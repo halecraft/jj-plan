@@ -1121,12 +1121,12 @@ Need JWT and API key support
   [[ "$output" == *"RESULT:no_current"* ]]
 }
 
-# --- jj stack new ---
+# --- jj plan stack ---
 
-@test "jj stack new creates a change with bare stack bookmark" {
+@test "jj plan stack creates a change with bare stack bookmark" {
   run_in_repo '
     jj describe -m "Old plan"
-    jj stack new
+    jj plan stack
     # The bare "stack" bookmark should be on @
     bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
     echo "BM:$bm"
@@ -1140,10 +1140,10 @@ Need JWT and API key support
   [[ "$output" == *"DESC:[]"* ]]
 }
 
-@test "jj stack new my-feature creates a change with stack/my-feature bookmark" {
+@test "jj plan stack my-feature creates a change with stack/my-feature bookmark" {
   run_in_repo '
     jj describe -m "Old plan"
-    jj stack new my-feature
+    jj plan stack my-feature
     bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
     echo "BM:$bm"
   '
@@ -1152,14 +1152,14 @@ Need JWT and API key support
   [[ "$output" == *"stack/my-feature:"* ]]
 }
 
-@test "jj stack new -r REV roots the new stack off the given revision" {
+@test "jj plan stack -r REV roots the new stack off the given revision" {
   run_in_repo '
     jj describe -m "Base"
     BASE=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     jj new; jj describe -m "Child"
     jj new; jj describe -m "Grandchild"
     # Start a new stack rooted at Base
-    jj stack new -r "$BASE"
+    jj plan stack -r "$BASE"
     # Parent of @ should be Base
     parent_desc=$("$REAL_JJ" log -r @- -T description --no-graph)
     echo "PARENT:$parent_desc"
@@ -1169,12 +1169,12 @@ Need JWT and API key support
   [[ "$output" == *"PARENT:Base"* ]]
 }
 
-@test "jj stack new -r REV my-feature combines revision and name" {
+@test "jj plan stack -r REV my-feature combines revision and name" {
   run_in_repo '
     jj describe -m "Base"
     BASE=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     jj new; jj describe -m "Child"
-    jj stack new -r "$BASE" my-feature
+    jj plan stack -r "$BASE" my-feature
     parent_desc=$("$REAL_JJ" log -r @- -T description --no-graph)
     echo "PARENT:$parent_desc"
     bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
@@ -1186,14 +1186,14 @@ Need JWT and API key support
   [[ "$output" == *"stack/my-feature:"* ]]
 }
 
-@test "jj stack new flushes pending edits before creating the new stack" {
+@test "jj plan stack flushes pending edits before creating the new stack" {
   run_in_repo '
     jj describe -m "Original plan"
     PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     # Write a local edit to current.md (not yet flushed)
     printf "Revised plan with important details" > .jj-plan/current.md
-    # stack new should flush before creating the new change
-    jj stack new
+    # plan stack should flush before creating the new change
+    jj plan stack
     # The old plan change should have the revised description
     echo "DESC:$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)"
   '
@@ -1201,10 +1201,10 @@ Need JWT and API key support
   [[ "$output" == *"DESC:Revised plan with important details"* ]]
 }
 
-@test "current.md is updated after jj stack new" {
+@test "current.md is updated after jj plan stack" {
   run_in_repo '
     jj describe -m "Old plan"
-    jj stack new
+    jj plan stack
     NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     [[ -L .jj-plan/current.md ]] && echo "RESULT:is_symlink" || echo "RESULT:not_symlink"
     link=$(readlink .jj-plan/current.md)
@@ -1218,10 +1218,10 @@ Need JWT and API key support
   [[ "$output" == *"MATCH:yes"* ]]
 }
 
-@test "jj stack new prints confirmation with change ID" {
+@test "jj plan stack prints confirmation with change ID" {
   run_in_repo '
     jj describe -m "Old plan"
-    jj stack new
+    jj plan stack
     NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     echo "NEW_ID:$NEW_ID"
   '
@@ -1231,11 +1231,11 @@ Need JWT and API key support
   [[ "$output" == *")"* ]]
 }
 
-@test "jj stack new with invalid name fails cleanly and rolls back" {
+@test "jj plan stack with invalid name fails cleanly and rolls back" {
   run_in_repo '
     jj describe -m "Old plan"
     BEFORE=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-    jj stack new "invalid name" 2>&1
+    jj plan stack "invalid name" 2>&1
     AFTER=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     echo "BEFORE:$BEFORE"
     echo "AFTER:$AFTER"
@@ -1246,7 +1246,7 @@ Need JWT and API key support
   [[ "$output" == *"ROLLBACK:yes"* ]]
 }
 
-@test "jj stack new -r <ancestor> moves bare stack bookmark sideways with -B" {
+@test "jj plan stack -r <ancestor> moves bare stack bookmark sideways with -B" {
   run_in_repo '
     jj describe -m "Root"
     ROOT=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -1254,7 +1254,7 @@ Need JWT and API key support
     jj new; jj describe -m "Tip"
     # stack bookmark is on Root; now start a new stack rooted at Root
     # This requires -B because the bookmark moves sideways (Root -> new sibling of Root)
-    jj stack new -r "$ROOT"
+    jj plan stack -r "$ROOT"
     parent_desc=$("$REAL_JJ" log -r @- -T description --no-graph)
     echo "PARENT:$parent_desc"
     bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
@@ -1263,6 +1263,105 @@ Need JWT and API key support
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Started new stack: stack ("* ]]
   [[ "$output" == *"PARENT:Root"* ]]
+}
+
+# --- jj plan new ---
+
+@test "jj plan new creates a change with placeholder description" {
+  run_in_repo '
+    jj describe -m "Existing plan"
+    jj plan new
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"DESC:(placeholder: jj:"* ]]
+  [[ "$output" == *"Created plan change: jj:"* ]]
+}
+
+@test "jj plan new placeholder contains actual change ID" {
+  run_in_repo '
+    jj describe -m "Existing plan"
+    jj plan new
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "NEW_ID:$NEW_ID"
+    echo "DESC:$desc"
+    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MATCH:yes"* ]]
+}
+
+@test "jj plan new flushes pending edits" {
+  run_in_repo '
+    jj describe -m "Original plan"
+    PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    printf "Revised plan with important details" > .jj-plan/current.md
+    jj plan new
+    echo "DESC:$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"DESC:Revised plan with important details"* ]]
+}
+
+@test "jj plan new forwards -r flag" {
+  run_in_repo '
+    jj describe -m "Base"
+    BASE=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Child"
+    jj new; jj describe -m "Grandchild"
+    jj plan new -r "$BASE"
+    parent_desc=$("$REAL_JJ" log -r @- -T description --no-graph)
+    echo "PARENT:$parent_desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"PARENT:Base"* ]]
+  [[ "$output" == *"Created plan change: jj:"* ]]
+}
+
+@test "jj plan new updates current.md and shows stack" {
+  run_in_repo '
+    jj describe -m "Old plan"
+    jj plan new
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    [[ -L .jj-plan/current.md ]] && echo "RESULT:is_symlink" || echo "RESULT:not_symlink"
+    link=$(readlink .jj-plan/current.md)
+    [[ "$link" == *"$NEW_ID"* ]] && echo "LINK_MATCH:yes" || echo "LINK_MATCH:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"RESULT:is_symlink"* ]]
+  [[ "$output" == *"LINK_MATCH:yes"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
+}
+
+@test "jj plan new current.md contains placeholder" {
+  run_in_repo '
+    jj describe -m "Old plan"
+    jj plan new
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:(placeholder: jj:"* ]]
+}
+
+# --- jj plan error handling ---
+
+@test "jj plan with no subcommand shows usage" {
+  run_in_repo '
+    jj plan 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"jj plan: usage: jj plan {stack|new}"* ]]
+}
+
+@test "jj plan bogus shows usage" {
+  run_in_repo '
+    jj plan bogus 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"jj plan: usage: jj plan {stack|new}"* ]]
 }
 
 # --- Navigation commands show plan stack ---
@@ -1295,10 +1394,10 @@ Need JWT and API key support
   [[ "$output" == *":: Step 2"* ]]
 }
 
-@test "jj stack new appends plan stack after confirmation" {
+@test "jj plan stack appends plan stack after confirmation" {
   run_in_repo '
     jj describe -m "Old plan"
-    jj stack new my-feature
+    jj plan stack my-feature
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Started new stack: stack/my-feature ("* ]]

@@ -49,7 +49,7 @@ if [[ -z "$REAL_JJ" ]]; then
   exit 1
 fi
 
-JJ_PLAN_DIR=""
+JJ_PLAN_DIR="${JJ_PLAN_DIR:-}"
 JJ_PLAN_MAX="${JJ_PLAN_MAX:-50}"
 
 # Read-only commands: zero overhead passthrough.
@@ -449,82 +449,117 @@ if [[ "$1" == "abandon" ]]; then
   exit $jj_exit
 fi
 
-# Special handling for "stack new": start a new stack atomically
-if [[ "$1" == "stack" && "$2" == "new" ]]; then
-  # Parse args after "stack new"
-  shift 2
-  local stack_rev=""
-  local stack_name=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -r)
-        if [[ -z "$2" ]]; then
-          echo "jj stack new: -r requires a revision argument" >&2
-          exit 1
+# Special handling for "plan" subcommand: plan stack, plan new
+if [[ "$1" == "plan" ]]; then
+  case "$2" in
+    stack)
+      # jj plan stack — start a new stack atomically (replaces jj stack new)
+      shift 2
+      local stack_rev=""
+      local stack_name=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -r)
+            if [[ -z "$2" ]]; then
+              echo "jj plan stack: -r requires a revision argument" >&2
+              exit 1
+            fi
+            stack_rev="$2"
+            shift 2
+            ;;
+          *)
+            stack_name="$1"
+            shift
+            ;;
+        esac
+      done
+
+      # Determine bookmark name
+      local bookmark_name
+      if [[ -n "$stack_name" ]]; then
+        bookmark_name="stack/$stack_name"
+      else
+        bookmark_name="stack"
+      fi
+
+      # Flush pending edits before creating the new change
+      __jj_plan_flush_all
+
+      # Create a new change (optionally rooted at REV)
+      if [[ -n "$stack_rev" ]]; then
+        "$REAL_JJ" new -r "$stack_rev" 2>/dev/null
+      else
+        "$REAL_JJ" new 2>/dev/null
+      fi
+      local new_exit=$?
+      if [[ $new_exit -ne 0 ]]; then
+        echo "jj plan stack: failed to create new change" >&2
+        exit $new_exit
+      fi
+
+      # Set the bookmark on the new change (-B allows backwards/sideways moves)
+      local bm_err
+      bm_err="$("$REAL_JJ" bookmark set "$bookmark_name" -r @ -B 2>&1)"
+      local bm_exit=$?
+      if [[ $bm_exit -ne 0 ]]; then
+        # Bookmark set failed — roll back the jj new
+        echo "$bm_err" >&2
+        "$REAL_JJ" undo 2>/dev/null
+        exit $bm_exit
+      fi
+
+      # Sync plans directory (populates _bp_ordered_ids / _bp_wc)
+      __jj_plan_sync
+
+      # Derive new change ID from batch-read data instead of extra jj call
+      local new_change_id=""
+      for id in "${_bp_ordered_ids[@]}"; do
+        if [[ "${_bp_wc[$id]}" == "C" ]]; then
+          new_change_id="$id"
+          break
         fi
-        stack_rev="$2"
-        shift 2
-        ;;
-      *)
-        stack_name="$1"
-        shift
-        ;;
-    esac
-  done
+      done
+      # Fallback if sync didn't populate (shouldn't happen, but safe)
+      if [[ -z "$new_change_id" ]]; then
+        new_change_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+      fi
 
-  # Determine bookmark name
-  local bookmark_name
-  if [[ -n "$stack_name" ]]; then
-    bookmark_name="stack/$stack_name"
-  else
-    bookmark_name="stack"
-  fi
+      echo "Started new stack: $bookmark_name ($new_change_id)"
+      __jj_plan_show_stack
+      exit 0
+      ;;
 
-  # Flush pending edits before creating the new change
-  __jj_plan_flush_all
+    new)
+      # jj plan new — create a change with a self-referencing placeholder description
+      shift 2
 
-  # Create a new change (optionally rooted at REV)
-  if [[ -n "$stack_rev" ]]; then
-    "$REAL_JJ" new -r "$stack_rev" 2>/dev/null
-  else
-    "$REAL_JJ" new 2>/dev/null
-  fi
-  local new_exit=$?
-  if [[ $new_exit -ne 0 ]]; then
-    echo "jj stack new: failed to create new change" >&2
-    exit $new_exit
-  fi
+      # Flush pending edits before creating the new change
+      __jj_plan_flush_all
 
-  # Set the bookmark on the new change (-B allows backwards/sideways moves)
-  local bm_err
-  bm_err="$("$REAL_JJ" bookmark set "$bookmark_name" -r @ -B 2>&1)"
-  local bm_exit=$?
-  if [[ $bm_exit -ne 0 ]]; then
-    # Bookmark set failed — roll back the jj new
-    echo "$bm_err" >&2
-    "$REAL_JJ" undo 2>/dev/null
-    exit $bm_exit
-  fi
+      # Create a new change, forwarding all remaining args (e.g. -r @-)
+      "$REAL_JJ" new "$@"
+      local new_exit=$?
+      if [[ $new_exit -ne 0 ]]; then
+        echo "jj plan new: failed to create new change" >&2
+        exit $new_exit
+      fi
 
-  # Sync plans directory (populates _bp_ordered_ids / _bp_wc)
-  __jj_plan_sync
+      # Read back the new change's ID and set the placeholder description
+      local new_id
+      new_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+      "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
 
-  # Derive new change ID from batch-read data instead of extra jj call
-  local new_change_id=""
-  for id in "${_bp_ordered_ids[@]}"; do
-    if [[ "${_bp_wc[$id]}" == "C" ]]; then
-      new_change_id="$id"
-      break
-    fi
-  done
-  # Fallback if sync didn't populate (shouldn't happen, but safe)
-  if [[ -z "$new_change_id" ]]; then
-    new_change_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
-  fi
+      __jj_plan_sync
+      echo "Created plan change: jj:$new_id"
+      __jj_plan_show_stack
+      exit 0
+      ;;
 
-  echo "Started new stack: $bookmark_name ($new_change_id)"
-  __jj_plan_show_stack
-  exit 0
+    *)
+      echo "jj plan: usage: jj plan {stack|new} [args...]" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 # Simple command paths: status/st, new/edit, and general catch-all
