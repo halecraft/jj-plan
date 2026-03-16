@@ -1,4 +1,4 @@
-# jj-pop: Plan-Oriented Programming
+# jj-plan: Plan-Oriented Programming
 
 > Plans as VCS Artifacts
 
@@ -55,7 +55,7 @@ Each change in a stack is one unit of work: the description *is* the plan, the d
 
 ```
 jj stack new my-feature                  # Start a new named stack (creates change + bookmark)
-# Edit .jj-plans/current.md — write the plan
+# Edit .jj-plan/current.md — write the plan
 jj new                                   # Continue building the stack
 ```
 
@@ -89,17 +89,17 @@ When a plan grows beyond one PR, create new plan changes referencing the origina
 
 ```
 jj stack new phase2
-# Edit .jj-plans/current.md — "Phase 2 — API key support (continues jj:kpqxywon)"
+# Edit .jj-plan/current.md — "Phase 2 — API key support (continues jj:kpqxywon)"
 ```
 
 The lineage is preserved through change ID references. Each phase can be reviewed, implemented, and landed independently while maintaining a navigable thread back to the original intent.
 
-### 5. A `.jj-plans/` directory makes plans co-editable
+### 5. A `.jj-plan/` directory makes plans co-editable
 
-A shim intercepts `jj` commands and maintains a `.jj-plans/` directory:
+A shim intercepts `jj` commands and maintains a `.jj-plan/` directory:
 
 ```
-.jj-plans/
+.jj-plan/
   current.md          → symlink to active change's plan
   .stack              → one-line summary of the full stack
   01-kpqxywon.md      — stack bookmark (first member)
@@ -110,7 +110,7 @@ A shim intercepts `jj` commands and maintains a `.jj-plans/` directory:
 You and an AI agent both edit these markdown files in the editor — no `jj describe` clobbering, no modal editor sessions. The shim flushes edits to jj descriptions automatically. `jj status` shows the stack at a glance:
 
 ```
-Plan stack (.jj-plans/; *=here ✓=done ~=has changes):
+Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
   ✓ 01-kpqxywon :: Refactor auth middleware
   ~ 02-mtzrlpvq :: Extract auth module
 *   03-ykvsnxrl :: Implement JWT strategy
@@ -186,7 +186,7 @@ Human writes draft plan
             → Code links back via jj:CHANGE_ID
 ```
 
-When the agent reads `.jj-plans/current.md` before writing code, it has the full decision record. When it's done, the plan — annotated with completion status — becomes the permanent historical record. The code links back to it. The loop is closed:
+When the agent reads `.jj-plan/current.md` before writing code, it has the full decision record. When it's done, the plan — annotated with completion status — becomes the permanent historical record. The code links back to it. The loop is closed:
 
 ```
 Plan (jj description) → Code (references jj:CHANGE_ID) → Archaeology (jj show → full plan)
@@ -201,7 +201,7 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 | Plans are reviewed before code | Plan changes are the review surface |
 | Plans survive rebase/amend | jj change IDs are stable |
 | Plans are permanently addressable | `jj show CHANGE_ID` from any code comment |
-| Plans are co-editable (human + AI) | `.jj-plans/` shim syncs markdown files ↔ descriptions |
+| Plans are co-editable (human + AI) | `.jj-plan/` shim syncs markdown files ↔ descriptions |
 | Plans co-exist with code review | Plan changes have rich descriptions — they *are* the review |
 | Plans split across PRs | New plan changes reference originals by change ID |
 | Plans have status tracking | `plan-status: ✅` in description; inferred from empty/non-empty |
@@ -212,11 +212,11 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 ## Getting Started
 
 1. Use [jj](https://github.com/jj-vcs/jj) (Jujutsu) as your VCS.
-2. Install [jj-pop](jj-pop.zsh) in your `$PATH`.
-3. Add `.jj-plans` to your global gitignore.
-4. In a repo: `mkdir .jj-plans` to activate.
+2. Install [jj-plan](jj-plan.zsh) in your `$PATH`.
+3. Add `.jj-plan` to your global gitignore.
+4. In a repo: `mkdir .jj-plan` to activate.
 5. Start a stack: `jj stack new` (bare) or `jj stack new my-feature` (named). Use `-r REV` to root it off a specific revision (e.g. `jj stack new -r main my-feature`). The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
-6. Start planning: edit `.jj-plans/current.md`, review with your team and AI, then `jj new` to continue building the stack.
+6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj new` to continue building the stack.
 
 ## Querying
 

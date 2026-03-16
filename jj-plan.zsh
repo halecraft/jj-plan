@@ -1,13 +1,18 @@
 #!/bin/zsh
-# jj-pop: plan-oriented programming shim
-# Keeps .jj-plans/ in sync with the current stack's change descriptions.
+# jj-plan: plan-oriented programming shim
+# Keeps .jj-plan/ in sync with the current stack's change descriptions.
 #
-# .jj-plans/ contains one .md file per change in the stack, named with a
+# .jj-plan/ contains one .md file per change in the stack, named with a
 # sort index and short change ID. A current.md symlink points to the
 # active change's plan file.
 #
-# ACTIVATION: create .jj-plans/ in a repo root to enable plan sync.
+# ACTIVATION: create .jj-plan/ in a repo root to enable plan sync.
 # Without it, all jj commands pass through with zero overhead.
+#
+# PLAN DIRECTORY resolution (fallback chain):
+#   1. JJ_PLAN_DIR env var — if set, use as-is (no fallback)
+#   2. .jj-plan/ in repo root — preferred default
+#   3. .jj-plans/ in repo root — legacy fallback
 #
 # STACK BASE resolution (fallback chain):
 #   1. stack / stack/* bookmarks — nearest ancestor of @ (inclusive range)
@@ -17,7 +22,7 @@
 #      The trunk commit is NOT part of the stack.
 #   3. No sync — stack boundary cannot be determined
 #
-# Requires .jj-plans in global gitignore (e.g. ~/.config/git/ignore).
+# Requires .jj-plan (and .jj-plans) in global gitignore (e.g. ~/.config/git/ignore).
 #
 # Architecture:
 #   __jj_plan_batch_read — core: single jj log call → associative arrays
@@ -40,12 +45,12 @@ for dir in $path; do
 done
 
 if [[ -z "$REAL_JJ" ]]; then
-  echo "jj-pop: cannot find real jj binary" >&2
+  echo "jj-plan: cannot find real jj binary" >&2
   exit 1
 fi
 
-JJ_PLANS_DIR=".jj-plans"
-JJ_PLANS_MAX="${JJ_PLANS_MAX:-50}"
+JJ_PLAN_DIR=""
+JJ_PLAN_MAX="${JJ_PLAN_MAX:-50}"
 
 # Read-only commands: zero overhead passthrough.
 # Note: status/st are NOT here — they get special handling to append .stack.
@@ -56,16 +61,16 @@ __jj_plan_readonly_commands=(
 )
 
 __jj_plan_set_error() {
-  local plans_dir="$JJ_PLANS_DIR"
+  local plans_dir="$JJ_PLAN_DIR"
   local msg="$1"
   printf '%s\n' "$msg" > "$plans_dir/error.md"
   rm -f "$plans_dir/current.md"
   ln -s "error.md" "$plans_dir/current.md"
-  echo "jj-pop: ERROR: $msg" >&2
+  echo "jj-plan: ERROR: $msg" >&2
 }
 
 __jj_plan_clear_error() {
-  local plans_dir="$JJ_PLANS_DIR"
+  local plans_dir="$JJ_PLAN_DIR"
   if [[ -f "$plans_dir/error.md" ]]; then
     rm -f "$plans_dir/error.md"
   fi
@@ -154,7 +159,7 @@ __jj_plan_resolve_stack_base() {
 # Uses a single batch read to get all current jj descriptions, then
 # only calls jj describe for files that actually differ.
 __jj_plan_flush_all() {
-  local plans_dir="$JJ_PLANS_DIR"
+  local plans_dir="$JJ_PLAN_DIR"
 
   # Don't flush if current.md points to error.md (error state)
   if [[ -L "$plans_dir/current.md" && "$(readlink "$plans_dir/current.md")" == "error.md" ]]; then
@@ -197,14 +202,14 @@ __jj_plan_flush_all() {
 }
 
 # jj → files: Mirror jj stack state to plan files, symlink, and .stack.
-# After this runs, .jj-plans/ exactly reflects the current jj stack.
+# After this runs, .jj-plan/ exactly reflects the current jj stack.
 # Assumes __jj_plan_flush_all has already been called (jj descriptions
 # are authoritative at this point).
 #
 # Also handles bookmark-loss detection: if resolve fails but plan files
 # exist, a stack was lost — emit a warning.
 __jj_plan_sync() {
-  local plans_dir="$JJ_PLANS_DIR"
+  local plans_dir="$JJ_PLAN_DIR"
 
   # Resolve stack base
   local resolve_result
@@ -212,7 +217,7 @@ __jj_plan_sync() {
   if [[ $? -ne 0 ]]; then
     # Bookmark-loss detection: if plan files exist, a stack was lost
     if [[ -n "$plans_dir"/[0-9][0-9]-*.md(#qN[1]) ]]; then
-      echo "jj-pop: WARNING: stack bookmark was lost. Run: jj bookmark set stack -r <change>" >&2
+      echo "jj-plan: WARNING: stack bookmark was lost. Run: jj bookmark set stack -r <change>" >&2
     fi
     return
   fi
@@ -235,8 +240,8 @@ __jj_plan_sync() {
   fi
 
   # Check stack size against max
-  if [[ ${#_bp_ordered_ids} -gt "$JJ_PLANS_MAX" ]]; then
-    __jj_plan_set_error "Stack has ${#_bp_ordered_ids} changes (max $JJ_PLANS_MAX). Refusing to sync. Is @ in the right place? Consider: jj bookmark set stack -r <change>"
+  if [[ ${#_bp_ordered_ids} -gt "$JJ_PLAN_MAX" ]]; then
+    __jj_plan_set_error "Stack has ${#_bp_ordered_ids} changes (max $JJ_PLAN_MAX). Refusing to sync. Is @ in the right place? Consider: jj bookmark set stack -r <change>"
     return
   fi
 
@@ -322,10 +327,10 @@ __jj_plan_sync() {
 # Pure display function — reads the .stack file and prints it.
 # Call after __jj_plan_sync has run so .stack is up to date.
 __jj_plan_show_stack() {
-  if [[ -s "$JJ_PLANS_DIR/.stack" ]]; then
+  if [[ -s "$JJ_PLAN_DIR/.stack" ]]; then
     echo ""
-    echo "Plan stack (.jj-plans/; *=here ✓=done ~=has changes):"
-    cat "$JJ_PLANS_DIR/.stack"
+    echo "Plan stack (${JJ_PLAN_DIR##*/}/; *=here ✓=done ~=has changes):"
+    cat "$JJ_PLAN_DIR/.stack"
   fi
 }
 
@@ -347,15 +352,18 @@ if [[ -z "$1" ]] || (( ${__jj_plan_readonly_commands[(Ie)$1]} )); then
   exec "$REAL_JJ" "$@"
 fi
 
-# Resolve repo root so .jj-plans is found from any subdirectory
+# Resolve repo root and plan directory
+# Fallback chain: JJ_PLAN_DIR env var → .jj-plan → .jj-plans (legacy)
 local repo_root
 repo_root="$("$REAL_JJ" root 2>/dev/null)"
-if [[ -n "$repo_root" ]]; then
-  JJ_PLANS_DIR="$repo_root/.jj-plans"
-fi
-
-# Pass through if .jj-plans/ does not exist (not activated)
-if [[ ! -d "$JJ_PLANS_DIR" ]]; then
+if [[ -n "$JJ_PLAN_DIR" ]]; then
+  # Env var is set — use as-is (no fallback)
+  :
+elif [[ -n "$repo_root" && -d "$repo_root/.jj-plan" ]]; then
+  JJ_PLAN_DIR="$repo_root/.jj-plan"
+elif [[ -n "$repo_root" && -d "$repo_root/.jj-plans" ]]; then
+  JJ_PLAN_DIR="$repo_root/.jj-plans"
+else
   exec "$REAL_JJ" "$@"
 fi
 
@@ -430,9 +438,9 @@ if [[ "$1" == "abandon" ]]; then
 
       if [[ -n "$recovery_target" ]]; then
         "$REAL_JJ" bookmark set "$old_bm_name" -r "$recovery_target" -B 2>/dev/null
-        echo "jj-pop: moved stack bookmark $old_bm_name to $recovery_target (abandoned change held it)" >&2
+        echo "jj-plan: moved stack bookmark $old_bm_name to $recovery_target (abandoned change held it)" >&2
       else
-        echo "jj-pop: WARNING: stack bookmark $old_bm_name was lost (abandoned change had no descendants). Run: jj bookmark set $old_bm_name -r <change>" >&2
+        echo "jj-plan: WARNING: stack bookmark $old_bm_name was lost (abandoned change had no descendants). Run: jj bookmark set $old_bm_name -r <change>" >&2
       fi
     fi
   fi
