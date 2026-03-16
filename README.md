@@ -54,12 +54,13 @@ Plans aren't metadata *about* changes. Plans *are* changes.
 Each change in a stack is one unit of work: the description *is* the plan, the diff *is* the implementation.
 
 ```
-jj stack new my-feature                  # Start a new named stack (creates change + bookmark)
+jj plan stack my-feature                 # Start a new named stack (creates change + bookmark)
 # Edit .jj-plan/current.md — write the plan
-jj new                                   # Continue building the stack
+jj plan new                              # Add a plan change to the stack (with placeholder)
+jj new                                   # Continue building the stack (without placeholder)
 ```
 
-Or without a name: `jj stack new` sets a bare `stack` bookmark. You can also root a stack off a specific revision: `jj stack new -r main my-feature`.
+Or without a name: `jj plan stack` sets a bare `stack` bookmark. You can also root a stack off a specific revision: `jj plan stack -r main my-feature`.
 
 The plan lives in the change description — a markdown document with background, constraints, alternatives considered, and step-by-step approach. The `stack` bookmark marks the first change in the stack, and it is **included** as a stack member.
 
@@ -88,7 +89,7 @@ This is a permanent, resolvable link. `jj show kpqxywon` retrieves the full plan
 When a plan grows beyond one PR, create new plan changes referencing the original:
 
 ```
-jj stack new phase2
+jj plan stack phase2
 # Edit .jj-plan/current.md — "Phase 2 — API key support (continues jj:kpqxywon)"
 ```
 
@@ -163,10 +164,10 @@ If neither a stack bookmark nor `trunk()` can be resolved, no sync occurs.
 When you finish a stack, you don't need to move or delete any bookmarks. Just start a new stack:
 
 ```sh
-jj stack new next-task                 # atomic: creates change + sets stack/next-task bookmark
+jj plan stack next-task                # atomic: creates change + sets stack/next-task bookmark
 ```
 
-Or without a name: `jj stack new`. Or rooted off a specific revision: `jj stack new -r main next-task`.
+Or without a name: `jj plan stack`. Or rooted off a specific revision: `jj plan stack -r main next-task`.
 
 The old `stack/old-task` bookmark stays where it is — it's historical. The shim automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's.
 
@@ -215,8 +216,22 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 2. Install [jj-plan](jj-plan.zsh) in your `$PATH`.
 3. Add `.jj-plan` to your global gitignore.
 4. In a repo: `mkdir .jj-plan` to activate.
-5. Start a stack: `jj stack new` (bare) or `jj stack new my-feature` (named). Use `-r REV` to root it off a specific revision (e.g. `jj stack new -r main my-feature`). The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
-6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj new` to continue building the stack.
+5. Start a stack: `jj plan stack` (bare) or `jj plan stack my-feature` (named). Use `-r REV` to root it off a specific revision (e.g. `jj plan stack -r main my-feature`). The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
+6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj plan new` to add plan changes to the stack (each gets a self-referencing `jj:CHANGE_ID` placeholder).
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `JJ_PLAN_DIR` | Override plan directory path (absolute or relative) | Auto-resolved: `.jj-plan/` → `.jj-plans/` |
+| `JJ_PLAN_MAX` | Maximum stack size before refusing to sync | `50` |
+
+## Migration from jj-pop
+
+- Rename `jj-pop.zsh` to `jj-plan.zsh` in your `$PATH` (or update your symlink).
+- Replace `jj stack new` with `jj plan stack` in your workflow.
+- Existing `.jj-plans/` directories continue to work (silent fallback). Create `.jj-plan/` when ready to migrate — it takes precedence.
+- Replace `JJ_PLANS_MAX` with `JJ_PLAN_MAX` in your shell profile (old env var is no longer recognized).
 
 ## Querying
 

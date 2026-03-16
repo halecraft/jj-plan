@@ -51,6 +51,7 @@ fi
 
 JJ_PLAN_DIR="${JJ_PLAN_DIR:-}"
 JJ_PLAN_MAX="${JJ_PLAN_MAX:-50}"
+JJ_PLAN_DIR_SOURCE=""
 
 # Read-only commands: zero overhead passthrough.
 # Note: status/st are NOT here — they get special handling to append .stack.
@@ -358,12 +359,15 @@ local repo_root
 repo_root="$("$REAL_JJ" root 2>/dev/null)"
 if [[ -n "$JJ_PLAN_DIR" ]]; then
   # Env var is set — use as-is (no fallback)
-  :
+  JJ_PLAN_DIR_SOURCE="env var"
 elif [[ -n "$repo_root" && -d "$repo_root/.jj-plan" ]]; then
   JJ_PLAN_DIR="$repo_root/.jj-plan"
+  JJ_PLAN_DIR_SOURCE=".jj-plan"
 elif [[ -n "$repo_root" && -d "$repo_root/.jj-plans" ]]; then
   JJ_PLAN_DIR="$repo_root/.jj-plans"
+  JJ_PLAN_DIR_SOURCE=".jj-plans (legacy)"
 else
+  JJ_PLAN_DIR_SOURCE="none"
   exec "$REAL_JJ" "$@"
 fi
 
@@ -555,8 +559,52 @@ if [[ "$1" == "plan" ]]; then
       exit 0
       ;;
 
+    config)
+      # jj plan config — show all configuration and resolved state (read-only)
+      echo "jj-plan configuration:"
+      echo ""
+      echo "  shim path:        $SELF"
+      echo "  real jj binary:   $REAL_JJ"
+      echo "  repo root:        ${repo_root:-(not in a repo)}"
+      echo ""
+      if [[ "$JJ_PLAN_DIR_SOURCE" == "env var" ]]; then
+        echo "  JJ_PLAN_DIR env:  $JJ_PLAN_DIR"
+      else
+        echo "  JJ_PLAN_DIR env:  (not set)"
+      fi
+      echo "  JJ_PLAN_MAX env:  ${JJ_PLAN_MAX}"
+      echo ""
+      echo "  resolved dir:     $JJ_PLAN_DIR"
+      echo "  resolution source: $JJ_PLAN_DIR_SOURCE"
+      echo ""
+
+      # Stack info (read-only, no flush/sync)
+      local resolve_result
+      resolve_result="$(__jj_plan_resolve_stack_base 2>/dev/null)"
+      if [[ $? -eq 0 ]]; then
+        local range_mode="${resolve_result%%:*}"
+        local stack_base="${resolve_result#*:}"
+        echo "  stack base:       $stack_base ($range_mode)"
+
+        local stack_revset
+        if [[ "$range_mode" == "inclusive" ]]; then
+          stack_revset="($stack_base::@) | descendants(@)"
+        else
+          stack_revset="($stack_base..@) | descendants(@)"
+        fi
+        local stack_size
+        stack_size="$("$REAL_JJ" log -r "$stack_revset" -T '"x"' --no-graph 2>/dev/null | wc -c | tr -d ' ')"
+        echo "  stack size:       $stack_size"
+      else
+        echo "  stack base:       (none)"
+        echo "  stack size:       0"
+      fi
+
+      exit 0
+      ;;
+
     *)
-      echo "jj plan: usage: jj plan {stack|new} [args...]" >&2
+      echo "jj plan: usage: jj plan {stack|new|config} [args...]" >&2
       exit 1
       ;;
   esac

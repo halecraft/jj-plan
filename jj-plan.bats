@@ -1353,7 +1353,7 @@ Need JWT and API key support
     jj plan 2>&1
   '
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"jj plan: usage: jj plan {stack|new}"* ]]
+  [[ "$output" == *"jj plan: usage: jj plan {stack|new|config}"* ]]
 }
 
 @test "jj plan bogus shows usage" {
@@ -1361,7 +1361,83 @@ Need JWT and API key support
     jj plan bogus 2>&1
   '
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"jj plan: usage: jj plan {stack|new}"* ]]
+  [[ "$output" == *"jj plan: usage: jj plan {stack|new|config}"* ]]
+}
+
+# --- jj plan config ---
+
+@test "jj plan config shows resolved plan directory" {
+  run_in_repo '
+    jj plan config
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj-plan configuration:"* ]]
+  [[ "$output" == *"resolved dir:"*".jj-plan"* ]]
+  [[ "$output" == *"resolution source: .jj-plan"* ]]
+}
+
+@test "jj plan config shows real jj binary path" {
+  run_in_repo '
+    jj plan config
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"real jj binary:"*"/jj"* ]]
+  [[ "$output" == *"shim path:"* ]]
+}
+
+@test "jj plan config shows stack info" {
+  run_in_repo '
+    jj describe -m "Plan"
+    jj new; jj describe -m "Step 1"
+    jj plan config
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"stack base:"*"(inclusive)"* ]]
+  [[ "$output" == *"stack size:"*"2"* ]]
+}
+
+@test "jj plan config shows legacy resolution source for .jj-plans" {
+  run zsh -c "
+    export PATH=\"$HOME/.local/bin:\$PATH\"
+    REAL_JJ=\"$REAL_JJ\"
+    cd \"\$(mktemp -d)\"
+    $REAL_JJ git init 2>/dev/null
+    $REAL_JJ bookmark set stack -r @ 2>/dev/null
+    mkdir -p .jj-plans
+    jj plan config
+  "
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"resolution source: .jj-plans (legacy)"* ]]
+}
+
+@test "jj plan config shows env var when JJ_PLAN_DIR is set" {
+  run zsh -c "
+    export PATH=\"$HOME/.local/bin:\$PATH\"
+    REAL_JJ=\"$REAL_JJ\"
+    cd \"\$(mktemp -d)\"
+    $REAL_JJ git init 2>/dev/null
+    $REAL_JJ bookmark set stack -r @ 2>/dev/null
+    mkdir -p .custom-plans
+    export JJ_PLAN_DIR=\"\$(pwd)/.custom-plans\"
+    jj plan config
+  "
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"JJ_PLAN_DIR env:"*".custom-plans"* ]]
+  [[ "$output" == *"resolution source: env var"* ]]
+}
+
+@test "jj plan config shows no stack when no bookmark or trunk" {
+  run zsh -c "
+    export PATH=\"$HOME/.local/bin:\$PATH\"
+    REAL_JJ=\"$REAL_JJ\"
+    cd \"\$(mktemp -d)\"
+    $REAL_JJ git init 2>/dev/null
+    mkdir -p .jj-plan
+    jj plan config
+  "
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"stack base:"*"(none)"* ]]
+  [[ "$output" == *"stack size:"*"0"* ]]
 }
 
 # --- Navigation commands show plan stack ---
