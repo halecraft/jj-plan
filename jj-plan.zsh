@@ -512,21 +512,13 @@ if [[ "$1" == "plan" ]]; then
         exit $bm_exit
       fi
 
-      # Sync plans directory (populates _bp_ordered_ids / _bp_wc)
-      __jj_plan_sync
+      # Read back the new change's ID and set the placeholder description
+      local new_change_id
+      new_change_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+      "$REAL_JJ" describe -m "(placeholder: jj:$new_change_id)" 2>/dev/null
 
-      # Derive new change ID from batch-read data instead of extra jj call
-      local new_change_id=""
-      for id in "${_bp_ordered_ids[@]}"; do
-        if [[ "${_bp_wc[$id]}" == "C" ]]; then
-          new_change_id="$id"
-          break
-        fi
-      done
-      # Fallback if sync didn't populate (shouldn't happen, but safe)
-      if [[ -z "$new_change_id" ]]; then
-        new_change_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
-      fi
+      # Sync plans directory
+      __jj_plan_sync
 
       echo "Started new stack: $bookmark_name ($new_change_id)"
       __jj_plan_show_stack

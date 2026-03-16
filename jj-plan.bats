@@ -1130,14 +1130,17 @@ Need JWT and API key support
     # The bare "stack" bookmark should be on @
     bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
     echo "BM:$bm"
-    # @ should be empty (fresh change)
+    # @ should have the placeholder description
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     desc=$("$REAL_JJ" log -r @ -T description --no-graph)
     echo "DESC:[$desc]"
+    echo "NEW_ID:$NEW_ID"
+    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Started new stack: stack ("* ]]
   [[ "$output" == *"BM:stack:"* ]]
-  [[ "$output" == *"DESC:[]"* ]]
+  [[ "$output" == *"MATCH:yes"* ]]
 }
 
 @test "jj plan stack my-feature creates a change with stack/my-feature bookmark" {
