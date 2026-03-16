@@ -550,11 +550,15 @@ EOF
 
       # Parse --first / --last flags; collect remaining args for jj new
       local plan_first=false plan_last=false
+      local has_explicit_position=false
       local -a jj_args=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --first) plan_first=true; shift ;;
           --last)  plan_last=true; shift ;;
+          -r|-A|--insert-after|-B|--insert-before)
+            has_explicit_position=true
+            jj_args+=("$1"); shift ;;
           *)       jj_args+=("$1"); shift ;;
         esac
       done
@@ -640,8 +644,13 @@ EOF
         "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
 
       else
-        # Default: plain jj new with forwarded args
-        "$REAL_JJ" new "${jj_args[@]}"
+        # Default: insert after @ to preserve stack linearity (rebases descendants)
+        # Skip --insert-after @ if user provided explicit positioning (-r, -A, -B, etc.)
+        if $has_explicit_position; then
+          "$REAL_JJ" new "${jj_args[@]}"
+        else
+          "$REAL_JJ" new --insert-after @ "${jj_args[@]}"
+        fi
         local new_exit=$?
         if [[ $new_exit -ne 0 ]]; then
           echo "jj plan new: failed to create new change" >&2

@@ -1349,6 +1349,30 @@ Need JWT and API key support
   [[ "$output" == *"CONTENT:(placeholder: jj:"* ]]
 }
 
+@test "jj plan new from mid-stack inserts linearly (not a fork)" {
+  run_in_repo '
+    jj describe -m "Plan"
+    PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Step 1"
+    jj new; jj describe -m "Step 2"
+    # Move @ back to the middle
+    jj edit -r @-
+    jj plan new
+    # Stack should have 4 changes in linear order
+    count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+    echo "count=$count"
+    for f in .jj-plan/[0-9][0-9]-*.md; do
+      echo "FILE:$(basename $f):$(cat $f)"
+    done
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"count=4"* ]]
+  [[ "$output" == *"FILE:01-"*":Plan"* ]]
+  [[ "$output" == *"FILE:02-"*":Step 1"* ]]
+  [[ "$output" == *"FILE:03-"*":(placeholder: jj:"* ]]
+  [[ "$output" == *"FILE:04-"*":Step 2"* ]]
+}
+
 # --- jj plan error handling ---
 
 @test "jj plan with no subcommand shows usage" {

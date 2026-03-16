@@ -120,7 +120,7 @@ The placeholder description serves two purposes:
 
 ### Default (no flags)
 
-Runs `jj new` with all remaining args forwarded (e.g. `-r @-`, `--insert-before X`).
+Runs `jj new --insert-after @` with all remaining args forwarded. The `--insert-after @` ensures descendants of `@` are rebased onto the new change, preserving stack linearity (without it, `jj new` from a mid-stack position would fork the history). If the user provides explicit positioning flags (`-r`, `-A`/`--insert-after`, `-B`/`--insert-before`), the `--insert-after @` is omitted and the user's flags are forwarded as-is.
 
 ### `--first`
 
