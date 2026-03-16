@@ -615,14 +615,12 @@ EOF
         if [[ "$bm_raw" != "-" ]]; then
           # Find the first stack/stack/* bookmark in the comma-separated list
           local bm_name=""
-          local IFS=','
-          for bm in $bm_raw; do
+          for bm in ${(s:,:)bm_raw}; do
             if [[ "$bm" == "stack" || "$bm" == stack/* ]]; then
               bm_name="$bm"
               break
             fi
           done
-          unset IFS
           if [[ -n "$bm_name" ]]; then
             "$REAL_JJ" bookmark set "$bm_name" -r @ -B 2>/dev/null
           fi

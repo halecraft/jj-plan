@@ -1430,6 +1430,27 @@ Need JWT and API key support
   [[ "$output" == *"BM_MOVED:yes"* ]]
 }
 
+@test "jj plan new --first moves stack bookmark when first member has multiple bookmarks" {
+  run_in_repo '
+    jj describe -m "Root plan"
+    "$REAL_JJ" bookmark set extra-bm -r @ 2>/dev/null
+    jj new; jj describe -m "Step 1"
+    jj plan new --first
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    # The stack bookmark should now be on the new change
+    bm_change=$("$REAL_JJ" log -r "bookmarks(exact:\"stack\")" -T "change_id.shortest(8)" --no-graph)
+    echo "NEW_ID:$NEW_ID"
+    echo "BM_CHANGE:$bm_change"
+    [[ "$NEW_ID" == "$bm_change" ]] && echo "BM_MOVED:yes" || echo "BM_MOVED:no"
+    # extra-bm should stay on the original root, not follow
+    extra_bm_desc=$("$REAL_JJ" log -r "bookmarks(exact:\"extra-bm\")" -T "description.first_line()" --no-graph)
+    echo "EXTRA_BM_ON:$extra_bm_desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"BM_MOVED:yes"* ]]
+  [[ "$output" == *"EXTRA_BM_ON:Root plan"* ]]
+}
+
 @test "jj plan new --first sets placeholder description" {
   run_in_repo '
     jj describe -m "Plan"
