@@ -57,7 +57,8 @@ Each change in a stack is one unit of work: the description *is* the plan, the d
 jj plan stack my-feature                 # Start a new named stack (creates change + bookmark)
 # Edit .jj-plan/current.md — write the plan
 jj plan new                              # Add a plan change to the stack (with placeholder)
-jj new                                   # Continue building the stack (without placeholder)
+jj plan new --first                      # Insert a plan change at the start of the stack
+jj plan new --last                       # Insert a plan change at the end of the stack
 ```
 
 Or without a name: `jj plan stack` sets a bare `stack` bookmark. You can also root a stack off a specific revision: `jj plan stack -r main my-feature`.
@@ -217,7 +218,7 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 3. Add `.jj-plan` to your global gitignore.
 4. In a repo: `mkdir .jj-plan` to activate.
 5. Start a stack: `jj plan stack` (bare) or `jj plan stack my-feature` (named). Use `-r REV` to root it off a specific revision (e.g. `jj plan stack -r main my-feature`). The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
-6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj plan new` to add plan changes to the stack (each gets a self-referencing `jj:CHANGE_ID` placeholder).
+6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj plan new` to add plan changes to the stack (each gets a self-referencing `jj:CHANGE_ID` placeholder). Use `--first` or `--last` to insert at stack boundaries. Run `jj plan --help` for all options.
 
 ## Environment Variables
 

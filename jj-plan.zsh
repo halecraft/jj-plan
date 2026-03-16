@@ -453,8 +453,27 @@ if [[ "$1" == "abandon" ]]; then
   exit $jj_exit
 fi
 
-# Special handling for "plan" subcommand: plan stack, plan new
+# Special handling for "plan" subcommand: plan stack, plan new, plan config
 if [[ "$1" == "plan" ]]; then
+  # --help / -h check before dispatch
+  if [[ "$2" == "--help" || "$2" == "-h" ]]; then
+    cat <<'EOF'
+jj plan — plan-oriented programming commands
+
+Subcommands:
+  stack [name] [-r REV]    Start a new named stack (creates change + bookmark)
+  new [flags] [jj-new-args]
+                           Create a plan change with a self-referencing placeholder
+    --first                Insert before the first stack member (moves bookmark)
+    --last                 Insert after the last stack member
+  config                   Show resolved configuration and stack info
+
+Options:
+  --help, -h               Show this help message
+EOF
+    exit 0
+  fi
+
   case "$2" in
     stack)
       # jj plan stack — start a new stack atomically (replaces jj stack new)
@@ -529,21 +548,111 @@ if [[ "$1" == "plan" ]]; then
       # jj plan new — create a change with a self-referencing placeholder description
       shift 2
 
+      # Parse --first / --last flags; collect remaining args for jj new
+      local plan_first=false plan_last=false
+      local -a jj_args=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --first) plan_first=true; shift ;;
+          --last)  plan_last=true; shift ;;
+          *)       jj_args+=("$1"); shift ;;
+        esac
+      done
+
+      if $plan_first && $plan_last; then
+        echo "jj plan new: --first and --last are mutually exclusive" >&2
+        exit 1
+      fi
+
       # Flush pending edits before creating the new change
       __jj_plan_flush_all
 
-      # Create a new change, forwarding all remaining args (e.g. -r @-)
-      "$REAL_JJ" new "$@"
-      local new_exit=$?
-      if [[ $new_exit -ne 0 ]]; then
-        echo "jj plan new: failed to create new change" >&2
-        exit $new_exit
+      if $plan_first || $plan_last; then
+        # Resolve the stack to find boundary IDs
+        local resolve_result
+        resolve_result="$(__jj_plan_resolve_stack_base)"
+        if [[ $? -ne 0 ]]; then
+          echo "jj plan new: cannot resolve stack (no stack bookmark or trunk). Use 'jj plan stack' to start a stack first." >&2
+          exit 1
+        fi
+
+        local range_mode="${resolve_result%%:*}"
+        local stack_base="${resolve_result#*:}"
+        local stack_revset
+        if [[ "$range_mode" == "inclusive" ]]; then
+          stack_revset="($stack_base::@) | descendants(@)"
+        else
+          stack_revset="($stack_base..@) | descendants(@)"
+        fi
+
+        if ! __jj_plan_batch_read "$stack_revset"; then
+          echo "jj plan new: stack is empty" >&2
+          exit 1
+        fi
       fi
 
-      # Read back the new change's ID and set the placeholder description
-      local new_id
-      new_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
-      "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
+      if $plan_first; then
+        local first_id="${_bp_ordered_ids[1]}"
+
+        "$REAL_JJ" new --insert-before "$first_id" "${jj_args[@]}"
+        local new_exit=$?
+        if [[ $new_exit -ne 0 ]]; then
+          echo "jj plan new: failed to create new change" >&2
+          exit $new_exit
+        fi
+
+        # Read back the new change's ID and set the placeholder description
+        local new_id
+        new_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+        "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
+
+        # Move stack bookmark to the new change (it was on first_id)
+        local bm_raw="${_bp_bm[$first_id]}"
+        if [[ "$bm_raw" != "-" ]]; then
+          # Find the first stack/stack/* bookmark in the comma-separated list
+          local bm_name=""
+          local IFS=','
+          for bm in $bm_raw; do
+            if [[ "$bm" == "stack" || "$bm" == stack/* ]]; then
+              bm_name="$bm"
+              break
+            fi
+          done
+          unset IFS
+          if [[ -n "$bm_name" ]]; then
+            "$REAL_JJ" bookmark set "$bm_name" -r @ -B 2>/dev/null
+          fi
+        fi
+
+      elif $plan_last; then
+        local last_id="${_bp_ordered_ids[-1]}"
+
+        "$REAL_JJ" new --insert-after "$last_id" "${jj_args[@]}"
+        local new_exit=$?
+        if [[ $new_exit -ne 0 ]]; then
+          echo "jj plan new: failed to create new change" >&2
+          exit $new_exit
+        fi
+
+        # Read back the new change's ID and set the placeholder description
+        local new_id
+        new_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+        "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
+
+      else
+        # Default: plain jj new with forwarded args
+        "$REAL_JJ" new "${jj_args[@]}"
+        local new_exit=$?
+        if [[ $new_exit -ne 0 ]]; then
+          echo "jj plan new: failed to create new change" >&2
+          exit $new_exit
+        fi
+
+        # Read back the new change's ID and set the placeholder description
+        local new_id
+        new_id="$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)"
+        "$REAL_JJ" describe -m "(placeholder: jj:$new_id)" 2>/dev/null
+      fi
 
       __jj_plan_sync
       echo "Created plan change: jj:$new_id"
@@ -595,8 +704,12 @@ if [[ "$1" == "plan" ]]; then
       exit 0
       ;;
 
+    "")
+      echo "jj plan: missing subcommand. Run 'jj plan --help' for usage." >&2
+      exit 1
+      ;;
     *)
-      echo "jj plan: usage: jj plan {stack|new|config} [args...]" >&2
+      echo "jj plan: unknown subcommand '$2'. Run 'jj plan --help' for usage." >&2
       exit 1
       ;;
   esac

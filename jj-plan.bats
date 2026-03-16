@@ -1356,7 +1356,8 @@ Need JWT and API key support
     jj plan 2>&1
   '
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"jj plan: usage: jj plan {stack|new|config}"* ]]
+  [[ "$output" == *"jj plan: missing subcommand"* ]]
+  [[ "$output" == *"jj plan --help"* ]]
 }
 
 @test "jj plan bogus shows usage" {
@@ -1364,7 +1365,132 @@ Need JWT and API key support
     jj plan bogus 2>&1
   '
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"jj plan: usage: jj plan {stack|new|config}"* ]]
+  [[ "$output" == *"jj plan: unknown subcommand"* ]]
+  [[ "$output" == *"jj plan --help"* ]]
+}
+
+# --- jj plan new --first / --last ---
+
+@test "jj plan new --first inserts before first stack member" {
+  run_in_repo '
+    jj describe -m "First"
+    jj new; jj describe -m "Second"
+    jj new; jj describe -m "Third"
+    jj plan new --first
+    # New change should be 01, old first should be 02
+    echo "FILE01:$(cat .jj-plan/01-*.md)"
+    echo "FILE02:$(cat .jj-plan/02-*.md)"
+    count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+    echo "count=$count"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"FILE01:(placeholder: jj:"* ]]
+  [[ "$output" == *"FILE02:First"* ]]
+  [[ "$output" == *"count=4"* ]]
+  [[ "$output" == *"Created plan change: jj:"* ]]
+}
+
+@test "jj plan new --first moves the stack bookmark" {
+  run_in_repo '
+    jj describe -m "Root plan"
+    jj new; jj describe -m "Step 1"
+    jj plan new --first
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    # The stack bookmark should now be on the new change
+    bm_change=$("$REAL_JJ" log -r "bookmarks(exact:\"stack\")" -T "change_id.shortest(8)" --no-graph)
+    echo "NEW_ID:$NEW_ID"
+    echo "BM_CHANGE:$bm_change"
+    [[ "$NEW_ID" == "$bm_change" ]] && echo "BM_MOVED:yes" || echo "BM_MOVED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"BM_MOVED:yes"* ]]
+}
+
+@test "jj plan new --first sets placeholder description" {
+  run_in_repo '
+    jj describe -m "Plan"
+    jj plan new --first
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MATCH:yes"* ]]
+}
+
+@test "jj plan new --last inserts after last stack member" {
+  run_in_repo '
+    jj describe -m "First"
+    FIRST=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Second"
+    jj new; jj describe -m "Third"
+    # Move @ back to first so tip is not @
+    jj edit -r "$FIRST"
+    jj plan new --last
+    # New change should be the last numbered file (04)
+    count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+    echo "count=$count"
+    last_file=$(ls .jj-plan/[0-9][0-9]-*.md | sort | tail -1)
+    echo "LAST:$(cat "$last_file")"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"count=4"* ]]
+  [[ "$output" == *"LAST:(placeholder: jj:"* ]]
+  [[ "$output" == *"Created plan change: jj:"* ]]
+}
+
+@test "jj plan new --last sets placeholder description" {
+  run_in_repo '
+    jj describe -m "Plan"
+    jj plan new --last
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MATCH:yes"* ]]
+}
+
+@test "jj plan new --first and --last together errors" {
+  run_in_repo '
+    jj describe -m "Plan"
+    jj plan new --first --last 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"--first and --last are mutually exclusive"* ]]
+}
+
+@test "jj plan new --first errors when no stack resolved" {
+  run zsh -c "
+    export PATH=\"$HOME/.local/bin:\$PATH\"
+    REAL_JJ=\"$REAL_JJ\"
+    cd \"\$(mktemp -d)\"
+    $REAL_JJ git init 2>/dev/null
+    mkdir -p .jj-plan
+    jj plan new --first 2>&1
+  "
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"cannot resolve stack"* ]]
+}
+
+# --- jj plan --help ---
+
+@test "jj plan --help prints help" {
+  run_in_repo '
+    jj plan --help
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Subcommands:"* ]]
+  [[ "$output" == *"--first"* ]]
+  [[ "$output" == *"--last"* ]]
+}
+
+@test "jj plan -h prints help" {
+  run_in_repo '
+    jj plan -h
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Subcommands:"* ]]
 }
 
 # --- jj plan config ---

@@ -36,11 +36,14 @@ jj <subcommand> [args...]
 │
 ├─ no subcommand or read-only? ──→ exec $REAL_JJ (zero overhead)
 ├─ no repo root or no plan dir? ─→ exec $REAL_JJ (not activated)
-├─ "plan" ────────────────────────→ case dispatch:
+├─ "plan" ────────────────────────→ --help/-h check, then case dispatch:
+│   ├─ "plan --help" ─────────────→ print help summary, exit 0
 │   ├─ "plan stack" ──────────────→ atomic stack creation
 │   ├─ "plan new" ────────────────→ placeholder plan change
+│   │     ├─ --first ─────────────→ insert before first stack member (moves bookmark)
+│   │     └─ --last ──────────────→ insert after last stack member
 │   ├─ "plan config" ─────────────→ read-only introspection
-│   └─ anything else ─────────────→ usage error
+│   └─ anything else ─────────────→ usage error (suggests --help)
 ├─ "abandon" ─────────────────────→ bookmark recovery handler
 ├─ "status/st/new/edit" ──────────→ __jj_plan_wrap
 └─ everything else ───────────────→ __jj_plan_wrap (catch-all)
@@ -104,15 +107,43 @@ Atomic stack creation (replaces the old `jj stack new`):
 
 Creates a change with a self-referencing placeholder description:
 
-1. `__jj_plan_flush_all` — flush pending edits.
-2. `jj new "$@"` — forward all args (e.g. `-r @-`).
-3. Read back the new change's ID via `jj log -r @ -T 'change_id.shortest(8)'`.
-4. `jj describe -m "(placeholder: jj:$id)"` — set the placeholder.
-5. `__jj_plan_sync` + display.
+1. Parse args: strip `--first` and `--last` (shim flags); collect remaining args for `jj new`.
+2. `__jj_plan_flush_all` — flush pending edits.
+3. Create the change (varies by flag — see below).
+4. Read back the new change's ID via `jj log -r @ -T 'change_id.shortest(8)'`.
+5. `jj describe -m "(placeholder: jj:$id)"` — set the placeholder.
+6. `__jj_plan_sync` + display.
 
 The placeholder description serves two purposes:
 - **GC protection**: jj garbage-collects chains of empty-description changes. The placeholder is non-empty.
 - **Self-referencing link**: the `jj:CHANGE_ID` is immediately usable in code comments, even before the real plan is written.
+
+### Default (no flags)
+
+Runs `jj new` with all remaining args forwarded (e.g. `-r @-`, `--insert-before X`).
+
+### `--first`
+
+Inserts before the first stack member:
+
+1. Resolve stack via `__jj_plan_resolve_stack_base` + `__jj_plan_batch_read`. Error if no stack.
+2. Extract `first_id` from `_bp_ordered_ids[1]`.
+3. `jj new --insert-before $first_id` — rebases the old first member onto the new change.
+4. Move the stack bookmark: parse `_bp_bm[$first_id]` for the first `stack`/`stack/*` bookmark, then `jj bookmark set $bm_name -r @ -B`. This is necessary because the bookmark was on the old first member — without moving it, the new change would fall outside the stack range.
+
+### `--last`
+
+Inserts after the last stack member:
+
+1. Resolve stack via `__jj_plan_resolve_stack_base` + `__jj_plan_batch_read`. Error if no stack.
+2. Extract `last_id` from `_bp_ordered_ids[-1]` (zsh last element).
+3. `jj new --insert-after $last_id` — rebases the old last member's children onto the new change.
+
+When `@` is already the tip of the stack, this is equivalent to plain `jj new`, but uses the explicit `--insert-after` form for consistency.
+
+### Flag validation
+
+`--first` and `--last` are mutually exclusive. If both are specified, the shim exits with an error.
 
 ## `jj plan config`
 
