@@ -6,34 +6,37 @@
 
 jj-plan is a Rust binary installed as `jj` in `$PATH`, shadowing the real jj binary. It intercepts mutating commands to keep a `.jj-plan/` directory in sync with the current stack's change descriptions. Read-only commands (`log`, `diff`, `show`, etc.) pass through with zero overhead via Unix `exec`.
 
-The binary resolves the real `jj` binary by walking `$PATH` and skipping itself (via `std::fs::canonicalize` comparison). All repository access uses `jj` subprocess calls — the binary does not link `jj-lib`. Repo root discovery uses a filesystem walk for `.jj/` (no subprocess).
+The binary resolves the real `jj` binary by walking `$PATH` and skipping itself (via `std::fs::canonicalize` comparison). Repository reads (stack resolution, commit metadata, bookmark enumeration) use **jj-lib** for in-process access (~1ms startup, sub-millisecond reads). Mutations (`jj describe`, `jj new`, `jj edit`, `jj abandon`, `jj bookmark set`) use CLI subprocess calls because the CLI handles working copy snapshotting, auto-rebase, and user-facing output. Repo root discovery uses a filesystem walk for `.jj/` (no subprocess).
+
+If jj-lib cannot load the repository (version mismatch, corrupt state), the binary degrades gracefully to exec passthrough — the jj command runs directly without plan sync features.
 
 ## Project Structure
 
 | Module | Lines | Responsibility |
 |---|---|---|
-| `src/main.rs` | 122 | Argument parsing, top-level dispatch, read-only passthrough |
-| `src/jj_binary.rs` | 145 | Real jj binary resolution, `exec`/`run_inherit`/`run_silent` helpers |
-| `src/plan_dir.rs` | 220 | Repo root discovery, plan directory resolution (env → `.jj-plan/` → `.jj-plans/`) |
-| `src/stack.rs` | 213 | Stack base resolution, `StackChange` struct, `batch_read_changes` |
-| `src/sync.rs` | 580 | FC/IS sync: gather → plan → execute, `.stack` generation |
-| `src/flush.rs` | 258 | FC/IS flush: gather → plan → execute, file→jj description sync |
-| `src/wrap.rs` | 90 | Unified mutating command lifecycle: flush → command → resolve_and_sync |
+| `src/main.rs` | 127 | Argument parsing, top-level dispatch, read-only passthrough, jj-lib repo loading |
+| `src/jj_binary.rs` | 144 | Real jj binary resolution, `exec`/`run_inherit`/`run_silent` helpers |
+| `src/plan_dir.rs` | 208 | Repo root discovery, plan directory resolution (env → `.jj-plan/` → `.jj-plans/`) |
+| `src/repo.rs` | 621 | In-process repository access via jj-lib: workspace loading, revset evaluation, commit reads, bookmark enumeration |
+| `src/stack.rs` | 52 | Shared domain types: `StackBase` enum, `StackChange` struct |
+| `src/sync.rs` | 577 | FC/IS sync: gather → plan → execute, `.stack` generation |
+| `src/flush.rs` | 219 | FC/IS flush: gather (jj-lib) → plan → execute (`jj describe` subprocess) |
+| `src/wrap.rs` | 95 | Unified mutating command lifecycle: flush → command → reload → resolve_and_sync |
 | `src/markdown.rs` | 633 | `[scratch]` section stripping, code fence immunity, heading-level scoping |
-| `src/template.rs` | 300 | Plan template resolution, `{{CHANGE_ID}}` interpolation |
-| `src/plan_file.rs` | 311 | Plan file parsing, I/O helpers with error observability |
+| `src/template.rs` | 297 | Plan template resolution, `{{CHANGE_ID}}` interpolation |
+| `src/plan_file.rs` | 310 | Plan file parsing, I/O helpers with error observability |
 | `src/error.rs` | 37 | `JjPlanError` enum via `thiserror` |
-| `src/commands/mod.rs` | 71 | `jj plan` subcommand dispatch |
-| `src/commands/config.rs` | 67 | `jj plan config` — read-only introspection |
+| `src/commands/mod.rs` | 73 | `jj plan` subcommand dispatch |
+| `src/commands/config.rs` | 68 | `jj plan config` — read-only introspection (jj-lib reads) |
 | `src/commands/help.rs` | 28 | `jj plan --help` text |
-| `src/commands/stack.rs` | 125 | `jj plan stack` — atomic stack creation |
-| `src/commands/new.rs` | 195 | `jj plan new` — plan change creation with `--first`/`--last` |
-| `src/commands/done.rs` | 310 | `jj plan done` — completion marking, scratch stripping, advance |
-| `src/commands/nav.rs` | 145 | `jj plan next`/`prev`/`go` — stack navigation |
-| `src/commands/abandon.rs` | 235 | `jj abandon` — bookmark recovery handler |
-| `src/commands/describe.rs` | 354 | `jj describe` — interception for `-m` mode |
+| `src/commands/stack.rs` | 128 | `jj plan stack` — atomic stack creation |
+| `src/commands/new.rs` | 189 | `jj plan new` — plan change creation with `--first`/`--last` |
+| `src/commands/done.rs` | 303 | `jj plan done` — completion marking, scratch stripping, advance |
+| `src/commands/nav.rs` | 159 | `jj plan next`/`prev`/`go` — stack navigation |
+| `src/commands/abandon.rs` | 121 | `jj abandon` — bookmark recovery handler (jj-lib reads, subprocess writes) |
+| `src/commands/describe.rs` | 334 | `jj describe` — interception for `-m` mode |
 
-Total: ~4,450 lines of Rust across 20 source files.
+Total: ~4,723 lines of Rust across 21 source files.
 
 ## Repo Root and Plan Directory Resolution
 
@@ -103,32 +106,33 @@ Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that
 All mutating commands go through `wrap::wrap()` in `src/wrap.rs`:
 
 ```
-flush_all()          ← files → jj (before the command)
-jj.run_inherit()     ← the actual jj command
-resolve_and_sync()   ← re-resolve stack, sync files, show summary
+flush_all()          ← files → jj (before the command; reads via jj-lib, writes via subprocess)
+jj.run_inherit()     ← the actual jj command (subprocess)
+loaded_repo.reload() ← refresh jj-lib snapshot after the mutation (~0.2ms)
+resolve_and_sync()   ← re-resolve stack via jj-lib, sync files, show summary
 ```
 
-**Ordering is critical**: flush before command ensures user edits are written to jj descriptions before the command modifies state. `resolve_and_sync()` after command ensures files reflect the new jj state.
+**Ordering is critical**: flush before command ensures user edits are written to jj descriptions before the command modifies state. After the subprocess command mutates the repository, `reload()` refreshes the in-process `ReadonlyRepo` snapshot so that `resolve_and_sync()` sees the new state via jj-lib.
 
 ### resolve_and_sync (`src/wrap.rs`)
 
 `resolve_and_sync()` is the canonical post-mutation sync path. It:
 
-1. Resolves the stack base (`resolve_stack_base`)
-2. Resolves stack changes (`resolve_stack_changes`)
+1. Resolves the stack base via jj-lib (`repo::resolve_stack_base_lib`)
+2. Resolves stack changes via jj-lib (`repo::resolve_stack_changes_lib`)
 3. Handles ambiguous bookmarks (sets error state)
 4. Calls `sync()` to update plan files
 5. Calls `show_stack()` to display the summary
 
-All command modules (`nav.rs`, `done.rs`, `new.rs`, `stack.rs`, `abandon.rs`) use this single function instead of maintaining their own `sync_and_show()` helpers. This ensures the stack is resolved exactly **once** per post-mutation sync, eliminating redundant `jj log` subprocess calls.
+All command modules (`nav.rs`, `done.rs`, `new.rs`, `stack.rs`, `abandon.rs`) use this single function instead of maintaining their own sync helpers. All reads are in-process via jj-lib — no subprocess calls.
 
 ### Flush (`src/flush.rs`)
 
 Structured as FC/IS (Functional Core / Imperative Shell):
 
-1. **Gather** (`gather_flush_state`): Reads plan file contents from disk via `plan_file::plan_files_by_id()`, batch-reads jj descriptions via `batch_read_by_ids()`.
+1. **Gather** (`gather_flush_state`): Reads plan file contents from disk via `plan_file::plan_files_by_id()`, batch-reads jj descriptions via jj-lib (`repo::gather_descriptions()`).
 2. **Plan** (`plan_flush`): Pure function — compares file contents against jj descriptions, produces `Vec<FlushAction>` for changes that differ.
-3. **Execute** (`execute_flush`): Shells out to `jj describe -r CHANGEID -m CONTENT` for each action.
+3. **Execute** (`execute_flush`): Shells out to `jj describe -r CHANGEID -m CONTENT` for each action. This is the only subprocess usage in flush — all reads are jj-lib.
 
 Skips flushing when in error state (`current.md` → `error.md`).
 
@@ -148,11 +152,43 @@ Also FC/IS:
 
 ## Repository Access
 
-A single `jj log` call using a custom template with RS (`\x1e`) field separators and NUL (`\0`) record separators. Parsed in Rust with type-safe `StackChange` structs (`src/stack.rs`):
+All repository reads use **jj-lib** for in-process access (`src/repo.rs`). The workspace and repository are loaded once at startup via `load_repo()` (~1ms), then refreshed after each CLI mutation via `LoadedRepo::reload()` (~0.2ms, calls `ReadonlyRepo::reload_at_head()`).
+
+### LoadedRepo lifecycle
+
+```
+main.rs: load_repo()     → LoadedRepo { workspace, repo }    (~1ms)
+wrap.rs: flush_all()     → reads via jj-lib (repo is fresh)
+         jj command      → subprocess mutation
+         repo.reload()   → refresh ReadonlyRepo snapshot      (~0.2ms)
+         resolve_and_sync() → reads via jj-lib (repo is fresh)
+```
+
+Commands that read stack state after `flush_all()` (which may call `jj describe`) must call `loaded_repo.reload()` before their reads to pick up flush mutations.
+
+### Read functions (`src/repo.rs`)
+
+| Function | Purpose |
+|---|---|
+| `resolve_stack_base_lib()` | Find nearest `stack`/`stack/*` bookmark or `trunk()` fallback |
+| `resolve_stack_changes_lib()` | Evaluate stack revset, return ordered `Vec<StackChange>` |
+| `batch_read_changes_lib()` | Evaluate arbitrary revset, return `Vec<StackChange>` |
+| `gather_descriptions()` | Read descriptions for plan file comparison (flush) |
+| `read_change_id_at_wc()` | Working copy's shortest change ID |
+| `read_description_at()` | Single change description by revset target |
+| `resolve_change_id()` | Resolve revset to shortest change ID |
+| `snapshot_bookmark_state()` | Pre-abandon bookmark snapshot for recovery |
+| `stack_bookmark_survives()` | Post-abandon bookmark existence check |
+| `commit_exists()` | Check if a revset target resolves |
+| `first_child_change_id()` | First child of a change (for abandon recovery) |
+
+All functions use jj-lib's revset engine (`revset::parse()` → `resolve_user_expression()` → `evaluate()`) and commit API (`Commit::description()`, `Commit::change_id()`, `Commit::parent_tree()`).
+
+### Domain types (`src/stack.rs`)
 
 ```rust
 pub struct StackChange {
-    pub change_id: String,      // shortest(8) prefix
+    pub change_id: String,      // shortest(8) prefix, reverse hex (k-z alphabet)
     pub description: String,    // full description text
     pub is_empty: bool,         // no file changes
     pub is_working_copy: bool,  // is @
@@ -160,12 +196,7 @@ pub struct StackChange {
 }
 ```
 
-The template format:
-```
-change_id.shortest(8) RS bookmarks.join(",") RS empty_flag RS wc_flag RS description NUL
-```
-
-`batch_read_changes()` handles the parsing — splitting by NUL for records, RS for fields, and rejoining if the description contained RS characters.
+Change IDs use jj's **reverse hex encoding** (`zyxwvutsrqponmlk` alphabet, not standard hex `0123456789abcdef`). This is critical: standard hex overlaps with commit ID prefixes and causes revset resolution failures. Use `jj_lib::hex_util::encode_reverse_hex()`.
 
 ## Markdown Processing (`src/markdown.rs`)
 
@@ -337,33 +368,55 @@ Protects `stack`/`stack/*` bookmarks from accidental deletion:
 
 ## Performance
 
-The shim adds overhead to every mutating command due to the flush→command→sync lifecycle. Key costs:
+The shim adds overhead to every mutating command due to the flush→command→reload→sync lifecycle. Key costs:
 
 | Operation | Cost | Notes |
 |---|---|---|
-| Repo root discovery | ~0ms | Filesystem walk for `.jj/` (was ~15ms via `jj root` subprocess) |
-| `jj log` (stack base) | ~22ms | Per subprocess call |
-| `jj log` (batch read) | ~20ms | Per subprocess call |
-| `jj describe` (flush) | ~21ms | Per changed file |
+| Repo root discovery | ~0ms | Filesystem walk for `.jj/` |
+| `load_repo()` (startup) | ~1ms | jj-lib workspace + repo load (once per invocation) |
+| `reload_at_head()` | ~0.2ms | Refresh repo snapshot after CLI mutation |
+| jj-lib revset evaluation | <1ms | Stack resolution, commit reads, bookmark enumeration |
+| `jj describe` (flush write) | ~21ms | Per changed file (subprocess) |
+| `jj edit` / `jj new` | ~60ms | CLI mutation subprocess |
 
 ### Subprocess call model
 
-The "resolve twice" model: stack state is resolved at most **twice** per command — once before the mutation (for flush) and once after (for sync via `resolve_and_sync()`). Commands that don't need pre-mutation stack data (e.g. `jj status`) resolve only once.
+All repository reads are in-process via jj-lib. Only mutations use subprocess calls. The subprocess count depends on the command:
 
-Typical subprocess counts per command:
-
-| Command | Subprocess calls | Overhead |
+| Command | Subprocess calls | Notes |
 |---|---|---|
-| `wrap` (e.g. `jj status`) | 4 (flush:batch_read + status + stack_base + stack_changes) | ~80ms |
-| `jj plan next/prev` | 6 (flush:batch_read + pre-resolve×2 + edit + post-resolve×2) | ~120ms |
-| `jj plan done` (with advance) | 8 (flush + pre-resolve×2 + describe + advance-resolve×2 + edit + post-resolve×2) | ~160ms |
+| `wrap` (e.g. `jj status`) | 1 (the command itself) | Flush reads + sync reads are jj-lib |
+| `jj plan next/prev` | 1 (`jj edit`) | Flush reads + stack resolution are jj-lib |
+| `jj plan done` (single) | 1-2 (`jj describe` + optional `jj edit` for advance) | Stack resolution via jj-lib |
+| `jj plan done --stack` | N (`jj describe` × N changes) | One subprocess per change |
+| `jj plan new` | 1-2 (`jj new` + `jj describe`) | Plus `jj bookmark set` if `--first` |
+| `jj plan stack` | 3 (`jj new` + `jj bookmark set` + `jj describe`) | Atomic stack creation |
+
+Flush adds 1 `jj describe` subprocess per changed plan file (only when file content differs from jj description).
 
 ### Measured overhead
 
-On a typical repo (this project, ~15 commits in history):
-- Raw `jj status`: ~18ms
-- Shimmed `jj status`: ~80ms
-- Shim overhead: ~62ms
+On a typical repo (this project, ~20 commits in history, warm cache, `/usr/bin/time`, best of 5):
+
+| Metric | Value |
+|---|---|
+| Raw `jj status` | ~10ms |
+| Shimmed `jj status` | ~55ms |
+| **Shim overhead** | **~45ms** |
+| Shimmed `jj plan next` | ~95ms |
+| Shimmed `jj plan done --dry-run` | <10ms |
+
+The ~45ms shim overhead breaks down as:
+- `load_repo()`: ~1ms
+- Flush (jj-lib reads): <1ms
+- `jj status` subprocess: ~45ms (includes process spawn + jj startup)
+- `reload_at_head()`: ~0.2ms
+- `resolve_and_sync` (jj-lib reads): <1ms
+- Binary startup / dynamic linking: ~5ms
+
+The jj-plan read overhead above the single subprocess call is **~2-3ms**.
+
+Previous overhead (before jj-lib, subprocess-only reads): ~115ms. The jj-lib migration reduced shim overhead by **~60%**.
 
 ## Testing
 
@@ -378,12 +431,12 @@ Two complementary test suites:
 
 ### Cargo (unit tests)
 
-`cargo test` — 88 unit tests for pure functions:
+`cargo test` — 87 unit tests for pure functions:
 - `markdown`: 20 tests (scratch stripping, code fence immunity, edge cases)
 - `template`: 14 tests (resolve chain, interpolation, default structure)
 - `commands/describe`: 17 tests (arg parsing for -m/-r variants)
 - `sync`: 11 tests (plan_sync pure logic)
-- `flush`: 5 tests (plan_flush pure logic)
+- `flush`: 4 tests (plan_flush pure logic)
 - `plan_file`: 13 tests (filename parsing, I/O helpers)
 - `plan_dir`: 8 tests (resolution chain, repo root discovery)
 
