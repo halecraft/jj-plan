@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::jj_binary::JjBinary;
 use crate::plan_file;
+use crate::repo::LoadedRepo;
 use crate::stack::{batch_read_by_ids, StackChange};
 
 /// Flush ALL local plan file edits to jj descriptions.
@@ -18,14 +19,14 @@ use crate::stack::{batch_read_by_ids, StackChange};
 /// - Gather: collect plan files + batch-read jj descriptions (I/O)
 /// - Plan: diff file contents against descriptions → `Vec<FlushAction>` (pure)
 /// - Execute: shell out `jj describe` for each FlushAction (I/O)
-pub fn flush_all(plan_dir: &Path, jj: &JjBinary) {
+pub fn flush_all(plan_dir: &Path, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) {
     // Don't flush if current.md points to error.md (error state)
     if plan_file::is_error_state(plan_dir) {
         return;
     }
 
     // GATHER — collect plan files and their contents + jj descriptions
-    let gathered = gather_flush_state(plan_dir, jj);
+    let gathered = gather_flush_state(plan_dir, jj, loaded_repo);
 
     // PLAN — pure diff logic, no I/O
     let actions = plan_flush(&gathered);
@@ -47,7 +48,10 @@ struct FlushGatherState {
 }
 
 /// Collect plan file contents and corresponding jj descriptions.
-fn gather_flush_state(plan_dir: &Path, jj: &JjBinary) -> FlushGatherState {
+///
+/// If `loaded_repo` is available, reads descriptions via jj-lib in-process.
+/// Otherwise falls back to subprocess-based `batch_read_by_ids`.
+fn gather_flush_state(plan_dir: &Path, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) -> FlushGatherState {
     let plan_files = plan_file::plan_files_by_id(plan_dir);
 
     if plan_files.is_empty() {
@@ -67,10 +71,15 @@ fn gather_flush_state(plan_dir: &Path, jj: &JjBinary) -> FlushGatherState {
     }
 
     // Batch-read jj descriptions for all change IDs
+    // Prefer jj-lib in-process reads; fall back to subprocess
     let change_ids: Vec<&str> = plan_files.keys().map(|s| s.as_str()).collect();
-    let jj_descriptions = match batch_read_by_ids(jj, &change_ids) {
-        Some(changes) => build_description_map(changes),
-        None => HashMap::new(),
+    let jj_descriptions = if let Some(loaded) = loaded_repo {
+        crate::repo::gather_descriptions(loaded, &change_ids)
+    } else {
+        match batch_read_by_ids(jj, &change_ids) {
+            Some(changes) => build_description_map(changes),
+            None => HashMap::new(),
+        }
     };
 
     FlushGatherState {

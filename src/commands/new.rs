@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::repo::LoadedRepo;
 use crate::template;
 
 /// Run `jj plan new` — create a new plan change in the stack.
@@ -15,7 +16,7 @@ use crate::template;
 ///
 /// After creating the change, a placeholder description is set and the
 /// plan directory is synced to reflect the new stack state.
-pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::error::Result<i32> {
+pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -46,7 +47,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::err
     // ------------------------------------------------------------------
     // 2. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // ------------------------------------------------------------------
     // 3. Resolve stack if --first or --last
@@ -193,6 +194,6 @@ fn find_stack_bookmark(bookmarks: &[String]) -> Option<String> {
 /// Shared epilogue for all three paths (--first, --last, default).
 fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str) -> crate::error::Result<i32> {
     eprintln!("Created plan change: jj:{}", new_id);
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
     Ok(0)
 }

@@ -6,6 +6,7 @@ mod template;
 mod jj_binary;
 mod plan_dir;
 mod plan_file;
+mod repo;
 mod stack;
 mod sync;
 mod wrap;
@@ -13,6 +14,7 @@ mod wrap;
 use error::JjPlanError;
 use jj_binary::JjBinary;
 use plan_dir::{find_repo_root, resolve_plan_dir};
+use repo::LoadedRepo;
 
 /// Read-only commands that get zero-overhead passthrough via exec.
 /// Note: status/st are NOT here — they get special handling to append .stack.
@@ -97,19 +99,22 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
         }
     };
 
+    // Load jj-lib repo for in-process reads (graceful: None on failure)
+    let loaded_repo = repo::load_repo(&repo_root);
+
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args);
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, loaded_repo.as_ref());
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args);
+        return commands::abandon::run_abandon(jj, &plan_dir, args, loaded_repo.as_ref());
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args);
+        return commands::describe::handle_describe(jj, &plan_dir, args, loaded_repo.as_ref());
     }
 
     // All other commands: wrap handler (flush → command → sync → show)
@@ -120,5 +125,5 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     //   2. run jj       — execute the actual jj command
     //   3. sync()       — mirror jj state back to plan files
     //   4. show_stack() — display the plan stack summary
-    wrap::wrap(&plan_dir, jj, args)
+    wrap::wrap(&plan_dir, jj, args, loaded_repo.as_ref())
 }

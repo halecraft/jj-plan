@@ -1,12 +1,26 @@
 #!/usr/bin/env bats
 
 # Tests for jj-plan
-# Run: bats jj-plan.bats
+# Run: cargo build --release && bats jj-plan.bats
 #
-# Requires ~/.local/bin/jj shim to be in PATH ahead of the real jj binary.
+# Uses the freshly-built target/release/jj-plan binary (no system-wide install).
+# Override with JJ_PLAN_BIN=path/to/binary if needed.
 
 REAL_JJ="/opt/homebrew/bin/jj"
-SHIM_JJ="$HOME/.local/bin/jj"
+
+# Resolve the shim binary: env override, or default to target/release/jj-plan
+JJ_PLAN_BIN="${JJ_PLAN_BIN:-$BATS_TEST_DIRNAME/target/release/jj-plan}"
+
+# Create a temp directory with a `jj` symlink pointing to the shim binary.
+# This lets PATH-based dispatch work without installing system-wide.
+setup_file() {
+  export SHIM_DIR="$(mktemp -d)"
+  ln -s "$(cd "$BATS_TEST_DIRNAME" && realpath "$JJ_PLAN_BIN")" "$SHIM_DIR/jj"
+}
+
+teardown_file() {
+  rm -rf "$SHIM_DIR"
+}
 
 # Helper: run a zsh script in a fresh jj repo with .jj-plan/ activated.
 # Sets a "stack" bookmark on the initial commit — that commit IS the first
@@ -14,7 +28,7 @@ SHIM_JJ="$HOME/.local/bin/jj"
 run_in_repo() {
   local script="$1"
   run zsh -c "
-    export PATH=\"$HOME/.local/bin:\$PATH\"
+    export PATH=\"$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
     REAL_JJ=\"$REAL_JJ\"
     cd \"\$(mktemp -d)\"
     $REAL_JJ git init 2>/dev/null
@@ -29,7 +43,7 @@ run_in_repo_with_max() {
   local max="$1"
   local script="$2"
   run zsh -c "
-    export PATH=\"$HOME/.local/bin:\$PATH\"
+    export PATH=\"$SHIM_DIR:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin\"
     export JJ_PLAN_MAX=$max
     REAL_JJ=\"$REAL_JJ\"
     cd \"\$(mktemp -d)\"

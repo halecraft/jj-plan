@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::repo::LoadedRepo;
 use crate::template;
 
 /// Run `jj plan stack` — create a new stack with a single plan (jj change).
@@ -30,6 +31,7 @@ pub fn run_stack(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
+    loaded_repo: Option<&LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // -----------------------------------------------------------------------
     // 1. Parse args: `-r <rev>` and positional stack name
@@ -63,7 +65,7 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 3. Flush local plan edits to jj descriptions
     // -----------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // -----------------------------------------------------------------------
     // 4. Create new change
@@ -121,7 +123,7 @@ pub fn run_stack(
     // 8. Print summary and sync
     // -----------------------------------------------------------------------
     eprintln!("Started new stack: {} ({})", bookmark_name, change_id);
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
 
     Ok(0)
 }

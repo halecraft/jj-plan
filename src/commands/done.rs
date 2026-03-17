@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::markdown::strip_scratch_sections;
 use crate::plan_dir::PlanDir;
+use crate::repo::LoadedRepo;
 use crate::stack::StackChange;
 
 /// Run `jj plan done` — mark one or all plans as done.
@@ -17,7 +18,7 @@ use crate::stack::StackChange;
 ///
 /// When marking a single plan done (the default), if the target is the
 /// working copy (`@`), automatically advances to the next undone plan.
-pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::error::Result<i32> {
+pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -38,7 +39,7 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::er
     // ------------------------------------------------------------------
     // 2. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // ------------------------------------------------------------------
     // 3. Resolve stack
@@ -101,7 +102,7 @@ fn run_done_stack(
     }
 
     // Sync and show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
 
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
@@ -180,7 +181,7 @@ fn run_done_single(
     }
 
     // Sync and show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
     Ok(0)
 }
 

@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_file;
+use crate::repo::LoadedRepo;
 
 /// Intercept `jj describe -m "..."` to write the message to the plan file first.
 ///
@@ -20,13 +21,14 @@ pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
+    loaded_repo: Option<&LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // 1. Parse describe args to find -m/--message values and -r/--revision target
     let parsed = parse_describe_args(args);
 
     // If no -m/--message found, this is editor-mode → pass through to wrap
     if parsed.messages.is_empty() {
-        return crate::wrap::wrap(plan_dir, jj, args);
+        return crate::wrap::wrap(plan_dir, jj, args, loaded_repo);
     }
 
     // 2. Build the concatenated message (jj concatenates multiple -m with newlines)
@@ -63,7 +65,7 @@ pub fn handle_describe(
     // After flush, jj description matches the file. Then `jj describe -m "..."`
     // sets the same content again (idempotent). Then sync reads jj and writes
     // back to files. All consistent.
-    crate::wrap::wrap(plan_dir, jj, args)
+    crate::wrap::wrap(plan_dir, jj, args, loaded_repo)
 }
 
 // ---------------------------------------------------------------------------

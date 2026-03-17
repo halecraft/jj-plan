@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::repo::LoadedRepo;
 use crate::stack::StackChange;
 
 /// Run `jj plan next` — advance `@` to the next change in the stack.
@@ -7,9 +8,9 @@ use crate::stack::StackChange;
 /// Lifecycle: flush → resolve stack → find current position → navigate → sync → show.
 ///
 /// If `@` is already the last plan, prints a message and stays put.
-pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32> {
+pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // 2. Resolve stack
     let (changes, current_idx) = match resolve_stack_and_position(jj) {
@@ -23,7 +24,7 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     // 3. Check if already at the last plan
     if current_idx >= changes.len() - 1 {
         eprintln!("Already at the last plan in the stack");
-        crate::wrap::resolve_and_sync(plan_dir, jj);
+        crate::wrap::resolve_and_sync(plan_dir, jj, None);
         return Ok(0);
     }
 
@@ -35,7 +36,7 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     }
 
     // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
     Ok(0)
 }
 
@@ -44,9 +45,9 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
 /// Lifecycle: flush → resolve stack → find current position → navigate → sync → show.
 ///
 /// If `@` is already the first plan, prints a message and stays put.
-pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32> {
+pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // 2. Resolve stack
     let (changes, current_idx) = match resolve_stack_and_position(jj) {
@@ -60,7 +61,7 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     // 3. Check if already at the first plan
     if current_idx == 0 {
         eprintln!("Already at the first plan in the stack");
-        crate::wrap::resolve_and_sync(plan_dir, jj);
+        crate::wrap::resolve_and_sync(plan_dir, jj, None);
         return Ok(0);
     }
 
@@ -72,7 +73,7 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     }
 
     // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
     Ok(0)
 }
 
@@ -87,9 +88,10 @@ pub fn plan_go(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     target: &str,
+    loaded_repo: Option<&LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // 2. Resolve stack
     let base = crate::stack::resolve_stack_base(jj);
@@ -129,7 +131,7 @@ pub fn plan_go(
     }
 
     // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
     Ok(0)
 }
 

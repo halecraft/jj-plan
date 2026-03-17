@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::repo::LoadedRepo;
 
 /// Pre-abandon snapshot of the stack bookmark state.
 ///
@@ -192,6 +193,7 @@ pub fn run_abandon(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
+    loaded_repo: Option<&LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Check for --retain-bookmarks
@@ -210,7 +212,7 @@ pub fn run_abandon(
     // ------------------------------------------------------------------
     // 3. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
 
     // ------------------------------------------------------------------
     // 4. Run the abandon command with all original args
@@ -230,7 +232,7 @@ pub fn run_abandon(
     // ------------------------------------------------------------------
     // 6. Sync plan files + show stack
     // ------------------------------------------------------------------
-    crate::wrap::resolve_and_sync(plan_dir, jj);
+    crate::wrap::resolve_and_sync(plan_dir, jj, None);
 
     Ok(exit_code)
 }
