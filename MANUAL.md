@@ -620,6 +620,21 @@ jj evolog -r CHANGE_ID
 jj evolog -r CHANGE_ID -p
 ```
 
+### Extract the same section from prior plans
+
+Because plans are structured markdown in version history, you can pull the same section from earlier plans to compare decisions, post-implementation reflections, alternatives considered, and patterns.
+
+```sh
+# Pull one named section from an earlier plan
+jj show rtssrkto --git 2>&1 | grep -A5 "Post-implementation Reflections"
+
+# Search for the same heading across multiple plans
+jj log -r '::@' -T 'change_id.shortest() ++ " " ++ description.first_line() ++ "\n"' \
+| grep '^[a-z]'
+```
+
+This is especially useful when your plans share consistent headings such as `## Alternatives Considered`, `## Post-implementation Reflections`, or `## Risks`. Humans and AI can reuse the relevant slice of prior reasoning without rereading the entire plan.
+
 ### Cross-reference plans
 
 Reference other plans by change ID in your plan description:

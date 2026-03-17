@@ -120,6 +120,8 @@ Plan (jj description) → Code (references jj:CHANGE_ID) → Archaeology (jj sho
 
 No context is lost. No documentation rots.
 
+Because plans are structured markdown documents stored in version history, your implementation history becomes a queryable library of decisions, post-implementation reflections, alternatives considered, and patterns. Humans and AI can pull the relevant section from prior work without rereading entire plans.
+
 ---
 
 ## Why Plan-Oriented Programming?

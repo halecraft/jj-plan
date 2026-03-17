@@ -10,6 +10,11 @@ The binary resolves the real `jj` binary by walking `$PATH` and skipping itself 
 
 If jj-lib cannot load the repository (version mismatch, corrupt state), the binary degrades gracefully to exec passthrough — the jj command runs directly without plan sync features.
 
+## See Also
+
+- [README.md](README.md) — Project overview, philosophy, and quick start.
+- [MANUAL.md](MANUAL.md) — Exhaustive command reference, best practices, and recipes.
+
 ## Project Structure
 
 | Module | Lines | Responsibility |
@@ -59,17 +64,68 @@ When `.jj-plan/` and `.jj-plans/` both exist, `.jj-plan/` wins.
 
 Implementation: `src/plan_dir.rs` — `find_repo_root()` returns `Option<PathBuf>`, `resolve_plan_dir()` returns `Option<PlanDir>` with `PlanDirSource` enum.
 
-## Stack Base Resolution
+## Stack Bookmarks
 
-The binary needs to know which changes belong to the current stack. Resolution via `resolve_stack_base()` in `src/stack.rs`:
+The binary uses `stack` / `stack/*` bookmarks to determine which changes belong to the current plan stack. For user-facing documentation, see [MANUAL.md § Stacks](MANUAL.md#stacks).
 
-1. **`stack` / `stack/*` bookmarks** — finds `heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)`. If exactly one head: **inclusive** range (`base::@`). The bookmarked change IS the first stack member. If multiple equidistant heads: error (ambiguous siblings).
+### Inclusive model
+
+The bookmark is placed **on the first change in the stack**, not before it. The bookmarked change is a stack member. This is the natural instinct — you mark the work itself:
+
+```
+○ landed work
+○ feat: SchemaRef          ← stack/typed-interpret (first member)
+○ feat: typed interpret
+○ refactor: remove casts
+@ docs: update TECHNICAL
+```
+
+### Bare `stack` vs named `stack/*`
+
+- **`stack`** (bare) — a quick unnamed stack. Use when you only have one stack at a time.
+- **`stack/my-feature`** (named) — a named stack. Use when you have concurrent work. `jj bookmark list stack/*` shows all active stacks.
+
+### Resolution algorithm
+
+Resolution is implemented in `resolve_stack_base_lib()` in `src/repo.rs`:
+
+1. **`stack` / `stack/*` bookmarks** — evaluates `heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)`. If exactly one head: **inclusive** range (`base::@`). The bookmarked change IS the first stack member. If multiple equidistant heads: error (ambiguous siblings).
 2. **`trunk()`** — if it resolves to something other than `root()`: **exclusive** range (`trunk()..@`). The trunk commit is NOT part of the stack.
 3. **No usable base** — no sync occurs.
 
 Both modes also include `descendants(@)` to capture changes ahead of the working copy.
 
 Returns `StackBase` enum: `Inclusive(change_id)`, `Exclusive`, or `Ambiguous(Vec<change_id>)`.
+
+### Nearest-ancestor resolution
+
+When multiple `stack` / `stack/*` bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the binary always picks the right one:
+
+```
+○ stack/phase1 (old, farther from @)
+○ phase 1 work
+○ stack/phase2 (nearer to @, wins)
+○ phase 2 work
+@ current
+```
+
+If two `stack/*` bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), `StackBase::Ambiguous` is returned and an error is produced asking the user to advance or remove one.
+
+### Fallback to `trunk()`
+
+If no `stack` / `stack/*` bookmark is an ancestor of `@`, the binary falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
+
+If neither a stack bookmark nor `trunk()` can be resolved, no sync occurs.
+
+### "Done" workflow
+
+When you finish a stack, you don't need to move or delete any bookmarks. Just start a new stack:
+
+```sh
+jj plan stack next-task                # atomic: creates change + sets stack/next-task bookmark
+```
+
+The old `stack/old-task` bookmark stays where it is — it's historical. The binary automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's.
 
 ## Command Dispatch
 
@@ -241,6 +297,8 @@ The built-in default template:
 
 ## Describe Interception (`src/commands/describe.rs`)
 
+For user-facing documentation, flags, and examples, see [MANUAL.md § jj describe](MANUAL.md#jj-describe).
+
 When `jj describe -m "..."` is invoked:
 
 1. Parse args: extract all `-m`/`--message` values and `-r`/`--revision` target.
@@ -257,6 +315,8 @@ This eliminates the "NEVER call `jj describe` directly" rule — the binary hand
 
 ## Stack Navigation (`src/commands/nav.rs`)
 
+For user-facing documentation and examples, see [MANUAL.md § jj plan next](MANUAL.md#jj-plan-next), [jj plan prev](MANUAL.md#jj-plan-prev), and [jj plan go](MANUAL.md#jj-plan-go).
+
 Three commands, all following the same lifecycle: flush → resolve stack → navigate → sync → show.
 
 - **`jj plan next`**: Find `@` position in stack. If last → print "Already at the last plan" and stay put. Otherwise → `jj edit -r $next_id`.
@@ -266,6 +326,8 @@ Three commands, all following the same lifecycle: flush → resolve stack → na
 Shared helper `resolve_stack_and_position()` returns `(Vec<StackChange>, current_index)`.
 
 ## `jj plan stack` (`src/commands/stack.rs`)
+
+For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan stack](MANUAL.md#jj-plan-stack).
 
 Atomic stack creation:
 
@@ -280,6 +342,8 @@ Atomic stack creation:
 9. `sync()` + `show_stack()`.
 
 ## `jj plan new` (`src/commands/new.rs`)
+
+For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan new](MANUAL.md#jj-plan-new).
 
 Creates a change with a templated description:
 
@@ -304,6 +368,8 @@ Insert after the last stack member.
 
 ## `jj plan done` (`src/commands/done.rs`)
 
+For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan done](MANUAL.md#jj-plan-done).
+
 Mark one or all plans as done:
 
 1. `flush_all()`.
@@ -319,6 +385,8 @@ Flags: `--stack` (all plans), `--keep-scratch`, `--dry-run`, positional `CHANGE_
 
 ## `jj plan config` (`src/commands/config.rs`)
 
+For user-facing documentation and examples, see [MANUAL.md § jj plan config](MANUAL.md#jj-plan-config).
+
 Read-only introspection — no flush, no sync. Prints:
 - shim path, real jj binary, repo root
 - JJ_PLAN_DIR env, JJ_PLAN_MAX env
@@ -326,6 +394,8 @@ Read-only introspection — no flush, no sync. Prints:
 - stack base (with range mode), stack size
 
 ## Abandon Recovery (`src/commands/abandon.rs`)
+
+For user-facing documentation, see [MANUAL.md § jj abandon](MANUAL.md#jj-abandon).
 
 Protects `stack`/`stack/*` bookmarks from accidental deletion:
 
@@ -444,3 +514,22 @@ Two complementary test suites:
 - `plan_dir`: 8 tests (resolution chain, repo root discovery)
 
 The FC/IS pattern ensures all business logic is unit-testable without subprocess overhead.
+
+## Migration from zsh shim
+
+If you were using the zsh shim (`jj-plan.zsh`):
+
+1. **Prerequisites**: Rust toolchain (1.89+).
+2. **Build**: `cargo build --release` in the jj-plan repo.
+3. **Install**: Remove the old symlink and copy the binary:
+   ```sh
+   rm ~/.local/bin/jj                           # remove symlink to jj-plan.zsh
+   cp target/release/jj-plan ~/.local/bin/jj    # install Rust binary
+   ```
+4. **Verify**: `jj plan config` — `shim path:` should point to the new binary (not `.zsh`).
+5. **Behavioral changes**:
+   - `jj describe -m "..."` is now intercepted and routed through plan files automatically. The "NEVER call `jj describe` directly" rule is no longer needed.
+   - `jj plan new` and `jj plan stack` now seed descriptions with a structured template instead of `(placeholder: jj:CHANGE_ID)`. The template starts with `(plan: jj:CHANGE_ID)`.
+   - New commands available: `done`, `next`, `prev`, `go`.
+   - `[scratch]` convention: mark any heading with `[scratch]` for working memory that gets cleaned up on `jj plan done`.
+6. The zsh shim (`jj-plan.zsh`) remains in the repo as a reference but is no longer maintained.
