@@ -425,9 +425,12 @@ Two complementary test suites:
 ### Bats (behavioral/acceptance)
 
 `bats jj-plan.bats` — 138 tests validating the installed binary from the outside:
-- `run_in_repo`: creates a temp jj repo with `stack` bookmark and `.jj-plan/` activated
-- Tests call the shim via `$PATH` and assert on stdout/stderr and file state
-- `REAL_JJ` (`/opt/homebrew/bin/jj`) bypasses the shim for direct jj calls
+- **Template repo**: `setup_file()` pre-creates a jj repo with `stack` bookmark + `.jj-plan/`. Each test gets an isolated copy via `cp -r` (~2ms vs ~100ms for `jj git init`).
+- **Per-test isolation**: `setup()` copies the template and `cd`s into it. `teardown()` removes it. No shared mutable state between tests.
+- **Direct bats style**: Tests run commands inline (no `run_in_repo` wrapper, no `zsh -c` subprocess). Assertions use direct value checks (`[[ "$(cat file)" == "..." ]]`) instead of echo/grep patterns.
+- **Parallel support**: `bats jj-plan.bats --jobs 8` runs in ~31s (vs ~54s sequential, ~64s before this rewrite). Requires GNU `parallel` (`brew install parallel`).
+- `REAL_JJ` (`/opt/homebrew/bin/jj`) bypasses the shim for direct jj calls and repo setup.
+- `$SHIM_DIR` is set once in `setup_file()` and added to `$PATH` globally — no test uses `$HOME/.local/bin`.
 
 ### Cargo (unit tests)
 

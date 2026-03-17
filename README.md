@@ -252,6 +252,39 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 8. Complete: `jj plan done` marks the current plan as done, strips `[scratch]` sections, and advances to the next undone plan.
 9. Introspect: `jj plan config` shows resolved configuration and stack info. `jj plan --help` for all options.
 
+## Development
+
+### Running tests
+
+The recommended way to build and test:
+
+```sh
+./test.sh              # build + run 138 bats tests (8 parallel jobs)
+./test.sh --jobs=4     # fewer parallel jobs (if system is constrained)
+./test.sh --no-build   # skip cargo build, just run tests
+```
+
+Or manually:
+
+```sh
+cargo build --release
+bats jj-plan.bats --jobs 8     # parallel (requires: brew install parallel)
+bats jj-plan.bats              # sequential (~54s)
+cargo test                     # 87 unit tests (<1s)
+```
+
+Parallel execution requires GNU `parallel`:
+
+```sh
+brew install parallel          # macOS
+```
+
+### Test architecture
+
+- **Template repo**: A jj repo with `stack` bookmark + `.jj-plan/` is created once per run. Each test gets an isolated `cp -r` copy (~2ms).
+- **Direct bats style**: Tests run commands inline — no wrapper functions, no subshells. Assertions check values directly (`[[ "$(cat file)" == "expected" ]]`).
+- **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
+
 ## Environment Variables
 
 | Variable | Purpose | Default |
