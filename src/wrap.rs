@@ -23,8 +23,6 @@ pub fn wrap(
     jj: &JjBinary,
     args: &[String],
 ) -> crate::error::Result<i32> {
-    let max_stack_size = crate::plan_dir::plan_max();
-
     // 1. Flush all local plan file edits to jj descriptions
     crate::flush::flush_all(&plan_dir.path, jj);
 
@@ -32,17 +30,27 @@ pub fn wrap(
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
-    // 3. Re-resolve the stack (repo state may have changed)
-    //    We must re-read from jj after the mutation.
-    let (_stack_base, stack_changes) = resolve_fresh_stack(jj, &plan_dir.path);
-
-    // 4. Sync jj state back to plan files
-    sync::sync(plan_dir, stack_changes.as_deref(), max_stack_size);
-
-    // 5. Display the plan stack summary
-    sync::show_stack(plan_dir);
+    // 3-5. Re-resolve stack, sync plan files, show stack summary
+    resolve_and_sync(plan_dir, jj);
 
     Ok(exit_code)
+}
+
+/// Canonical post-mutation sync: resolve stack → sync plan files → show stack.
+///
+/// This is the single entry point for "re-read jj state and update plan files
+/// after a mutation". All command modules should call this instead of
+/// maintaining their own `sync_and_show()` helpers.
+///
+/// Handles:
+/// - Normal stack resolution (inclusive bookmark or exclusive trunk)
+/// - Ambiguous sibling bookmarks → sets error state
+/// - No usable base → passes None to sync (bookmark-loss detection)
+pub fn resolve_and_sync(plan_dir: &PlanDir, jj: &JjBinary) {
+    let max_stack_size = crate::plan_dir::plan_max();
+    let (_stack_base, stack_changes) = resolve_fresh_stack(jj, &plan_dir.path);
+    sync::sync(plan_dir, stack_changes.as_deref(), max_stack_size);
+    sync::show_stack(plan_dir);
 }
 
 /// Re-resolve the stack base and changes after a mutation.

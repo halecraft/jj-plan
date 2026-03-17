@@ -23,7 +23,7 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     // 3. Check if already at the last plan
     if current_idx >= changes.len() - 1 {
         eprintln!("Already at the last plan in the stack");
-        sync_and_show(jj, plan_dir);
+        crate::wrap::resolve_and_sync(plan_dir, jj);
         return Ok(0);
     }
 
@@ -35,7 +35,7 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     }
 
     // 5. Sync + show stack
-    sync_and_show(jj, plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
     Ok(0)
 }
 
@@ -60,7 +60,7 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     // 3. Check if already at the first plan
     if current_idx == 0 {
         eprintln!("Already at the first plan in the stack");
-        sync_and_show(jj, plan_dir);
+        crate::wrap::resolve_and_sync(plan_dir, jj);
         return Ok(0);
     }
 
@@ -72,7 +72,7 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir) -> crate::error::Result<i32>
     }
 
     // 5. Sync + show stack
-    sync_and_show(jj, plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
     Ok(0)
 }
 
@@ -129,7 +129,7 @@ pub fn plan_go(
     }
 
     // 5. Sync + show stack
-    sync_and_show(jj, plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
     Ok(0)
 }
 
@@ -148,13 +148,3 @@ fn resolve_stack_and_position(jj: &JjBinary) -> Option<(Vec<StackChange>, usize)
     Some((changes, current_idx))
 }
 
-/// Sync the plan directory and show the stack summary.
-fn sync_and_show(jj: &JjBinary, plan_dir: &PlanDir) {
-    let max = crate::plan_dir::plan_max();
-    let base = crate::stack::resolve_stack_base(jj);
-    let changes = base
-        .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-    crate::sync::sync(plan_dir, changes.as_deref(), max);
-    crate::sync::show_stack(plan_dir);
-}

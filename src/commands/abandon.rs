@@ -230,15 +230,7 @@ pub fn run_abandon(
     // ------------------------------------------------------------------
     // 6. Sync plan files + show stack
     // ------------------------------------------------------------------
-    let max = crate::plan_dir::plan_max();
-
-    let base = crate::stack::resolve_stack_base(jj);
-    let changes = base
-        .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-
-    crate::sync::sync(plan_dir, changes.as_deref(), max);
-    crate::sync::show_stack(plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
 
     Ok(exit_code)
 }

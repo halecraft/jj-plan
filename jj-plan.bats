@@ -1901,6 +1901,28 @@ Need JWT and API key support
   [[ "$output" == *"ADVANCED:yes"* ]]
 }
 
+@test "jj plan done wraps around to earlier undone plan when at end of stack" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 3"
+    P3=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    # Mark plan 2 done (middle), leave plan 1 undone
+    jj plan done "$P2"
+    # Now at plan 3 (last); mark it done — should wraparound to plan 1
+    jj edit -r "$P3"
+    jj plan done
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    echo "P1:$P1"
+    echo "CUR:$CUR"
+    [[ "$CUR" == "$P1" ]] && echo "WRAPPED:yes" || echo "WRAPPED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"WRAPPED:yes"* ]]
+}
+
 @test "jj plan done --dry-run does not modify description" {
   run_in_repo '
     jj describe -m "My plan

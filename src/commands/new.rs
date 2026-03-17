@@ -192,17 +192,7 @@ fn find_stack_bookmark(bookmarks: &[String]) -> Option<String> {
 ///
 /// Shared epilogue for all three paths (--first, --last, default).
 fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str) -> crate::error::Result<i32> {
-    let max = crate::plan_dir::plan_max();
-
-    let base = crate::stack::resolve_stack_base(jj);
-    let changes = base
-        .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-
-    crate::sync::sync(plan_dir, changes.as_deref(), max);
-
     eprintln!("Created plan change: jj:{}", new_id);
-    crate::sync::show_stack(plan_dir);
-
+    crate::wrap::resolve_and_sync(plan_dir, jj);
     Ok(0)
 }

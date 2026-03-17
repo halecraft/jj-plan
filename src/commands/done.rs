@@ -101,7 +101,7 @@ fn run_done_stack(
     }
 
     // Sync and show stack
-    sync_and_show(jj, plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
 
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
@@ -180,7 +180,7 @@ fn run_done_single(
     }
 
     // Sync and show stack
-    sync_and_show(jj, plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
     Ok(0)
 }
 
@@ -228,8 +228,12 @@ fn append_done_marker(desc: &str, already_done: bool) -> String {
 
 /// After marking the current working copy done, re-resolve the stack and
 /// advance (`jj edit`) to the next undone change.
+///
+/// Re-resolves the stack once (after the describe mutation), then searches
+/// forward (with wraparound) for the next undone change. After `jj edit`,
+/// calls `resolve_and_sync()` exactly once to update plan files.
 fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir) {
-    // Re-resolve the stack after the describe
+    // Re-resolve the stack once after the describe
     let base = crate::stack::resolve_stack_base(jj);
     let changes = base
         .as_ref()
@@ -246,36 +250,27 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir) {
         None => return,
     };
 
-    // Search forward from the current position for the next undone change
-    for change in &changes[current_idx + 1..] {
-        if !change.is_done() {
+    // Search forward then wraparound for the next undone change
+    let forward = &changes[current_idx + 1..];
+    let wraparound = &changes[..current_idx];
+    let next_undone = forward.iter().chain(wraparound.iter()).find(|c| !c.is_done());
+
+    match next_undone {
+        Some(change) => {
             let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
-            // Sync after edit so plan files reflect the new working copy
+            // Single resolve_and_sync after the edit (no show_stack — the
+            // caller's final resolve_and_sync will display)
             let max = crate::plan_dir::plan_max();
             let base2 = crate::stack::resolve_stack_base(jj);
             let changes2 = base2
                 .as_ref()
                 .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
             crate::sync::sync(plan_dir, changes2.as_deref(), max);
-            return;
+        }
+        None => {
+            eprintln!("All plans in stack are done 🎉");
         }
     }
-
-    // Also check from the beginning up to current_idx (wrap around)
-    for change in &changes[..current_idx] {
-        if !change.is_done() {
-            let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
-            let max = crate::plan_dir::plan_max();
-            let base2 = crate::stack::resolve_stack_base(jj);
-            let changes2 = base2
-                .as_ref()
-                .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-            crate::sync::sync(plan_dir, changes2.as_deref(), max);
-            return;
-        }
-    }
-
-    eprintln!("All plans in stack are done 🎉");
 }
 
 /// Print a dry-run diff for a single change, showing what sections would be
@@ -313,13 +308,3 @@ fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
     eprintln!();
 }
 
-/// Sync the plan directory and show the stack summary.
-fn sync_and_show(jj: &JjBinary, plan_dir: &PlanDir) {
-    let max = crate::plan_dir::plan_max();
-    let base = crate::stack::resolve_stack_base(jj);
-    let changes = base
-        .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-    crate::sync::sync(plan_dir, changes.as_deref(), max);
-    crate::sync::show_stack(plan_dir);
-}

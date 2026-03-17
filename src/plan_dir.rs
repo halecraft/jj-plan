@@ -1,5 +1,20 @@
 use std::path::{Path, PathBuf};
 
+/// Discover the jj repo root by walking up from `cwd` looking for `.jj/`.
+///
+/// This replaces the `jj root` subprocess call (~15ms) with a pure
+/// filesystem walk (~0ms). Mirrors the logic in jj's own CLI:
+/// `cli/src/cli_util.rs::find_workspace_dir()`.
+///
+/// Returns `Some(path)` where `path` is the directory containing `.jj/`,
+/// or `None` if no `.jj/` directory is found in any ancestor.
+pub fn find_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    cwd.ancestors()
+        .find(|path| path.join(".jj").is_dir())
+        .map(|p| p.to_path_buf())
+}
+
 /// How the plan directory was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanDirSource {
@@ -159,5 +174,36 @@ mod tests {
         // (Can't reliably test env override without env manipulation)
         // Just verify the function doesn't panic
         let _max = plan_max();
+    }
+
+    #[test]
+    fn ancestor_walk_finds_repo_root_from_nested_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join(".jj")).unwrap();
+        let subdir = root.join("src").join("commands").join("deep");
+        fs::create_dir_all(&subdir).unwrap();
+
+        // The ancestor walk (same logic as find_repo_root) must find the
+        // nearest ancestor containing .jj/, skipping the subdirectories
+        let found = subdir
+            .ancestors()
+            .find(|p| p.join(".jj").is_dir())
+            .map(|p| p.to_path_buf());
+        assert_eq!(found, Some(root.to_path_buf()));
+    }
+
+    #[test]
+    fn ancestor_walk_returns_none_when_no_jj_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leaf = tmp.path().join("a").join("b");
+        fs::create_dir_all(&leaf).unwrap();
+
+        // No .jj/ anywhere under tmp — walk must not find one within our tree
+        let found = leaf
+            .ancestors()
+            .take_while(|p| p.starts_with(tmp.path()))
+            .find(|p| p.join(".jj").is_dir());
+        assert!(found.is_none());
     }
 }

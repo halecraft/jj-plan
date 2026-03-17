@@ -118,24 +118,10 @@ pub fn run_stack(
     let _ = jj.run_silent(&["describe", "-m", &description]);
 
     // -----------------------------------------------------------------------
-    // 8. Sync plan directory to reflect the new stack
-    // -----------------------------------------------------------------------
-    let max = crate::plan_dir::plan_max();
-    let base = crate::stack::resolve_stack_base(jj);
-    let changes = base
-        .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
-    crate::sync::sync(plan_dir, changes.as_deref(), max);
-
-    // -----------------------------------------------------------------------
-    // 9. Print summary (to stderr, matching zsh shim convention)
+    // 8. Print summary and sync
     // -----------------------------------------------------------------------
     eprintln!("Started new stack: {} ({})", bookmark_name, change_id);
-
-    // -----------------------------------------------------------------------
-    // 10. Show the stack
-    // -----------------------------------------------------------------------
-    crate::sync::show_stack(plan_dir);
+    crate::wrap::resolve_and_sync(plan_dir, jj);
 
     Ok(0)
 }

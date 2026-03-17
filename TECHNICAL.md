@@ -6,19 +6,19 @@
 
 jj-plan is a Rust binary installed as `jj` in `$PATH`, shadowing the real jj binary. It intercepts mutating commands to keep a `.jj-plan/` directory in sync with the current stack's change descriptions. Read-only commands (`log`, `diff`, `show`, etc.) pass through with zero overhead via Unix `exec`.
 
-The binary resolves the real `jj` binary by walking `$PATH` and skipping itself (via `std::fs::canonicalize` comparison). All repository access uses `jj` subprocess calls — the binary does not link `jj-lib`.
+The binary resolves the real `jj` binary by walking `$PATH` and skipping itself (via `std::fs::canonicalize` comparison). All repository access uses `jj` subprocess calls — the binary does not link `jj-lib`. Repo root discovery uses a filesystem walk for `.jj/` (no subprocess).
 
 ## Project Structure
 
 | Module | Lines | Responsibility |
 |---|---|---|
 | `src/main.rs` | 122 | Argument parsing, top-level dispatch, read-only passthrough |
-| `src/jj_binary.rs` | 157 | Real jj binary resolution, `exec`/`run_inherit`/`run_silent` helpers |
-| `src/plan_dir.rs` | 163 | Plan directory resolution (env → `.jj-plan/` → `.jj-plans/`) |
+| `src/jj_binary.rs` | 145 | Real jj binary resolution, `exec`/`run_inherit`/`run_silent` helpers |
+| `src/plan_dir.rs` | 220 | Repo root discovery, plan directory resolution (env → `.jj-plan/` → `.jj-plans/`) |
 | `src/stack.rs` | 213 | Stack base resolution, `StackChange` struct, `batch_read_changes` |
 | `src/sync.rs` | 580 | FC/IS sync: gather → plan → execute, `.stack` generation |
 | `src/flush.rs` | 258 | FC/IS flush: gather → plan → execute, file→jj description sync |
-| `src/wrap.rs` | 79 | Unified mutating command lifecycle: flush → command → sync → show |
+| `src/wrap.rs` | 90 | Unified mutating command lifecycle: flush → command → resolve_and_sync |
 | `src/markdown.rs` | 633 | `[scratch]` section stripping, code fence immunity, heading-level scoping |
 | `src/template.rs` | 300 | Plan template resolution, `{{CHANGE_ID}}` interpolation |
 | `src/plan_file.rs` | 311 | Plan file parsing, I/O helpers with error observability |
@@ -26,18 +26,26 @@ The binary resolves the real `jj` binary by walking `$PATH` and skipping itself 
 | `src/commands/mod.rs` | 71 | `jj plan` subcommand dispatch |
 | `src/commands/config.rs` | 67 | `jj plan config` — read-only introspection |
 | `src/commands/help.rs` | 28 | `jj plan --help` text |
-| `src/commands/stack.rs` | 140 | `jj plan stack` — atomic stack creation |
-| `src/commands/new.rs` | 208 | `jj plan new` — plan change creation with `--first`/`--last` |
-| `src/commands/done.rs` | 318 | `jj plan done` — completion marking, scratch stripping, advance |
-| `src/commands/nav.rs` | 159 | `jj plan next`/`prev`/`go` — stack navigation |
-| `src/commands/abandon.rs` | 250 | `jj abandon` — bookmark recovery handler |
+| `src/commands/stack.rs` | 125 | `jj plan stack` — atomic stack creation |
+| `src/commands/new.rs` | 195 | `jj plan new` — plan change creation with `--first`/`--last` |
+| `src/commands/done.rs` | 310 | `jj plan done` — completion marking, scratch stripping, advance |
+| `src/commands/nav.rs` | 145 | `jj plan next`/`prev`/`go` — stack navigation |
+| `src/commands/abandon.rs` | 235 | `jj abandon` — bookmark recovery handler |
 | `src/commands/describe.rs` | 354 | `jj describe` — interception for `-m` mode |
 
 Total: ~4,450 lines of Rust across 20 source files.
 
-## Plan Directory Resolution
+## Repo Root and Plan Directory Resolution
 
-Resolution happens after `jj root` determines the repo root. Fallback chain:
+### Repo Root Discovery
+
+The repo root is discovered by walking up from `std::env::current_dir()` looking for a `.jj/` directory, via `find_repo_root()` in `src/plan_dir.rs`. This mirrors the logic in jj's own CLI (`cli/src/cli_util.rs::find_workspace_dir()`). It replaces the previous approach of shelling out to `jj root` (~15ms subprocess overhead eliminated).
+
+If no `.jj/` directory is found in any ancestor, the command is passed through to the real `jj` binary (which will produce its own "not in a repo" error).
+
+### Plan Directory Resolution
+
+Fallback chain (after repo root is known):
 
 1. **`JJ_PLAN_DIR` env var** — if set, used as-is (absolute or relative). No further fallback.
 2. **`$repo_root/.jj-plan/`** — preferred default.
@@ -46,7 +54,7 @@ Resolution happens after `jj root` determines the repo root. Fallback chain:
 
 When `.jj-plan/` and `.jj-plans/` both exist, `.jj-plan/` wins.
 
-Implementation: `src/plan_dir.rs` — `resolve_plan_dir()` returns `Option<PlanDir>` with `PlanDirSource` enum.
+Implementation: `src/plan_dir.rs` — `find_repo_root()` returns `Option<PathBuf>`, `resolve_plan_dir()` returns `Option<PlanDir>` with `PlanDirSource` enum.
 
 ## Stack Base Resolution
 
@@ -95,13 +103,24 @@ Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that
 All mutating commands go through `wrap::wrap()` in `src/wrap.rs`:
 
 ```
-flush_all()        ← files → jj (before the command)
-jj.run_inherit()   ← the actual jj command
-sync()             ← jj → files (after the command)
-show_stack()       ← display .stack to stdout
+flush_all()          ← files → jj (before the command)
+jj.run_inherit()     ← the actual jj command
+resolve_and_sync()   ← re-resolve stack, sync files, show summary
 ```
 
-**Ordering is critical**: flush before command ensures user edits are written to jj descriptions before the command modifies state. Sync after command ensures files reflect the new jj state.
+**Ordering is critical**: flush before command ensures user edits are written to jj descriptions before the command modifies state. `resolve_and_sync()` after command ensures files reflect the new jj state.
+
+### resolve_and_sync (`src/wrap.rs`)
+
+`resolve_and_sync()` is the canonical post-mutation sync path. It:
+
+1. Resolves the stack base (`resolve_stack_base`)
+2. Resolves stack changes (`resolve_stack_changes`)
+3. Handles ambiguous bookmarks (sets error state)
+4. Calls `sync()` to update plan files
+5. Calls `show_stack()` to display the summary
+
+All command modules (`nav.rs`, `done.rs`, `new.rs`, `stack.rs`, `abandon.rs`) use this single function instead of maintaining their own `sync_and_show()` helpers. This ensures the stack is resolved exactly **once** per post-mutation sync, eliminating redundant `jj log` subprocess calls.
 
 ### Flush (`src/flush.rs`)
 
@@ -316,26 +335,56 @@ Protects `stack`/`stack/*` bookmarks from accidental deletion:
 | `JJ_PLAN_MAX` | Max changes in stack before refusing to sync | `50` |
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in default |
 
+## Performance
+
+The shim adds overhead to every mutating command due to the flush→command→sync lifecycle. Key costs:
+
+| Operation | Cost | Notes |
+|---|---|---|
+| Repo root discovery | ~0ms | Filesystem walk for `.jj/` (was ~15ms via `jj root` subprocess) |
+| `jj log` (stack base) | ~22ms | Per subprocess call |
+| `jj log` (batch read) | ~20ms | Per subprocess call |
+| `jj describe` (flush) | ~21ms | Per changed file |
+
+### Subprocess call model
+
+The "resolve twice" model: stack state is resolved at most **twice** per command — once before the mutation (for flush) and once after (for sync via `resolve_and_sync()`). Commands that don't need pre-mutation stack data (e.g. `jj status`) resolve only once.
+
+Typical subprocess counts per command:
+
+| Command | Subprocess calls | Overhead |
+|---|---|---|
+| `wrap` (e.g. `jj status`) | 4 (flush:batch_read + status + stack_base + stack_changes) | ~80ms |
+| `jj plan next/prev` | 6 (flush:batch_read + pre-resolve×2 + edit + post-resolve×2) | ~120ms |
+| `jj plan done` (with advance) | 8 (flush + pre-resolve×2 + describe + advance-resolve×2 + edit + post-resolve×2) | ~160ms |
+
+### Measured overhead
+
+On a typical repo (this project, ~15 commits in history):
+- Raw `jj status`: ~18ms
+- Shimmed `jj status`: ~80ms
+- Shim overhead: ~62ms
+
 ## Testing
 
 Two complementary test suites:
 
 ### Bats (behavioral/acceptance)
 
-`bats jj-plan.bats` — 137 tests validating the installed binary from the outside:
+`bats jj-plan.bats` — 138 tests validating the installed binary from the outside:
 - `run_in_repo`: creates a temp jj repo with `stack` bookmark and `.jj-plan/` activated
 - Tests call the shim via `$PATH` and assert on stdout/stderr and file state
 - `REAL_JJ` (`/opt/homebrew/bin/jj`) bypasses the shim for direct jj calls
 
 ### Cargo (unit tests)
 
-`cargo test` — 86 unit tests for pure functions:
+`cargo test` — 88 unit tests for pure functions:
 - `markdown`: 20 tests (scratch stripping, code fence immunity, edge cases)
 - `template`: 14 tests (resolve chain, interpolation, default structure)
 - `commands/describe`: 17 tests (arg parsing for -m/-r variants)
 - `sync`: 11 tests (plan_sync pure logic)
 - `flush`: 5 tests (plan_flush pure logic)
 - `plan_file`: 13 tests (filename parsing, I/O helpers)
-- `plan_dir`: 6 tests (resolution chain)
+- `plan_dir`: 8 tests (resolution chain, repo root discovery)
 
 The FC/IS pattern ensures all business logic is unit-testable without subprocess overhead.

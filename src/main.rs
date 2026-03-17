@@ -12,7 +12,7 @@ mod wrap;
 
 use error::JjPlanError;
 use jj_binary::JjBinary;
-use plan_dir::resolve_plan_dir;
+use plan_dir::{find_repo_root, resolve_plan_dir};
 
 /// Read-only commands that get zero-overhead passthrough via exec.
 /// Note: status/st are NOT here — they get special handling to append .stack.
@@ -77,7 +77,8 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     let subcommand = &args[0];
 
     // Resolve repo root — if not in a repo, passthrough
-    let repo_root = match jj.repo_root() {
+    // Uses filesystem walk for .jj/ instead of `jj root` subprocess (~15ms saved)
+    let repo_root = match find_repo_root() {
         Some(root) => root,
         None => {
             // Not in a jj repo — passthrough (jj will produce its own error)

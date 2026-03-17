@@ -141,18 +141,5 @@ impl JjBinary {
         Ok((output.status, stdout, stderr))
     }
 
-    /// Convenience: get the repo root via `jj root`, or None if not in a repo.
-    pub fn repo_root(&self) -> Option<PathBuf> {
-        match self.run_silent(&["root"]) {
-            Ok((status, stdout, _)) if status.success() => {
-                let trimmed = stdout.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(PathBuf::from(trimmed))
-                }
-            }
-            _ => None,
-        }
-    }
+
 }
