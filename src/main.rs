@@ -70,6 +70,15 @@ fn main() {
 }
 
 fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
+    // Top-level `plan --help` should work even before repo activation checks
+    // and should recognize jj-style global options such as `--color`.
+    if let commands::help::InvocationKind::PlanHelp(_) =
+        commands::help::classify_invocation(args)
+    {
+        commands::help::print_help();
+        return Ok(0);
+    }
+
     // No args or read-only command → zero-overhead passthrough via exec
     if args.is_empty() || is_readonly_command(&args[0]) {
         jj.exec_strings(args)?;

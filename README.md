@@ -19,11 +19,11 @@ Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
 ### Install
 
 ```sh
-# 1. Build (requires Rust 1.89+)
-cargo build --release
+# 1. Install to ~/.local/bin by default
+./install.sh
 
-# 2. Install — must appear in $PATH before the real jj binary
-cp target/release/jj-plan ~/.local/bin/jj
+# 2. Or choose a different destination directory
+./install.sh --bin-dir /usr/local/bin
 
 # 3. Add .jj-plan to your global gitignore
 echo '.jj-plan' >> ~/.config/git/ignore
@@ -304,6 +304,8 @@ brew install parallel          # macOS
 - **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
 
 ## Documentation
+
+Use `jj plan --help` for the compact terminal summary. Use the docs below when you want either the full user reference or the implementation details.
 
 | Document | Audience | Content |
 |---|---|---|

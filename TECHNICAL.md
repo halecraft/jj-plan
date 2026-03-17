@@ -33,7 +33,7 @@ If jj-lib cannot load the repository (version mismatch, corrupt state), the bina
 | `src/error.rs` | 37 | `JjPlanError` enum via `thiserror` |
 | `src/commands/mod.rs` | 73 | `jj plan` subcommand dispatch |
 | `src/commands/config.rs` | 68 | `jj plan config` — read-only introspection (jj-lib reads) |
-| `src/commands/help.rs` | 28 | `jj plan --help` text |
+| `src/commands/help.rs` | 645 | Top-level `plan --help` classification, color-mode resolution, structured help rendering |
 | `src/commands/stack.rs` | 128 | `jj plan stack` — atomic stack creation |
 | `src/commands/new.rs` | 189 | `jj plan new` — plan change creation with `--first`/`--last` |
 | `src/commands/done.rs` | 303 | `jj plan done` — completion marking, scratch stripping, advance |
@@ -130,32 +130,52 @@ The old `stack/old-task` bookmark stays where it is — it's historical. The bin
 ## Command Dispatch
 
 ```
-jj <subcommand> [args...]
+jj [global options] <subcommand> [args...]
 │
-├─ no subcommand or read-only? ──→ exec $REAL_JJ (zero overhead)
-├─ no repo root or no plan dir? ─→ exec $REAL_JJ (not activated)
-├─ "plan" ────────────────────────→ --help/-h check, then subcommand dispatch:
-│   ├─ "plan --help" ─────────────→ print help summary, exit 0
-│   ├─ "plan stack" ──────────────→ atomic stack creation (templated description)
-│   ├─ "plan new" ────────────────→ templated plan change creation
-│   │     ├─ --first ─────────────→ insert before first stack member (moves bookmark)
-│   │     └─ --last ──────────────→ insert after last stack member
-│   ├─ "plan done" ───────────────→ mark done, strip [scratch], advance
-│   │     ├─ --stack ─────────────→ mark all plans done
-│   │     ├─ --keep-scratch ──────→ skip [scratch] stripping
-│   │     └─ --dry-run ───────────→ preview what would change
-│   ├─ "plan next" ───────────────→ advance @ to next plan in stack
-│   ├─ "plan prev" ───────────────→ move @ to previous plan in stack
-│   ├─ "plan go" ─────────────────→ jump to plan by index or change ID
-│   ├─ "plan config" ─────────────→ read-only introspection
-│   └─ anything else ─────────────→ usage error (suggests --help)
-├─ "abandon" ─────────────────────→ bookmark recovery handler
-├─ "describe" ────────────────────→ -m interception (write to plan file first)
-├─ "status/st/new/edit" ──────────→ wrap::wrap()
-└─ everything else ───────────────→ wrap::wrap() (catch-all)
+├─ top-level `plan --help` invocation? ─→ classify help path, resolve color, render help, exit 0
+├─ no subcommand or read-only? ─────────→ exec $REAL_JJ (zero overhead)
+├─ no repo root or no plan dir? ────────→ exec $REAL_JJ (not activated)
+├─ "plan" ──────────────────────────────→ subcommand dispatch:
+│   ├─ "plan stack" ────────────────────→ atomic stack creation (templated description)
+│   ├─ "plan new" ──────────────────────→ templated plan change creation
+│   │     ├─ --first ───────────────────→ insert before first stack member (moves bookmark)
+│   │     └─ --last ────────────────────→ insert after last stack member
+│   ├─ "plan done" ─────────────────────→ mark done, strip [scratch], advance
+│   │     ├─ --stack ───────────────────→ mark all plans done
+│   │     ├─ --keep-scratch ────────────→ skip [scratch] stripping
+│   │     └─ --dry-run ─────────────────→ preview what would change
+│   ├─ "plan next" ─────────────────────→ advance @ to next plan in stack
+│   ├─ "plan prev" ─────────────────────→ move @ to previous plan in stack
+│   ├─ "plan go" ───────────────────────→ jump to plan by index or change ID
+│   ├─ "plan config" ───────────────────→ read-only introspection
+│   └─ anything else ───────────────────→ usage error (suggests --help)
+├─ "abandon" ───────────────────────────→ bookmark recovery handler
+├─ "describe" ──────────────────────────→ -m interception (write to plan file first)
+├─ "status/st/new/edit" ────────────────→ wrap::wrap()
+└─ everything else ─────────────────────→ wrap::wrap() (catch-all)
 ```
 
-Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that `status`/`st` are NOT in that list — they get the flush→sync→show treatment to display the stack.
+The `plan --help` path is intentionally handled before repo-root and plan-directory resolution. This makes `jj plan --help` work even outside an activated repo and also fixes invocations where jj-style global options appear before `plan`, such as `jj --color always plan --help`.
+
+Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that `status`/`st` are NOT in that list — they get the flush→sync→show treatment to display the stack. Also note that the new normalization is intentionally narrow in scope: it recognizes the top-level help path cleanly without attempting full generic normalization of all jj global options for every custom subcommand.
+
+## Plan Help Rendering (`src/commands/help.rs`)
+
+For user-facing documentation, examples, and the role of terminal help vs the manual, see [MANUAL.md § jj plan --help](MANUAL.md#jj-plan---help).
+
+The help implementation now follows a small FC/IS shape:
+
+1. **GATHER** — classify whether the invocation is the top-level `plan --help` path and extract help-relevant global options such as `--color <WHEN>` / `--color=<WHEN>`.
+2. **PLAN** — build a structured `PlanHelp` model containing the title, mental model, happy-path workflow, command list, options, notes, and docs pointers.
+3. **EXECUTE** — render the model as either plain text or ANSI-styled output.
+
+Color mode follows jj-style precedence for the help path:
+
+1. Explicit `--color` flag on the invocation
+2. Resolved/default jj color mode from `ui.color`
+3. Terminal-aware fallback behavior for `auto`
+
+The renderer supports `always`, `never`, `auto`, and `debug`, and uses jj-like styling cues (emphasized section headings and highlighted command labels) while remaining compact enough for terminal scanning. Unit tests focus on the high-risk pure seams: invocation classification, color-mode resolution, and plain-vs-ANSI rendering.
 
 ## Flush/Sync Lifecycle
 
@@ -520,11 +540,18 @@ The FC/IS pattern ensures all business logic is unit-testable without subprocess
 If you were using the zsh shim (`jj-plan.zsh`):
 
 1. **Prerequisites**: Rust toolchain (1.89+).
-2. **Build**: `cargo build --release` in the jj-plan repo.
-3. **Install**: Remove the old symlink and copy the binary:
+2. **Install**: Use the install script from the jj-plan repo root:
    ```sh
-   rm ~/.local/bin/jj                           # remove symlink to jj-plan.zsh
-   cp target/release/jj-plan ~/.local/bin/jj    # install Rust binary
+   ./install.sh
+   ```
+   Or choose a different destination directory:
+   ```sh
+   ./install.sh --bin-dir /usr/local/bin
+   ```
+3. **If migrating from the old zsh symlink**: Remove the old symlink first, then run the install script:
+   ```sh
+   rm ~/.local/bin/jj          # remove symlink to jj-plan.zsh
+   ./install.sh
    ```
 4. **Verify**: `jj plan config` — `shim path:` should point to the new binary (not `.zsh`).
 5. **Behavioral changes**:

@@ -392,14 +392,38 @@ jj-plan configuration:
 
 ### `jj plan --help`
 
-Print a summary of all subcommands and their flags.
+Print a compact terminal summary of what jj-plan can do.
 
 **Synopsis:**
 
 ```
 jj plan --help
 jj plan -h
+jj plan --help --color <WHEN>
+jj --color <WHEN> plan --help
 ```
+
+**Description:**
+
+Use `jj plan --help` when you want quick terminal orientation: the mental model, the happy-path workflow, the available subcommands, and where to go next in the docs.
+
+This help screen is intentionally compact. It is the fast overview, not the exhaustive reference.
+
+**Color behavior:**
+
+`jj plan --help` follows jj-style color behavior:
+
+- `--color always` forces ANSI styling
+- `--color never` disables ANSI styling
+- `--color auto` follows terminal-aware default behavior
+- if no explicit `--color` flag is provided, jj-plan follows the resolved/default jj color mode
+
+**Notes:**
+
+- Use `jj plan --help` for the compact terminal summary.
+- Use `MANUAL.md` when you want the full command reference, examples, and recipes.
+- Use `README.md` for the project overview, philosophy, and quick start.
+- Use `TECHNICAL.md` for architecture and implementation details.
 
 ---
 
