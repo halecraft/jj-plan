@@ -102,6 +102,12 @@ fn run_done_stack(
 
     // Sync and show stack
     sync_and_show(jj, plan_dir);
+
+    // --stack marks everything done, suggest starting a new stack
+    eprintln!();
+    eprintln!("All plans in stack are done 🎉");
+    eprintln!("Start a new stack: jj plan stack [-r REV] [name]");
+
     Ok(0)
 }
 
