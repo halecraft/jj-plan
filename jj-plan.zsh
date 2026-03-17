@@ -1,4 +1,8 @@
 #!/bin/zsh
+# LEGACY: This is the original zsh shim implementation of jj-plan.
+# It has been replaced by a Rust binary. See README.md for installation.
+# This file is preserved as a reference for the original architecture.
+#
 # jj-plan: plan-oriented programming shim
 # Keeps .jj-plan/ in sync with the current stack's change descriptions.
 #

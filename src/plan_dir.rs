@@ -50,8 +50,8 @@ impl PlanDir {
 /// only the env var path is checked.
 pub fn resolve_plan_dir(repo_root: Option<&Path>) -> Option<PlanDir> {
     // 1. JJ_PLAN_DIR env var
-    if let Ok(env_dir) = std::env::var("JJ_PLAN_DIR") {
-        if !env_dir.is_empty() {
+    if let Ok(env_dir) = std::env::var("JJ_PLAN_DIR")
+        && !env_dir.is_empty() {
             let path = PathBuf::from(&env_dir);
             // The env var is used as-is — no existence check, no fallback.
             // This matches the zsh shim behavior where the env var is
@@ -61,7 +61,6 @@ pub fn resolve_plan_dir(repo_root: Option<&Path>) -> Option<PlanDir> {
                 source: PlanDirSource::EnvVar,
             });
         }
-    }
 
     let repo_root = repo_root?;
 

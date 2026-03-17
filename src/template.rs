@@ -34,13 +34,12 @@ const DEFAULT_TEMPLATE: &str = "\
 /// Returns the raw template string (before `{{CHANGE_ID}}` interpolation).
 pub fn resolve_template(plan_dir: &Path) -> String {
     // 1. JJ_PLAN_TEMPLATE env var
-    if let Ok(env_path) = std::env::var("JJ_PLAN_TEMPLATE") {
-        if !env_path.is_empty() {
-            if let Ok(content) = fs::read_to_string(&env_path) {
-                if !content.is_empty() {
+    if let Ok(env_path) = std::env::var("JJ_PLAN_TEMPLATE")
+        && !env_path.is_empty() {
+            if let Ok(content) = fs::read_to_string(&env_path)
+                && !content.is_empty() {
                     return content;
                 }
-            }
             // If the env var points to a non-existent or empty file, warn
             // and fall through to the next source.
             eprintln!(
@@ -48,15 +47,13 @@ pub fn resolve_template(plan_dir: &Path) -> String {
                 env_path
             );
         }
-    }
 
     // 2. {plan_dir}/template.md
     let template_file = plan_dir.join("template.md");
-    if let Ok(content) = fs::read_to_string(&template_file) {
-        if !content.is_empty() {
+    if let Ok(content) = fs::read_to_string(&template_file)
+        && !content.is_empty() {
             return content;
         }
-    }
 
     // 3. Built-in default
     DEFAULT_TEMPLATE.to_string()

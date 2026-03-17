@@ -67,8 +67,8 @@ pub fn clear_error(plan_dir: &Path) {
 /// Call after `sync()` has run so `.stack` is up to date.
 pub fn show_stack(plan_dir: &PlanDir) {
     let stack_path = plan_dir.path.join(".stack");
-    if let Ok(content) = fs::read_to_string(&stack_path) {
-        if !content.is_empty() {
+    if let Ok(content) = fs::read_to_string(&stack_path)
+        && !content.is_empty() {
             println!();
             println!(
                 "Plan stack ({}/; *=here ✓=done ~=has changes):",
@@ -76,7 +76,6 @@ pub fn show_stack(plan_dir: &PlanDir) {
             );
             print!("{}", content);
         }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,14 +226,12 @@ fn plan_sync(
                 // index — if so, rename rather than delete+recreate
                 if let Some(existing_name) =
                     current_state.id_to_filename.get(&change.change_id)
-                {
-                    if *existing_name != target_filename {
+                    && *existing_name != target_filename {
                         plan.files_to_rename.push(FileRename {
                             from: existing_name.clone(),
                             to: target_filename.clone(),
                         });
                     }
-                }
 
                 // Always write the description (jj is authoritative after flush)
                 plan.files_to_write.push(FileWrite {

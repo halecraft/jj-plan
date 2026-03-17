@@ -137,15 +137,14 @@ pub fn write_bytes_or_warn(path: &Path, content: &[u8]) {
 
 /// Remove a file, warning on failure (ignores "not found").
 pub fn remove_or_warn(path: &Path) {
-    if let Err(e) = fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound {
             eprintln!(
                 "jj-plan: warning: failed to remove {}: {}",
                 path.display(),
                 e
             );
         }
-    }
 }
 
 /// Rename (move) a file, warning on failure.

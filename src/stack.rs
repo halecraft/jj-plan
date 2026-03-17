@@ -71,8 +71,8 @@ pub fn resolve_stack_base(jj: &JjBinary) -> Option<StackBase> {
         "-T",
         r#"change_id.shortest(8) ++ "\n""#,
         "--no-graph",
-    ]) {
-        if status.success() {
+    ])
+        && status.success() {
             let heads: Vec<&str> = stdout.trim().lines().filter(|l| !l.is_empty()).collect();
             if heads.len() == 1 {
                 return Some(StackBase::Inclusive(heads[0].to_string()));
@@ -84,7 +84,6 @@ pub fn resolve_stack_base(jj: &JjBinary) -> Option<StackBase> {
                 ));
             }
         }
-    }
 
     // 2. trunk() — if it resolves to something other than root() (exclusive)
     if let Ok((status, stdout, _)) = jj.run_silent(&[
@@ -94,11 +93,10 @@ pub fn resolve_stack_base(jj: &JjBinary) -> Option<StackBase> {
         "-T",
         "change_id",
         "--no-graph",
-    ]) {
-        if status.success() && !stdout.trim().is_empty() {
+    ])
+        && status.success() && !stdout.trim().is_empty() {
             return Some(StackBase::Exclusive);
         }
-    }
 
     // 3. No usable base
     None

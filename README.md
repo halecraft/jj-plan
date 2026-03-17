@@ -2,7 +2,7 @@
 
 > Plans as VCS Artifacts
 
-**TL;DR**: In plan-oriented programming, the plan is the primary artifact — reviewed, debated, and validated by humans, AI agents, designers, and PMs *before any code is written*. By storing plans as Jujutsu change descriptions (jj is a VCS, like git), they become permanent, addressable nodes in version history. A thin shim makes them co-editable as markdown files in your editor.
+**TL;DR**: In plan-oriented programming, the plan is the primary artifact — reviewed, debated, and validated by humans, AI agents, designers, and PMs *before any code is written*. By storing plans as Jujutsu change descriptions (jj is a VCS, like git), they become permanent, addressable nodes in version history. A Rust binary makes them co-editable as markdown files in your editor.
 
 ---
 
@@ -18,7 +18,8 @@ The workflow:
 2. **Cross-check** — A second prompt, or AI agent, or human reviews the plan for correctness, feasibility, and completeness. Designers and PMs weigh in on intent and scope.
 3. **Validate** — The plan is iterated on. Steps are refined. Edge cases are surfaced. This happens *before a single line of code exists*.
 4. **Implement** — Only now does code get written, guided by the plan. The plan is the specification, the context, and the historical record.
-5. **Archive** — The plan remains in version history, permanently linked to the code it produced.
+5. **Complete** — `jj plan done` marks the plan as finished, strips working memory (`[scratch]` sections), and archives the clean plan in version history. `jj evolog` recovers the full scratch content if needed.
+6. **Archive** — The plan remains in version history, permanently linked to the code it produced.
 
 This is not waterfall. Plans are living documents that evolve during implementation. But the key shift is that **planning is a first-class phase with its own artifact**, not a mental prelude to typing code.
 
@@ -30,7 +31,7 @@ Plans stored outside the VCS (wikis, docs, chat) suffer from three problems:
 - **Disconnection**: Six months later, `git blame` shows "refactor auth middleware" and the reasoning is gone.
 - **Inaccessibility**: The AI agent writing code can't read your Google Doc. The new team member can't find the Slack thread.
 
-When the plan lives *in* the VCS — as a change description — it travels with the code. It's versioned. It's queryable--tools can index every line of code against the plan it came from (i.e. `git blame`). It's right where you need it.
+When the plan lives *in* the VCS — as a change description — it travels with the code. It's versioned. It's queryable — tools can index every line of code against the plan it came from (i.e. `git blame`). It's right where you need it.
 
 ## The jj Insight: Stable Change IDs
 
@@ -56,14 +57,15 @@ Each change in a stack is one unit of work: the description *is* the plan, the d
 ```
 jj plan stack my-feature                 # Start a new named stack (creates change + bookmark)
 # Edit .jj-plan/current.md — write the plan
-jj plan new                              # Add a plan change to the stack (with placeholder)
+jj plan new                              # Add a plan change to the stack (templated)
 jj plan new --first                      # Insert a plan change at the start of the stack
 jj plan new --last                       # Insert a plan change at the end of the stack
+jj plan done                             # Mark current plan as done, strip working memory
 ```
 
 Or without a name: `jj plan stack` sets a bare `stack` bookmark. You can also root a stack off a specific revision: `jj plan stack -r main my-feature`.
 
-The plan lives in the change description — a markdown document with background, constraints, alternatives considered, and step-by-step approach. The `stack` bookmark marks the first change in the stack, and it is **included** as a stack member.
+The plan lives in the change description — a markdown document with background, constraints, alternatives considered, and step-by-step approach. New plans are created with a structured template that includes Background, Approach, Tasks, and a Scratchpad section. The `stack` bookmark marks the first change in the stack, and it is **included** as a stack member.
 
 ### 2. Plans are reviewed before code exists
 
@@ -98,7 +100,7 @@ The lineage is preserved through change ID references. Each phase can be reviewe
 
 ### 5. A `.jj-plan/` directory makes plans co-editable
 
-A shim intercepts `jj` commands and maintains a `.jj-plan/` directory:
+The jj-plan binary intercepts `jj` commands and maintains a `.jj-plan/` directory:
 
 ```
 .jj-plan/
@@ -107,9 +109,10 @@ A shim intercepts `jj` commands and maintains a `.jj-plan/` directory:
   01-kpqxywon.md      — stack bookmark (first member)
   02-mtzrlpvq.md
   03-ykvsnxrl.md      — tip
+  template.md         — optional: custom plan template
 ```
 
-You and an AI agent both edit these markdown files in the editor — no `jj describe` clobbering, no modal editor sessions. The shim flushes edits to jj descriptions automatically. `jj status` shows the stack at a glance:
+You and an AI agent both edit these markdown files in the editor — no `jj describe` clobbering, no modal editor sessions. The binary flushes edits to jj descriptions automatically. `jj describe -m "..."` is also intercepted and routed through the plan file, so the file is always the source of truth. `jj status` shows the stack at a glance:
 
 ```
 Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
@@ -119,9 +122,24 @@ Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
     04-abcdefgh :: Add API key support
 ```
 
+### 6. Plans have working memory with a cleanup lifecycle
+
+Any heading in a plan can be marked `[scratch]` to designate it as working memory:
+
+```markdown
+## Analysis [scratch]
+
+Tried approach A — failed because of X.
+Approach B works but needs Y from the API.
+```
+
+Working memory lives near the content it supports. When the plan is complete, `jj plan done` strips all `[scratch]` sections from the description, cleaning the archival record while preserving conclusions. The full working memory is always recoverable via `jj evolog` (jj's evolution log).
+
+This gives plans a natural lifecycle: draft with scratch notes → implement → clean up → archive.
+
 ## Stack Bookmarks
 
-The shim uses `stack` / `stack/*` bookmarks to determine which changes belong to the current plan stack.
+The binary uses `stack` / `stack/*` bookmarks to determine which changes belong to the current plan stack.
 
 ### Inclusive model
 
@@ -142,7 +160,7 @@ The bookmark is placed **on the first change in the stack**, not before it. The 
 
 ### Nearest-ancestor resolution
 
-When multiple `stack` / `stack/*` bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the shim always picks the right one:
+When multiple `stack` / `stack/*` bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the binary always picks the right one:
 
 ```
 ○ stack/phase1 (old, farther from @)
@@ -152,11 +170,11 @@ When multiple `stack` / `stack/*` bookmarks are ancestors of `@`, the **nearest*
 @ current
 ```
 
-If two `stack/*` bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), the shim produces an error and asks you to advance or remove one.
+If two `stack/*` bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), an error is produced asking you to advance or remove one.
 
 ### Fallback to `trunk()`
 
-If no `stack` / `stack/*` bookmark is an ancestor of `@`, the shim falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
+If no `stack` / `stack/*` bookmark is an ancestor of `@`, the binary falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
 
 If neither a stack bookmark nor `trunk()` can be resolved, no sync occurs.
 
@@ -170,7 +188,7 @@ jj plan stack next-task                # atomic: creates change + sets stack/nex
 
 Or without a name: `jj plan stack`. Or rooted off a specific revision: `jj plan stack -r main next-task`.
 
-The old `stack/old-task` bookmark stays where it is — it's historical. The shim automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's.
+The old `stack/old-task` bookmark stays where it is — it's historical. The binary automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's.
 
 ## The AI Collaboration Loop
 
@@ -184,11 +202,13 @@ Human writes draft plan
     → Human revises plan
       → PM confirms scope: "Phase 2 can wait for Q4"
         → AI implements, guided by the finalized plan
-          → Plan is marked done, lives in history forever
+          → jj plan done strips scratch, archives the clean plan
             → Code links back via jj:CHANGE_ID
 ```
 
-When the agent reads `.jj-plan/current.md` before writing code, it has the full decision record. When it's done, the plan — annotated with completion status — becomes the permanent historical record. The code links back to it. The loop is closed:
+`[scratch]` sections in plans serve as the shared working memory surface between human and AI. The AI can write analysis, alternatives explored, and debugging notes in scratch sections during implementation. `jj plan done` is the cleanup boundary: reasoning is archived in `jj evolog`, conclusions persist in the final description.
+
+When the agent reads `.jj-plan/current.md` before writing code, it has the full decision record. When it's done, the plan — cleaned of scratch, annotated with completion status — becomes the permanent historical record. The code links back to it. The loop is closed:
 
 ```
 Plan (jj description) → Code (references jj:CHANGE_ID) → Archaeology (jj show → full plan)
@@ -203,22 +223,34 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 | Plans are reviewed before code | Plan changes are the review surface |
 | Plans survive rebase/amend | jj change IDs are stable |
 | Plans are permanently addressable | `jj show CHANGE_ID` from any code comment |
-| Plans are co-editable (human + AI) | `.jj-plan/` shim syncs markdown files ↔ descriptions |
+| Plans are co-editable (human + AI) | `.jj-plan/` syncs markdown files ↔ descriptions |
 | Plans co-exist with code review | Plan changes have rich descriptions — they *are* the review |
 | Plans split across PRs | New plan changes reference originals by change ID |
 | Plans have status tracking | `plan-status: ✅` in description; inferred from empty/non-empty |
+| Plans have working memory | `[scratch]` sections for drafts; `jj plan done` strips them |
+| `jj describe` works naturally | `-m` mode intercepted and routed through plan files |
 | Stack is always visible | `jj status` appends the plan stack summary |
+| Stack is navigable | `jj plan next`/`prev`/`go` for index-based movement |
 | Multiple concurrent stacks | `stack/*` bookmarks with nearest-ancestor resolution |
 | Stack bookmark is intuitive | Bookmark is ON the first change, not before it (inclusive) |
+| New plans are structured | Configurable templates with `{{CHANGE_ID}}` interpolation |
 
 ## Getting Started
 
 1. Use [jj](https://github.com/jj-vcs/jj) (Jujutsu) as your VCS.
-2. Install [jj-plan](jj-plan.zsh) in your `$PATH`.
+2. Build and install jj-plan:
+   ```sh
+   cargo build --release
+   cp target/release/jj-plan ~/.local/bin/jj
+   ```
+   Ensure `~/.local/bin` is in your `$PATH` ahead of the real jj binary.
 3. Add `.jj-plan` to your global gitignore.
 4. In a repo: `mkdir .jj-plan` to activate.
-5. Start a stack: `jj plan stack` (bare) or `jj plan stack my-feature` (named). Use `-r REV` to root it off a specific revision (e.g. `jj plan stack -r main my-feature`). The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
-6. Start planning: edit `.jj-plan/current.md`, review with your team and AI, then `jj plan new` to add plan changes to the stack (each gets a self-referencing `jj:CHANGE_ID` placeholder). Use `--first` or `--last` to insert at stack boundaries. Run `jj plan --help` for all options.
+5. Start a stack: `jj plan stack` (bare) or `jj plan stack my-feature` (named). Use `-r REV` to root it off a specific revision. The bookmarked change is the first member. Or rely on `trunk()` with a remote — no bookmark needed.
+6. Start planning: edit `.jj-plan/current.md`. New plans (`jj plan new`) are seeded with a structured template. Use `--first` or `--last` to insert at stack boundaries. Mark `[scratch]` headings for working memory.
+7. Navigate: `jj plan next`/`prev` to move through the stack, `jj plan go N` to jump by index.
+8. Complete: `jj plan done` marks the current plan as done, strips `[scratch]` sections, and advances to the next undone plan.
+9. Introspect: `jj plan config` shows resolved configuration and stack info. `jj plan --help` for all options.
 
 ## Environment Variables
 
@@ -226,13 +258,26 @@ No context is lost. No documentation rots. The VCS *is* the documentation.
 |---|---|---|
 | `JJ_PLAN_DIR` | Override plan directory path (absolute or relative) | Auto-resolved: `.jj-plan/` → `.jj-plans/` |
 | `JJ_PLAN_MAX` | Maximum stack size before refusing to sync | `50` |
+| `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in default |
 
-## Migration from jj-pop
+## Migration from zsh shim
 
-- Rename `jj-pop.zsh` to `jj-plan.zsh` in your `$PATH` (or update your symlink).
-- Replace `jj stack new` with `jj plan stack` in your workflow.
-- Existing `.jj-plans/` directories continue to work (silent fallback). Create `.jj-plan/` when ready to migrate — it takes precedence.
-- Replace `JJ_PLANS_MAX` with `JJ_PLAN_MAX` in your shell profile (old env var is no longer recognized).
+If you were using the zsh shim (`jj-plan.zsh`):
+
+1. **Prerequisites**: Rust toolchain (1.89+).
+2. **Build**: `cargo build --release` in the jj-plan repo.
+3. **Install**: Remove the old symlink and copy the binary:
+   ```sh
+   rm ~/.local/bin/jj                           # remove symlink to jj-plan.zsh
+   cp target/release/jj-plan ~/.local/bin/jj    # install Rust binary
+   ```
+4. **Verify**: `jj plan config` — `shim path:` should point to the new binary (not `.zsh`).
+5. **Behavioral changes**:
+   - `jj describe -m "..."` is now intercepted and routed through plan files automatically. The "NEVER call `jj describe` directly" rule is no longer needed.
+   - `jj plan new` and `jj plan stack` now seed descriptions with a structured template instead of `(placeholder: jj:CHANGE_ID)`. The template starts with `(plan: jj:CHANGE_ID)`.
+   - New commands available: `done`, `next`, `prev`, `go`.
+   - `[scratch]` convention: mark any heading with `[scratch]` for working memory that gets cleaned up on `jj plan done`.
+6. The zsh shim (`jj-plan.zsh`) remains in the repo as a reference but is no longer maintained.
 
 ## Querying
 
@@ -248,4 +293,12 @@ jj show kpqxywon
 
 # List all active stack bookmarks
 jj bookmark list stack/*
+
+# Show resolved configuration and stack info
+jj plan config
+
+# Navigate the stack by position
+jj plan next                             # advance to next plan
+jj plan prev                             # go to previous plan
+jj plan go 3                             # jump to plan #3
 ```

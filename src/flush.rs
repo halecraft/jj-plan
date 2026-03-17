@@ -60,11 +60,10 @@ fn gather_flush_state(plan_dir: &Path, jj: &JjBinary) -> FlushGatherState {
     // Read file contents from disk
     let mut file_contents = HashMap::new();
     for (change_id, path) in &plan_files {
-        if let Ok(content) = fs::read_to_string(path) {
-            if !content.is_empty() {
+        if let Ok(content) = fs::read_to_string(path)
+            && !content.is_empty() {
                 file_contents.insert(change_id.clone(), content);
             }
-        }
     }
 
     // Batch-read jj descriptions for all change IDs

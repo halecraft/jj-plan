@@ -170,14 +170,13 @@ fn read_current_change_id(jj: &JjBinary) -> Option<String> {
         "-T",
         "change_id.shortest(8)",
         "--no-graph",
-    ]) {
-        if status.success() {
+    ])
+        && status.success() {
             let id = stdout.trim().to_string();
             if !id.is_empty() {
                 return Some(id);
             }
         }
-    }
     None
 }
 

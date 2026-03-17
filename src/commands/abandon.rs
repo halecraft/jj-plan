@@ -76,8 +76,8 @@ fn snapshot_stack_bookmark(jj: &JjBinary) -> Option<BookmarkSnapshot> {
             "--reversed",
         ]) {
             Ok((st, out, _)) if st.success() => {
-                let first = out.lines().find(|l| !l.is_empty()).map(|s| s.to_string());
-                first
+                
+                out.lines().find(|l| !l.is_empty()).map(|s| s.to_string())
             }
             _ => None,
         }
@@ -104,34 +104,29 @@ fn attempt_bookmark_recovery(jj: &JjBinary, snapshot: &BookmarkSnapshot) {
     let mut recovery_target: Option<String> = None;
 
     // 1. Try first child (may have survived the abandon / rebase).
-    if let Some(ref child_id) = snapshot.first_child {
-        if let Ok((status, _, _)) =
+    if let Some(ref child_id) = snapshot.first_child
+        && let Ok((status, _, _)) =
             jj.run_silent(&["log", "-r", child_id, "-T", "''", "--no-graph"])
-        {
-            if status.success() {
+            && status.success() {
                 recovery_target = Some(child_id.clone());
             }
-        }
-    }
 
     // 2. If no surviving child but the abandoned change was @, use new @.
-    if recovery_target.is_none() && snapshot.was_working_copy {
-        if let Ok((status, stdout, _)) = jj.run_silent(&[
+    if recovery_target.is_none() && snapshot.was_working_copy
+        && let Ok((status, stdout, _)) = jj.run_silent(&[
             "log",
             "-r",
             "@",
             "-T",
             "change_id.shortest(8)",
             "--no-graph",
-        ]) {
-            if status.success() {
+        ])
+            && status.success() {
                 let id = stdout.trim().to_string();
                 if !id.is_empty() {
                     recovery_target = Some(id);
                 }
             }
-        }
-    }
 
     // 3. Apply recovery or warn.
     match recovery_target {
@@ -226,13 +221,11 @@ pub fn run_abandon(
     // ------------------------------------------------------------------
     // 5. If abandon succeeded and we had bookmark info, check survival
     // ------------------------------------------------------------------
-    if exit_code == 0 {
-        if let Some(ref snap) = snapshot {
-            if !stack_bookmark_survives(jj) {
+    if exit_code == 0
+        && let Some(ref snap) = snapshot
+            && !stack_bookmark_survives(jj) {
                 attempt_bookmark_recovery(jj, snap);
             }
-        }
-    }
 
     // ------------------------------------------------------------------
     // 6. Sync plan files + show stack

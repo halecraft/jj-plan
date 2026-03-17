@@ -1135,7 +1135,7 @@ Need JWT and API key support
     desc=$("$REAL_JJ" log -r @ -T description --no-graph)
     echo "DESC:[$desc]"
     echo "NEW_ID:$NEW_ID"
-    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+    [[ "$desc" == "(plan: jj:$NEW_ID)"* ]] && echo "MATCH:yes" || echo "MATCH:no"
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Started new stack: stack ("* ]]
@@ -1278,7 +1278,7 @@ Need JWT and API key support
     echo "DESC:$desc"
   '
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"DESC:(placeholder: jj:"* ]]
+  [[ "$output" == *"DESC:(plan: jj:"* ]]
   [[ "$output" == *"Created plan change: jj:"* ]]
 }
 
@@ -1290,7 +1290,7 @@ Need JWT and API key support
     desc=$("$REAL_JJ" log -r @ -T description --no-graph)
     echo "NEW_ID:$NEW_ID"
     echo "DESC:$desc"
-    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+    [[ "$desc" == "(plan: jj:$NEW_ID)"* ]] && echo "MATCH:yes" || echo "MATCH:no"
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"MATCH:yes"* ]]
@@ -1346,7 +1346,7 @@ Need JWT and API key support
     echo "CONTENT:$content"
   '
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"CONTENT:(placeholder: jj:"* ]]
+  [[ "$output" == *"CONTENT:(plan: jj:"* ]]
 }
 
 @test "jj plan new from mid-stack inserts linearly (not a fork)" {
@@ -1369,7 +1369,7 @@ Need JWT and API key support
   [[ "$output" == *"count=4"* ]]
   [[ "$output" == *"FILE:01-"*":Plan"* ]]
   [[ "$output" == *"FILE:02-"*":Step 1"* ]]
-  [[ "$output" == *"FILE:03-"*":(placeholder: jj:"* ]]
+  [[ "$output" == *"FILE:03-"*":(plan: jj:"* ]]
   [[ "$output" == *"FILE:04-"*":Step 2"* ]]
 }
 
@@ -1408,7 +1408,7 @@ Need JWT and API key support
     echo "count=$count"
   '
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"FILE01:(placeholder: jj:"* ]]
+  [[ "$output" == *"FILE01:(plan: jj:"* ]]
   [[ "$output" == *"FILE02:First"* ]]
   [[ "$output" == *"count=4"* ]]
   [[ "$output" == *"Created plan change: jj:"* ]]
@@ -1457,7 +1457,7 @@ Need JWT and API key support
     jj plan new --first
     NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     desc=$("$REAL_JJ" log -r @ -T description --no-graph)
-    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+    [[ "$desc" == "(plan: jj:$NEW_ID)"* ]] && echo "MATCH:yes" || echo "MATCH:no"
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"MATCH:yes"* ]]
@@ -1480,7 +1480,7 @@ Need JWT and API key support
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"count=4"* ]]
-  [[ "$output" == *"LAST:(placeholder: jj:"* ]]
+  [[ "$output" == *"LAST:(plan: jj:"* ]]
   [[ "$output" == *"Created plan change: jj:"* ]]
 }
 
@@ -1490,7 +1490,7 @@ Need JWT and API key support
     jj plan new --last
     NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
     desc=$("$REAL_JJ" log -r @ -T description --no-graph)
-    [[ "$desc" == "(placeholder: jj:$NEW_ID)" ]] && echo "MATCH:yes" || echo "MATCH:no"
+    [[ "$desc" == "(plan: jj:$NEW_ID)"* ]] && echo "MATCH:yes" || echo "MATCH:no"
   '
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"MATCH:yes"* ]]
@@ -1502,7 +1502,7 @@ Need JWT and API key support
     jj plan new --first --last 2>&1
   '
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"--first and --last are mutually exclusive"* ]]
+  [[ "$output" == *"cannot specify both --first and --last"* ]]
 }
 
 @test "jj plan new --first errors when no stack resolved" {
@@ -1515,7 +1515,7 @@ Need JWT and API key support
     jj plan new --first 2>&1
   "
   [[ "$status" -eq 1 ]]
-  [[ "$output" == *"cannot resolve stack"* ]]
+  [[ "$output" == *"could not resolve stack"* ]]
 }
 
 # --- jj plan --help ---
@@ -1865,4 +1865,379 @@ Need JWT and API key support
   [[ "$output" == *"LEGACY_COUNT=0"* ]]
   [[ "$output" == *"CONTENT:Custom dir test"* ]]
   [[ "$output" == *"Plan stack (.custom-plans/;"* ]]
+}
+
+# =============================================================================
+# New tests for Rust rewrite features (jj:wuzpsqkl)
+# =============================================================================
+
+# --- jj plan done ---
+
+@test "jj plan done marks current plan as done" {
+  run_in_repo '
+    jj describe -m "My plan"
+    jj plan done
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"plan-status: ✅"* ]]
+}
+
+@test "jj plan done advances to next undone plan" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj edit -r "$P1"
+    jj plan done
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    echo "P2:$P2"
+    echo "CUR:$CUR"
+    [[ "$CUR" == "$P2" ]] && echo "ADVANCED:yes" || echo "ADVANCED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"ADVANCED:yes"* ]]
+}
+
+@test "jj plan done --dry-run does not modify description" {
+  run_in_repo '
+    jj describe -m "My plan
+
+## Scratch [scratch]
+
+Working notes here"
+    jj plan done --dry-run
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Would strip scratch sections"* ]]
+  [[ "$output" == *"DESC:My plan"* ]]
+  [[ "$output" == *"Working notes here"* ]]
+}
+
+@test "jj plan done --keep-scratch preserves scratch content" {
+  run_in_repo '
+    jj describe -m "My plan
+
+## Notes [scratch]
+
+Important scratch notes"
+    jj plan done --keep-scratch
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Important scratch notes"* ]]
+  [[ "$output" == *"plan-status: ✅"* ]]
+}
+
+@test "jj plan done strips scratch sections" {
+  run_in_repo '
+    jj describe -m "My plan
+
+## Background
+
+Real content
+
+## Scratch [scratch]
+
+Temporary notes
+
+## Results
+
+Final results"
+    jj plan done
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Real content"* ]]
+  [[ "$output" == *"Final results"* ]]
+  [[ "$output" != *"Temporary notes"* ]]
+  [[ "$output" == *"plan-status: ✅"* ]]
+}
+
+@test "jj plan done --stack marks all plans done" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj new; jj describe -m "Plan 2"
+    jj new; jj describe -m "Plan 3"
+    jj plan done --stack
+    d1=$("$REAL_JJ" log -r "@ | @- | @--" -T "description ++ \"\n---\n\"" --no-graph)
+    echo "DESCS:$d1"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"plan-status: ✅"* ]]
+}
+
+@test "jj plan done on already-done plan is idempotent" {
+  run_in_repo '
+    jj describe -m "My plan
+
+plan-status: ✅"
+    jj plan done
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    # Should not have duplicate plan-status markers
+    count=$(echo "$desc" | grep -c "plan-status: ✅")
+    echo "COUNT:$count"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"COUNT:1"* ]]
+}
+
+# --- jj plan next / prev ---
+
+@test "jj plan next advances from plan 1 to plan 2" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj edit -r "$P1"
+    jj plan next
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    [[ "$CUR" == "$P2" ]] && echo "MOVED:yes" || echo "MOVED:no"
+    link=$(readlink .jj-plan/current.md)
+    echo "LINK:$link"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MOVED:yes"* ]]
+  [[ "$output" == *"Plan stack"* ]]
+}
+
+@test "jj plan prev moves from plan 2 to plan 1" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    jj plan prev
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    [[ "$CUR" == "$P1" ]] && echo "MOVED:yes" || echo "MOVED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MOVED:yes"* ]]
+  [[ "$output" == *"Plan stack"* ]]
+}
+
+@test "jj plan next at last plan stays put" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj new; jj describe -m "Plan 2"
+    jj plan next 2>&1
+    desc=$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)
+    echo "CURRENT:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Already at the last plan"* ]]
+  [[ "$output" == *"CURRENT:Plan 2"* ]]
+}
+
+@test "jj plan prev at first plan stays put" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj plan prev 2>&1
+    desc=$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)
+    echo "CURRENT:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Already at the first plan"* ]]
+  [[ "$output" == *"CURRENT:Plan 1"* ]]
+}
+
+@test "jj plan next flushes pending edits before moving" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    jj edit -r "$P1"
+    printf "Edited plan 1 content" > .jj-plan/current.md
+    jj plan next
+    desc=$("$REAL_JJ" log -r "$P1" -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"DESC:Edited plan 1 content"* ]]
+}
+
+# --- jj plan go ---
+
+@test "jj plan go 2 moves to the second plan" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj new; jj describe -m "Plan 2"
+    P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 3"
+    jj plan go 2
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    [[ "$CUR" == "$P2" ]] && echo "MOVED:yes" || echo "MOVED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MOVED:yes"* ]]
+  [[ "$output" == *"Plan stack"* ]]
+}
+
+@test "jj plan go CHANGE_ID moves to specified change" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    jj new; jj describe -m "Plan 3"
+    jj plan go "$P1"
+    CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    [[ "$CUR" == "$P1" ]] && echo "MOVED:yes" || echo "MOVED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"MOVED:yes"* ]]
+}
+
+@test "jj plan go 0 errors" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj plan go 0 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"out of range"* ]]
+}
+
+@test "jj plan go 99 errors (out of range)" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    jj plan go 99 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"out of range"* ]]
+}
+
+# --- Plan templates ---
+
+@test "jj plan new produces structured template content" {
+  run_in_repo '
+    jj describe -m "Existing plan"
+    jj plan new
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:(plan: jj:"* ]]
+  [[ "$output" == *"## Background"* ]]
+  [[ "$output" == *"## Approach"* ]]
+  [[ "$output" == *"## Tasks"* ]]
+  [[ "$output" == *"## Scratchpad [scratch]"* ]]
+}
+
+@test "jj plan stack produces structured template content" {
+  run_in_repo '
+    jj plan stack newstack
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:(plan: jj:"* ]]
+  [[ "$output" == *"## Background"* ]]
+  [[ "$output" == *"## Scratchpad [scratch]"* ]]
+}
+
+@test "custom template.md overrides default template" {
+  run_in_repo '
+    printf "Custom: {{CHANGE_ID}}\n\n## My Section\n" > .jj-plan/template.md
+    jj plan new
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:Custom: "* ]]
+  [[ "$output" == *"## My Section"* ]]
+  [[ "$output" != *"## Background"* ]]
+}
+
+@test "JJ_PLAN_TEMPLATE env var overrides template.md" {
+  run zsh -c "
+    export PATH=\"$HOME/.local/bin:\$PATH\"
+    REAL_JJ=\"$REAL_JJ\"
+    cd \"\$(mktemp -d)\"
+    $REAL_JJ git init 2>/dev/null
+    $REAL_JJ bookmark set stack -r @ 2>/dev/null
+    mkdir -p .jj-plan
+    printf 'ENV template: {{CHANGE_ID}}\n' > .jj-plan/template.md
+    ENVFILE=\"\$(mktemp)\"
+    printf 'Env override: {{CHANGE_ID}}\n\n## Env Section\n' > \"\$ENVFILE\"
+    export JJ_PLAN_TEMPLATE=\"\$ENVFILE\"
+    jj plan new
+    content=\$(cat .jj-plan/current.md)
+    echo \"CONTENT:\$content\"
+  "
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:Env override: "* ]]
+  [[ "$output" == *"## Env Section"* ]]
+  [[ "$output" != *"ENV template"* ]]
+}
+
+@test "template CHANGE_ID is interpolated correctly" {
+  run_in_repo '
+    jj plan new
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+    echo "NEW_ID:$NEW_ID"
+    [[ "$content" == "(plan: jj:$NEW_ID)"* ]] && echo "INTERPOLATED:yes" || echo "INTERPOLATED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"INTERPOLATED:yes"* ]]
+}
+
+@test "custom template without CHANGE_ID gets self-reference injected" {
+  run_in_repo '
+    printf "No placeholder here\n\n## Section\n" > .jj-plan/template.md
+    jj plan new
+    NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+    echo "NEW_ID:$NEW_ID"
+    [[ "$content" == *"jj:$NEW_ID"* ]] && echo "INJECTED:yes" || echo "INJECTED:no"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"INJECTED:yes"* ]]
+}
+
+# --- jj describe interception ---
+
+@test "jj describe -m writes to plan file first" {
+  run_in_repo '
+    jj describe -m "Initial"
+    jj describe -m "Updated via describe"
+    content=$(cat .jj-plan/current.md)
+    echo "CONTENT:$content"
+    desc=$("$REAL_JJ" log -r @ -T description --no-graph)
+    echo "DESC:$desc"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:Updated via describe"* ]]
+  [[ "$output" == *"DESC:Updated via describe"* ]]
+}
+
+@test "jj describe -m on non-current change updates correct plan file" {
+  run_in_repo '
+    jj describe -m "Plan 1"
+    P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+    jj new; jj describe -m "Plan 2"
+    jj describe -r "$P1" -m "Plan 1 updated"
+    content=$(cat .jj-plan/01-*.md)
+    echo "CONTENT:$content"
+  '
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"CONTENT:Plan 1 updated"* ]]
+}
+
+# --- jj plan go missing target ---
+
+@test "jj plan go without target shows error" {
+  run_in_repo '
+    jj describe -m "Plan"
+    jj plan go 2>&1
+  '
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"missing target"* ]]
 }
