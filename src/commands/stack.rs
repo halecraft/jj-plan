@@ -31,7 +31,7 @@ pub fn run_stack(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    loaded_repo: Option<&LoadedRepo>,
+    mut loaded_repo: Option<&mut LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // -----------------------------------------------------------------------
     // 1. Parse args: `-r <rev>` and positional stack name
@@ -65,7 +65,7 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 3. Flush local plan edits to jj descriptions
     // -----------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // -----------------------------------------------------------------------
     // 4. Create new change
@@ -123,7 +123,10 @@ pub fn run_stack(
     // 8. Print summary and sync
     // -----------------------------------------------------------------------
     eprintln!("Started new stack: {} ({})", bookmark_name, change_id);
-    crate::wrap::resolve_and_sync(plan_dir, jj, None);
+    if let Some(ref mut repo) = loaded_repo {
+        repo.reload();
+    }
+    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
 
     Ok(0)
 }

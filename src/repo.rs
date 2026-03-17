@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::hex_util::encode_reverse_hex;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store;
 use jj_lib::repo::{ReadonlyRepo, Repo as _, StoreFactories};
@@ -36,6 +37,28 @@ use crate::stack::{StackBase, StackChange};
 pub struct LoadedRepo {
     pub workspace: Workspace,
     pub repo: Arc<ReadonlyRepo>,
+}
+
+impl LoadedRepo {
+    /// Reload the repository after a CLI mutation.
+    ///
+    /// Calls `ReadonlyRepo::reload_at_head()` to get a fresh snapshot that
+    /// reflects changes made by subprocess mutations (`jj describe`,
+    /// `jj new`, `jj edit`, etc.). Reuses the existing loader (stores,
+    /// factories), so this is cheaper than a full `load_repo()`.
+    ///
+    /// Returns `true` on success, `false` on failure. On failure, the
+    /// repo remains at its previous (stale) snapshot — callers should
+    /// fall back to subprocess reads.
+    pub fn reload(&mut self) -> bool {
+        match self.repo.reload_at_head() {
+            Ok(new_repo) => {
+                self.repo = new_repo;
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 /// Load the jj workspace and repository at the given root path.
@@ -109,12 +132,21 @@ impl From<jj_lib::op_store::OpStoreError> for OpResolveError {
 /// workspace. We build the minimum viable config by loading the repo-level
 /// config from `.jj/repo/config.toml` (which may contain `revset-aliases`
 /// like `trunk()`) and providing defaults for everything else.
+///
+/// UserSettings::from_config() requires these keys to exist:
+/// - `user.name`, `user.email` (identity)
+/// - `operation.hostname`, `operation.username` (operation metadata)
+/// - `signing.behavior` (commit signing policy)
+///
+/// The jj CLI normally injects these via its own default config layer.
+/// Since we're not using the CLI's config stack, we provide placeholder
+/// defaults. These values are only used for read-only operations — we
+/// never create commits or operations via jj-lib.
 fn build_minimal_config(repo_root: &Path) -> Option<StackedConfig> {
-    let mut config = StackedConfig::empty();
-
-    // Add a default layer so UserSettings::from_config doesn't fail on
-    // missing keys. This provides defaults for settings like user.name, etc.
-    config.add_layer(ConfigLayer::empty(ConfigSource::Default));
+    // Start with jj-lib's built-in defaults (config/misc.toml), which provides
+    // all required keys: user.name, user.email, operation.hostname,
+    // operation.username, signing.behavior, merge.hunk-level, etc.
+    let mut config = StackedConfig::with_defaults();
 
     // Load repo-level config if it exists (may contain revset-aliases.trunk())
     let repo_config_path = repo_root.join(".jj").join("repo").join("config.toml");
@@ -410,6 +442,9 @@ pub fn batch_read_by_ids_lib(
 /// Get the shortest unique change ID prefix for a commit (8+ chars).
 ///
 /// Uses the repo's index for shortest-prefix computation.
+/// Returns the reverse-hex encoding (k-z alphabet) that jj uses for display
+/// and revset resolution. Using standard hex (a-f) would cause revset
+/// resolution failures since jj interprets those as commit ID prefixes.
 fn short_change_id(repo: &Arc<ReadonlyRepo>, commit: &Commit) -> String {
     let change_id = commit.change_id();
     // Use the index to find the shortest unique prefix
@@ -417,9 +452,11 @@ fn short_change_id(repo: &Arc<ReadonlyRepo>, commit: &Commit) -> String {
         .shortest_unique_change_id_prefix_len(change_id)
         .unwrap_or(8)
         .max(8);
-    let hex = change_id.hex();
-    let len = prefix_len.min(hex.len());
-    hex[..len].to_string()
+    // encode_reverse_hex returns the k-z alphabet encoding that jj uses
+    // for change IDs (as opposed to standard hex a-f used for commit IDs).
+    let reverse_hex = encode_reverse_hex(change_id.as_bytes());
+    let len = prefix_len.min(reverse_hex.len());
+    reverse_hex[..len].to_string()
 }
 
 /// Check whether a commit is "empty" (its tree matches its parent's merged tree).

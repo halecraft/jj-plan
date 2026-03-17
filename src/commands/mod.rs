@@ -21,7 +21,7 @@ pub fn dispatch_plan(
     plan_dir: &PlanDir,
     repo_root: &std::path::Path,
     args: &[String],
-    loaded_repo: Option<&LoadedRepo>,
+    loaded_repo: Option<&mut LoadedRepo>,
 ) -> Result<i32> {
     // args[0] is "plan", args[1] is the subcommand (if present)
     let subcommand = args.get(1).map(|s| s.as_str());

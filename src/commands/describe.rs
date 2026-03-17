@@ -21,7 +21,7 @@ pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    loaded_repo: Option<&LoadedRepo>,
+    loaded_repo: Option<&mut LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // 1. Parse describe args to find -m/--message values and -r/--revision target
     let parsed = parse_describe_args(args);

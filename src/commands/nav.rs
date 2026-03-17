@@ -8,9 +8,9 @@ use crate::stack::StackChange;
 /// Lifecycle: flush → resolve stack → find current position → navigate → sync → show.
 ///
 /// If `@` is already the last plan, prints a message and stays put.
-pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
+pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, mut loaded_repo: Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // 2. Resolve stack
     let (changes, current_idx) = match resolve_stack_and_position(jj) {
@@ -24,7 +24,10 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedR
     // 3. Check if already at the last plan
     if current_idx >= changes.len() - 1 {
         eprintln!("Already at the last plan in the stack");
-        crate::wrap::resolve_and_sync(plan_dir, jj, None);
+        if let Some(ref mut repo) = loaded_repo {
+            repo.reload();
+        }
+        crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
         return Ok(0);
     }
 
@@ -35,8 +38,11 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedR
         return Ok(status.code().unwrap_or(1));
     }
 
-    // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj, None);
+    // 5. Reload + Sync + show stack
+    if let Some(ref mut repo) = loaded_repo {
+        repo.reload();
+    }
+    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
     Ok(0)
 }
 
@@ -45,9 +51,9 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedR
 /// Lifecycle: flush → resolve stack → find current position → navigate → sync → show.
 ///
 /// If `@` is already the first plan, prints a message and stays put.
-pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
+pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, mut loaded_repo: Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // 2. Resolve stack
     let (changes, current_idx) = match resolve_stack_and_position(jj) {
@@ -61,7 +67,10 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedR
     // 3. Check if already at the first plan
     if current_idx == 0 {
         eprintln!("Already at the first plan in the stack");
-        crate::wrap::resolve_and_sync(plan_dir, jj, None);
+        if let Some(ref mut repo) = loaded_repo {
+            repo.reload();
+        }
+        crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
         return Ok(0);
     }
 
@@ -72,8 +81,11 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: Option<&LoadedR
         return Ok(status.code().unwrap_or(1));
     }
 
-    // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj, None);
+    // 5. Reload + Sync + show stack
+    if let Some(ref mut repo) = loaded_repo {
+        repo.reload();
+    }
+    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
     Ok(0)
 }
 
@@ -88,10 +100,10 @@ pub fn plan_go(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     target: &str,
-    loaded_repo: Option<&LoadedRepo>,
+    mut loaded_repo: Option<&mut LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // 2. Resolve stack
     let base = crate::stack::resolve_stack_base(jj);
@@ -130,8 +142,11 @@ pub fn plan_go(
         return Ok(status.code().unwrap_or(1));
     }
 
-    // 5. Sync + show stack
-    crate::wrap::resolve_and_sync(plan_dir, jj, None);
+    // 5. Reload + Sync + show stack
+    if let Some(ref mut repo) = loaded_repo {
+        repo.reload();
+    }
+    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
     Ok(0)
 }
 
@@ -149,4 +164,3 @@ fn resolve_stack_and_position(jj: &JjBinary) -> Option<(Vec<StackChange>, usize)
     let current_idx = changes.iter().position(|c| c.is_working_copy)?;
     Some((changes, current_idx))
 }
-

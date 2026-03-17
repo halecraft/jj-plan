@@ -100,21 +100,21 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     };
 
     // Load jj-lib repo for in-process reads (graceful: None on failure)
-    let loaded_repo = repo::load_repo(&repo_root);
+    let mut loaded_repo = repo::load_repo(&repo_root);
 
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, loaded_repo.as_ref());
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, loaded_repo.as_mut());
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, loaded_repo.as_ref());
+        return commands::abandon::run_abandon(jj, &plan_dir, args, loaded_repo.as_mut());
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args, loaded_repo.as_ref());
+        return commands::describe::handle_describe(jj, &plan_dir, args, loaded_repo.as_mut());
     }
 
     // All other commands: wrap handler (flush → command → sync → show)
@@ -123,7 +123,8 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     // all go through the full lifecycle:
     //   1. flush_all()  — write local plan file edits to jj descriptions
     //   2. run jj       — execute the actual jj command
-    //   3. sync()       — mirror jj state back to plan files
-    //   4. show_stack() — display the plan stack summary
-    wrap::wrap(&plan_dir, jj, args, loaded_repo.as_ref())
+    //   3. reload()     — refresh repo snapshot after mutation
+    //   4. sync()       — mirror jj state back to plan files
+    //   5. show_stack() — display the plan stack summary
+    wrap::wrap(&plan_dir, jj, args, loaded_repo.as_mut())
 }

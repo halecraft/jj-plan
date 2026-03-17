@@ -16,7 +16,7 @@ use crate::template;
 ///
 /// After creating the change, a placeholder description is set and the
 /// plan directory is synced to reflect the new stack state.
-pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: Option<&LoadedRepo>) -> crate::error::Result<i32> {
+pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_repo: Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -47,7 +47,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
     // ------------------------------------------------------------------
     // 2. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // ------------------------------------------------------------------
     // 3. Resolve stack if --first or --last
@@ -99,7 +99,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
                 let _ = jj.run_silent(&["bookmark", "set", &bm_name, "-r", "@", "-B"]);
             }
 
-            return finish(jj, plan_dir, &new_id);
+            return finish(jj, plan_dir, &new_id, &mut loaded_repo);
         } else {
             // -------------------------------------------------------
             // 5. --last: insert after the last change
@@ -125,7 +125,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
             let description = template::render_template(&plan_dir.path, &new_id);
             let _ = jj.run_silent(&["describe", "-m", &description]);
 
-            return finish(jj, plan_dir, &new_id);
+            return finish(jj, plan_dir, &new_id, &mut loaded_repo);
         }
     }
 
@@ -155,7 +155,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
     let description = template::render_template(&plan_dir.path, &new_id);
     let _ = jj.run_silent(&["describe", "-m", &description]);
 
-    finish(jj, plan_dir, &new_id)
+    finish(jj, plan_dir, &new_id, &mut loaded_repo)
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +192,11 @@ fn find_stack_bookmark(bookmarks: &[String]) -> Option<String> {
 /// Sync plan files, print the creation message, and show the stack.
 ///
 /// Shared epilogue for all three paths (--first, --last, default).
-fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str) -> crate::error::Result<i32> {
+fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str, loaded_repo: &mut Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
     eprintln!("Created plan change: jj:{}", new_id);
-    crate::wrap::resolve_and_sync(plan_dir, jj, None);
+    if let Some(repo) = loaded_repo {
+        repo.reload();
+    }
+    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
     Ok(0)
 }

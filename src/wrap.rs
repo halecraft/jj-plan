@@ -14,31 +14,35 @@ use crate::sync;
 ///
 /// 1. Flush all local plan file edits to jj descriptions
 /// 2. Run the actual jj command with inherited stdio
-/// 3. Re-resolve the stack (repo state changed after the command)
-/// 4. Sync jj state back to plan files
-/// 5. Display the plan stack summary
+/// 3. Reload the repo to pick up the mutation's changes
+/// 4. Re-resolve the stack from fresh repo state
+/// 5. Sync jj state back to plan files
+/// 6. Display the plan stack summary
 ///
 /// Returns the jj command's exit code.
 pub fn wrap(
     plan_dir: &PlanDir,
     jj: &JjBinary,
     args: &[String],
-    loaded_repo: Option<&LoadedRepo>,
+    loaded_repo: Option<&mut LoadedRepo>,
 ) -> crate::error::Result<i32> {
     // 1. Flush all local plan file edits to jj descriptions
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo);
+    // (pre-mutation — repo snapshot is fresh, jj-lib reads work)
+    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
 
     // 2. Run the actual jj command with inherited stdio
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
-    // 3-5. Re-resolve stack, sync plan files, show stack summary
-    // NOTE: After a mutation, the repo state has changed. We must re-load
-    // to get fresh data. For now, we fall back to subprocess for post-mutation
-    // reads since the LoadedRepo snapshot is stale. The pre-mutation flush
-    // benefits from jj-lib, and post-mutation sync uses subprocess until we
-    // add repo reloading.
-    resolve_and_sync(plan_dir, jj, None);
+    // 3-6. Reload repo, re-resolve stack, sync plan files, show stack summary
+    // After the CLI mutation, the on-disk repo state has changed. Reload
+    // to get a fresh ReadonlyRepo snapshot, then use jj-lib for sync reads.
+    if let Some(repo) = loaded_repo {
+        repo.reload();
+        resolve_and_sync(plan_dir, jj, Some(repo));
+    } else {
+        resolve_and_sync(plan_dir, jj, None);
+    }
 
     Ok(exit_code)
 }
@@ -54,9 +58,10 @@ pub fn wrap(
 /// - Ambiguous sibling bookmarks → sets error state
 /// - No usable base → passes None to sync (bookmark-loss detection)
 ///
-/// `loaded_repo` may be `None` after mutations (stale snapshot), in which case
-/// subprocess-based resolution is used. Pass `Some` only when the repo state
-/// is known to be fresh (e.g. pre-mutation reads).
+/// When `loaded_repo` is `Some`, uses jj-lib for in-process reads (fast path).
+/// When `None`, falls back to subprocess-based resolution (slow path).
+/// Callers should call `loaded_repo.reload()` after any CLI mutation before
+/// passing the repo here.
 pub fn resolve_and_sync(plan_dir: &PlanDir, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) {
     let max_stack_size = crate::plan_dir::plan_max();
     let (_stack_base, stack_changes) = resolve_fresh_stack(jj, &plan_dir.path, loaded_repo);
@@ -64,7 +69,7 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, jj: &JjBinary, loaded_repo: Option<&
     sync::show_stack(plan_dir);
 }
 
-/// Re-resolve the stack base and changes after a mutation.
+/// Re-resolve the stack base and changes.
 ///
 /// Returns (Option<StackBase>, Option<Vec<StackChange>>).
 /// The StackBase is used for error reporting; the Vec<StackChange>
@@ -72,7 +77,7 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, jj: &JjBinary, loaded_repo: Option<&
 ///
 /// If `loaded_repo` is provided, uses jj-lib for in-process reads.
 /// Otherwise falls back to subprocess-based resolution.
-fn resolve_fresh_stack(
+pub fn resolve_fresh_stack(
     jj: &JjBinary,
     plan_dir: &Path,
     loaded_repo: Option<&LoadedRepo>,
