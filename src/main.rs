@@ -1,7 +1,12 @@
 mod commands;
 mod error;
+mod flush;
 mod jj_binary;
 mod plan_dir;
+mod plan_file;
+mod stack;
+mod sync;
+mod wrap;
 
 use error::JjPlanError;
 use jj_binary::JjBinary;
@@ -63,7 +68,7 @@ fn main() {
 fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     // No args or read-only command → zero-overhead passthrough via exec
     if args.is_empty() || is_readonly_command(&args[0]) {
-        jj.exec(args)?;
+        jj.exec_strings(args)?;
         unreachable!("exec replaces the process");
     }
 
@@ -74,7 +79,7 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
         Some(root) => root,
         None => {
             // Not in a jj repo — passthrough (jj will produce its own error)
-            jj.exec(args)?;
+            jj.exec_strings(args)?;
             unreachable!();
         }
     };
@@ -84,7 +89,7 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
         Some(pd) => pd,
         None => {
             // No plan directory — not activated, full passthrough
-            jj.exec(args)?;
+            jj.exec_strings(args)?;
             unreachable!();
         }
     };
@@ -95,28 +100,16 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     }
 
     // Special handling for "abandon" — placeholder for jj:swlkutql
-    // For now, route through the general wrap handler
+    // For now, route through the general wrap handler.
     // (abandon recovery will be implemented in jj:swlkutql)
 
-    // All other commands: wrap handler (flush → command → sync → show)
-    //
-    // In this scaffold phase, we only have passthrough — the full
-    // flush/sync lifecycle is implemented in jj:uyooozox. For now,
-    // we run jj with inherited stdio and return its exit code.
+    // All commands: wrap handler (flush → command → sync → show)
     //
     // Commands like status/st, new, edit, describe, abandon, and the
-    // general catch-all all go through this path.
-    wrap_passthrough(jj, args)
-}
-
-/// Temporary wrap handler that just runs jj with inherited stdio.
-///
-/// This is the scaffold version — it does NOT flush or sync plan files.
-/// The full flush→command→sync→show lifecycle is implemented in jj:uyooozox.
-///
-/// Once jj:uyooozox lands, this function is replaced by the real wrap handler
-/// that calls flush_all() before the command and sync()+show_stack() after.
-fn wrap_passthrough(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
-    let status = jj.run_inherit(args)?;
-    Ok(status.code().unwrap_or(1))
+    // general catch-all all go through the full lifecycle:
+    //   1. flush_all()  — write local plan file edits to jj descriptions
+    //   2. run jj       — execute the actual jj command
+    //   3. sync()       — mirror jj state back to plan files
+    //   4. show_stack() — display the plan stack summary
+    wrap::wrap(&plan_dir, jj, args)
 }

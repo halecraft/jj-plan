@@ -57,8 +57,13 @@ impl JjBinary {
     /// Replace this process with jj (unix exec). Does not return on success.
     ///
     /// This is the zero-overhead passthrough path used for read-only commands.
+    ///
+    /// Accepts `&[&str]` for ergonomic call sites. The `main.rs` entry point
+    /// holds `Vec<String>` from `std::env::args()`, so callers convert via
+    /// `args.iter().map(|s| s.as_str()).collect::<Vec<_>>()` or the
+    /// `exec_strings` convenience method.
     #[cfg(unix)]
-    pub fn exec(&self, args: &[String]) -> Result<()> {
+    pub fn exec(&self, args: &[&str]) -> Result<()> {
         use std::os::unix::process::CommandExt;
         let err = Command::new(&self.path).args(args).exec();
         // exec() only returns on error
@@ -67,9 +72,16 @@ impl JjBinary {
 
     /// Non-unix fallback: spawn jj and exit with its status code.
     #[cfg(not(unix))]
-    pub fn exec(&self, args: &[String]) -> Result<()> {
-        let status = self.run_status(args)?;
+    pub fn exec(&self, args: &[&str]) -> Result<()> {
+        let status = self.run_inherit(args)?;
         std::process::exit(status.code().unwrap_or(1));
+    }
+
+    /// Convenience: exec with `&[String]` args (used by main dispatch where
+    /// args come from `std::env::args()`).
+    pub fn exec_strings(&self, args: &[String]) -> Result<()> {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.exec(&refs)
     }
 
     /// Run jj as a child process, inheriting stdin/stdout/stderr.
@@ -77,7 +89,7 @@ impl JjBinary {
     ///
     /// Used for wrapped (mutating) commands where we need to do work
     /// before and after the jj command.
-    pub fn run_inherit(&self, args: &[String]) -> Result<ExitStatus> {
+    pub fn run_inherit(&self, args: &[&str]) -> Result<ExitStatus> {
         Command::new(&self.path)
             .args(args)
             .stdin(Stdio::inherit())
@@ -87,11 +99,17 @@ impl JjBinary {
             .map_err(JjPlanError::JjExecFailed)
     }
 
+    /// Convenience: run_inherit with `&[String]` args.
+    pub fn run_inherit_strings(&self, args: &[String]) -> Result<ExitStatus> {
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.run_inherit(&refs)
+    }
+
     /// Run jj as a child process, capturing stdout. Stderr is inherited.
     /// Returns (exit_status, stdout_string).
     ///
     /// Used for commands where we need to parse jj's output (e.g. `jj root`).
-    pub fn run_capture_stdout(&self, args: &[String]) -> Result<(ExitStatus, String)> {
+    pub fn run_capture_stdout(&self, args: &[&str]) -> Result<(ExitStatus, String)> {
         let output = Command::new(&self.path)
             .args(args)
             .stdin(Stdio::inherit())
@@ -109,7 +127,7 @@ impl JjBinary {
     ///
     /// Used for probing commands where we don't want to display output
     /// (e.g. checking `jj root` to see if we're in a repo).
-    pub fn run_silent(&self, args: &[String]) -> Result<(ExitStatus, String, String)> {
+    pub fn run_silent(&self, args: &[&str]) -> Result<(ExitStatus, String, String)> {
         let output = Command::new(&self.path)
             .args(args)
             .stdin(Stdio::null())
@@ -125,8 +143,7 @@ impl JjBinary {
 
     /// Convenience: get the repo root via `jj root`, or None if not in a repo.
     pub fn repo_root(&self) -> Option<PathBuf> {
-        let args = vec!["root".to_string()];
-        match self.run_silent(&args) {
+        match self.run_silent(&["root"]) {
             Ok((status, stdout, _)) if status.success() => {
                 let trimmed = stdout.trim();
                 if trimmed.is_empty() {

@@ -2,12 +2,17 @@ use std::path::Path;
 
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::stack::{self, StackBase};
 
 /// Run `jj plan config` — print resolved configuration and stack info.
 ///
 /// This is a read-only introspection command with no flush, no sync, and
 /// no side effects. It prints all resolved configuration as key: value pairs,
 /// matching the zsh shim's output format.
+///
+/// Stack resolution is delegated to `stack::resolve_stack_base()` and
+/// `stack::resolve_stack_changes()` — the same code path used by wrap/sync.
+/// No duplicate resolution logic.
 pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path) {
     let self_exe = std::env::current_exe()
         .ok()
@@ -39,93 +44,25 @@ pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path) {
     println!("  resolution source: {}", plan_dir.source);
     println!();
 
-    // Stack info — read-only, no flush/sync
-    // Use jj subprocess to resolve stack base (same approach as zsh shim)
-    let stack_base = resolve_stack_base_via_jj(jj);
-    match stack_base {
-        Some((base, mode)) => {
-            println!("  stack base:       {} ({})", base, mode);
-
-            let revset = match mode.as_str() {
-                "inclusive" => format!("({}::@) | descendants(@)", base),
-                _ => format!("({}..@) | descendants(@)", base),
-            };
-            let size = count_revset_via_jj(jj, &revset);
-            println!("  stack size:       {}", size);
-        }
-        None => {
+    // Stack info — uses the shared stack resolution from stack.rs
+    let base = stack::resolve_stack_base(jj);
+    match &base {
+        Some(StackBase::Ambiguous(_)) | None => {
             println!("  stack base:       (none)");
             println!("  stack size:       0");
         }
-    }
-}
+        Some(stack_base) => {
+            if let Some((base_str, mode_str)) = stack_base.display_pair() {
+                println!("  stack base:       {} ({})", base_str, mode_str);
 
-/// Resolve the stack base by shelling out to jj, returning (base_id, range_mode).
-///
-/// This mirrors `__jj_plan_resolve_stack_base` from the zsh shim.
-/// Returns `Some(("change_id", "inclusive"|"exclusive"))` or `None`.
-fn resolve_stack_base_via_jj(jj: &JjBinary) -> Option<(String, String)> {
-    // 1. stack / stack/* bookmarks — nearest ancestor of @ (inclusive)
-    let revset =
-        r#"heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)"#.to_string();
-    let args = vec![
-        "log".to_string(),
-        "-r".to_string(),
-        revset,
-        "-T".to_string(),
-        r#"change_id.shortest(8) ++ "\n""#.to_string(),
-        "--no-graph".to_string(),
-    ];
-
-    if let Ok((status, stdout, _)) = jj.run_silent(&args) {
-        if status.success() {
-            let heads: Vec<&str> = stdout.trim().lines().filter(|l| !l.is_empty()).collect();
-            if heads.len() == 1 {
-                return Some((heads[0].to_string(), "inclusive".to_string()));
-            }
-            // Multiple heads = ambiguous, but for config display we just report none
-            if heads.len() > 1 {
-                return None;
+                let size = stack::resolve_stack_changes(jj, stack_base)
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                println!("  stack size:       {}", size);
+            } else {
+                println!("  stack base:       (none)");
+                println!("  stack size:       0");
             }
         }
-    }
-
-    // 2. trunk() — if it resolves to something other than root() (exclusive)
-    let args = vec![
-        "log".to_string(),
-        "-r".to_string(),
-        "trunk() & ~root()".to_string(),
-        "-T".to_string(),
-        "change_id".to_string(),
-        "--no-graph".to_string(),
-    ];
-
-    if let Ok((status, stdout, _)) = jj.run_silent(&args) {
-        if status.success() && !stdout.trim().is_empty() {
-            return Some(("trunk()".to_string(), "exclusive".to_string()));
-        }
-    }
-
-    // 3. No usable base
-    None
-}
-
-/// Count the number of changes matching a revset by shelling out to jj.
-fn count_revset_via_jj(jj: &JjBinary, revset: &str) -> usize {
-    let args = vec![
-        "log".to_string(),
-        "-r".to_string(),
-        revset.to_string(),
-        "-T".to_string(),
-        r#""x""#.to_string(),
-        "--no-graph".to_string(),
-    ];
-
-    match jj.run_silent(&args) {
-        Ok((status, stdout, _)) if status.success() => {
-            // Each change produces one "x", so count characters
-            stdout.trim().len()
-        }
-        _ => 0,
     }
 }
