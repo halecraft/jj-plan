@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::template;
 
 /// Run `jj plan new` — create a new plan change in the stack.
 ///
@@ -88,9 +89,9 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::err
                 }
             };
 
-            // Set placeholder description
-            let placeholder = format!("(placeholder: jj:{})", new_id);
-            let _ = jj.run_silent(&["describe", "-m", &placeholder]);
+            // Set templated description
+            let description = template::render_template(&plan_dir.path, &new_id);
+            let _ = jj.run_silent(&["describe", "-m", &description]);
 
             // Move stack bookmark to the new first change
             if let Some(bm_name) = find_stack_bookmark(&changes[0].bookmarks) {
@@ -120,8 +121,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::err
                 }
             };
 
-            let placeholder = format!("(placeholder: jj:{})", new_id);
-            let _ = jj.run_silent(&["describe", "-m", &placeholder]);
+            let description = template::render_template(&plan_dir.path, &new_id);
+            let _ = jj.run_silent(&["describe", "-m", &description]);
 
             return finish(jj, plan_dir, &new_id);
         }
@@ -150,8 +151,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String]) -> crate::err
         }
     };
 
-    let placeholder = format!("(placeholder: jj:{})", new_id);
-    let _ = jj.run_silent(&["describe", "-m", &placeholder]);
+    let description = template::render_template(&plan_dir.path, &new_id);
+    let _ = jj.run_silent(&["describe", "-m", &description]);
 
     finish(jj, plan_dir, &new_id)
 }

@@ -2,6 +2,7 @@ mod commands;
 mod error;
 mod flush;
 mod markdown;
+mod template;
 mod jj_binary;
 mod plan_dir;
 mod plan_file;

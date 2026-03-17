@@ -3,6 +3,7 @@ pub mod config;
 pub mod describe;
 pub mod done;
 pub mod help;
+pub mod nav;
 pub mod new;
 pub mod stack;
 
@@ -47,6 +48,19 @@ pub fn dispatch_plan(
         Some("done") => {
             let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
             done::run_done(jj, plan_dir, sub_args)
+        }
+
+        Some("next") => nav::plan_next(jj, plan_dir),
+        Some("prev") => nav::plan_prev(jj, plan_dir),
+        Some("go") => {
+            let target = args.get(2).map(|s| s.as_str());
+            match target {
+                Some(t) => nav::plan_go(jj, plan_dir, t),
+                None => {
+                    eprintln!("jj plan go: missing target (index or change ID)");
+                    Ok(1)
+                }
+            }
         }
 
         // No subcommand

@@ -17,6 +17,9 @@ Subcommands:
     --stack                Mark all plans in the stack as done
     --keep-scratch         Keep [scratch] sections (don't strip)
     --dry-run              Show what would be stripped without modifying anything
+  next                     Advance @ to the next plan in the stack
+  prev                     Move @ to the previous plan in the stack
+  go <N | CHANGE_ID>       Jump to a plan by index (1-based) or change ID
   config                   Show resolved configuration and stack info
 
 Options:

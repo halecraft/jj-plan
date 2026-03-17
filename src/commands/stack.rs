@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::template;
 
 /// Run `jj plan stack` — create a new stack with a single plan (jj change).
 ///
@@ -111,10 +112,10 @@ pub fn run_stack(
     let change_id = log_stdout.trim().to_string();
 
     // -----------------------------------------------------------------------
-    // 7. Set placeholder description
+    // 7. Set templated description
     // -----------------------------------------------------------------------
-    let placeholder = format!("(placeholder: jj:{})", change_id);
-    let _ = jj.run_silent(&["describe", "-m", &placeholder]);
+    let description = template::render_template(&plan_dir.path, &change_id);
+    let _ = jj.run_silent(&["describe", "-m", &description]);
 
     // -----------------------------------------------------------------------
     // 8. Sync plan directory to reflect the new stack
