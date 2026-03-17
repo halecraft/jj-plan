@@ -1,7 +1,6 @@
 /// Print the `jj plan --help` text and return.
 ///
-/// This matches the zsh shim's help output, extended with new commands
-/// that will be implemented in subsequent plans.
+/// Lists all available plan subcommands and their flags.
 pub fn print_help() {
     print!(
         "\
@@ -13,6 +12,11 @@ Subcommands:
                            Create a plan change with a self-referencing placeholder
     --first                Insert before the first stack member (moves bookmark)
     --last                 Insert after the last stack member
+  done [flags] [CHANGE_ID]
+                           Mark a plan as done, strip [scratch] sections, advance
+    --stack                Mark all plans in the stack as done
+    --keep-scratch         Keep [scratch] sections (don't strip)
+    --dry-run              Show what would be stripped without modifying anything
   config                   Show resolved configuration and stack info
 
 Options:

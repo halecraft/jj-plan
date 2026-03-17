@@ -1,6 +1,7 @@
 mod commands;
 mod error;
 mod flush;
+mod markdown;
 mod jj_binary;
 mod plan_dir;
 mod plan_file;
@@ -99,14 +100,20 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
         return commands::dispatch_plan(jj, &plan_dir, &repo_root, args);
     }
 
-    // Special handling for "abandon" — placeholder for jj:swlkutql
-    // For now, route through the general wrap handler.
-    // (abandon recovery will be implemented in jj:swlkutql)
+    // Special handling for "abandon" — recover stack bookmark if lost
+    if subcommand == "abandon" {
+        return commands::abandon::run_abandon(jj, &plan_dir, args);
+    }
 
-    // All commands: wrap handler (flush → command → sync → show)
+    // Special handling for "describe" — intercept -m to write to plan file first
+    if subcommand == "describe" {
+        return commands::describe::handle_describe(jj, &plan_dir, args);
+    }
+
+    // All other commands: wrap handler (flush → command → sync → show)
     //
-    // Commands like status/st, new, edit, describe, abandon, and the
-    // general catch-all all go through the full lifecycle:
+    // Commands like status/st, new, edit, and the general catch-all
+    // all go through the full lifecycle:
     //   1. flush_all()  — write local plan file edits to jj descriptions
     //   2. run jj       — execute the actual jj command
     //   3. sync()       — mirror jj state back to plan files

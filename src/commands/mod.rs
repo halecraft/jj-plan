@@ -1,5 +1,10 @@
+pub mod abandon;
 pub mod config;
+pub mod describe;
+pub mod done;
 pub mod help;
+pub mod new;
+pub mod stack;
 
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
@@ -32,19 +37,16 @@ pub fn dispatch_plan(
 
         // plan stack, plan new, plan done — placeholders for jj:swlkutql
         Some("stack") => {
-            // TODO(jj:swlkutql): implement plan stack
-            eprintln!("jj plan stack: not yet implemented in Rust binary");
-            Ok(1)
+            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
+            stack::run_stack(jj, plan_dir, sub_args)
         }
         Some("new") => {
-            // TODO(jj:swlkutql): implement plan new
-            eprintln!("jj plan new: not yet implemented in Rust binary");
-            Ok(1)
+            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
+            new::run_new(jj, plan_dir, sub_args)
         }
         Some("done") => {
-            // TODO(jj:swlkutql): implement plan done
-            eprintln!("jj plan done: not yet implemented in Rust binary");
-            Ok(1)
+            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
+            done::run_done(jj, plan_dir, sub_args)
         }
 
         // No subcommand
