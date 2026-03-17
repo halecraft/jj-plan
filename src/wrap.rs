@@ -3,10 +3,10 @@ use std::path::Path;
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::repo::LoadedRepo;
-use crate::stack::{self, StackBase};
+use crate::stack::{StackBase, StackChange};
 use crate::sync;
 
-/// Unified handler for mutating commands: flush → command → sync → show.
+/// Unified handler for mutating commands: flush → command → reload → sync → show.
 ///
 /// This is the Rust equivalent of `__jj_plan_wrap` from the zsh shim.
 /// All mutating jj commands (status, st, new, edit, describe, abandon,
@@ -24,25 +24,18 @@ pub fn wrap(
     plan_dir: &PlanDir,
     jj: &JjBinary,
     args: &[String],
-    loaded_repo: Option<&mut LoadedRepo>,
+    loaded_repo: &mut LoadedRepo,
 ) -> crate::error::Result<i32> {
     // 1. Flush all local plan file edits to jj descriptions
-    // (pre-mutation — repo snapshot is fresh, jj-lib reads work)
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
+    crate::flush::flush_all(&plan_dir.path, jj, &loaded_repo);
 
     // 2. Run the actual jj command with inherited stdio
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
-    // 3-6. Reload repo, re-resolve stack, sync plan files, show stack summary
-    // After the CLI mutation, the on-disk repo state has changed. Reload
-    // to get a fresh ReadonlyRepo snapshot, then use jj-lib for sync reads.
-    if let Some(repo) = loaded_repo {
-        repo.reload();
-        resolve_and_sync(plan_dir, jj, Some(repo));
-    } else {
-        resolve_and_sync(plan_dir, jj, None);
-    }
+    // 3-6. Reload repo, re-resolve stack, sync plan files, show stack
+    loaded_repo.reload();
+    resolve_and_sync(plan_dir, jj, &loaded_repo);
 
     Ok(exit_code)
 }
@@ -58,36 +51,26 @@ pub fn wrap(
 /// - Ambiguous sibling bookmarks → sets error state
 /// - No usable base → passes None to sync (bookmark-loss detection)
 ///
-/// When `loaded_repo` is `Some`, uses jj-lib for in-process reads (fast path).
-/// When `None`, falls back to subprocess-based resolution (slow path).
-/// Callers should call `loaded_repo.reload()` after any CLI mutation before
-/// passing the repo here.
-pub fn resolve_and_sync(plan_dir: &PlanDir, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) {
+/// Callers must call `loaded_repo.reload()` after CLI mutations before
+/// calling this.
+pub fn resolve_and_sync(plan_dir: &PlanDir, _jj: &JjBinary, loaded_repo: &LoadedRepo) {
     let max_stack_size = crate::plan_dir::plan_max();
-    let (_stack_base, stack_changes) = resolve_fresh_stack(jj, &plan_dir.path, loaded_repo);
+    let (_stack_base, stack_changes) = resolve_fresh_stack(_jj, &plan_dir.path, loaded_repo);
     sync::sync(plan_dir, stack_changes.as_deref(), max_stack_size);
     sync::show_stack(plan_dir);
 }
 
-/// Re-resolve the stack base and changes.
+/// Re-resolve the stack base and changes via jj-lib.
 ///
 /// Returns (Option<StackBase>, Option<Vec<StackChange>>).
 /// The StackBase is used for error reporting; the Vec<StackChange>
 /// is passed to sync().
-///
-/// If `loaded_repo` is provided, uses jj-lib for in-process reads.
-/// Otherwise falls back to subprocess-based resolution.
 pub fn resolve_fresh_stack(
-    jj: &JjBinary,
+    _jj: &JjBinary,
     plan_dir: &Path,
-    loaded_repo: Option<&LoadedRepo>,
-) -> (Option<StackBase>, Option<Vec<stack::StackChange>>) {
-    // Resolve stack base: prefer jj-lib, fall back to subprocess
-    let base = if let Some(loaded) = loaded_repo {
-        crate::repo::resolve_stack_base_lib(loaded)
-    } else {
-        stack::resolve_stack_base(jj)
-    };
+    loaded_repo: &LoadedRepo,
+) -> (Option<StackBase>, Option<Vec<StackChange>>) {
+    let base = crate::repo::resolve_stack_base_lib(loaded_repo);
 
     match &base {
         None => {
@@ -95,7 +78,6 @@ pub fn resolve_fresh_stack(
             (None, None)
         }
         Some(StackBase::Ambiguous(ids)) => {
-            // Ambiguous sibling bookmarks — set error in sync
             sync::set_error(
                 plan_dir,
                 &format!(
@@ -106,12 +88,8 @@ pub fn resolve_fresh_stack(
             (base, None)
         }
         Some(StackBase::Inclusive(_) | StackBase::Exclusive) => {
-            // Resolve stack changes: prefer jj-lib, fall back to subprocess
-            let changes = if let Some(loaded) = loaded_repo {
-                crate::repo::resolve_stack_changes_lib(loaded, base.as_ref().unwrap())
-            } else {
-                stack::resolve_stack_changes(jj, base.as_ref().unwrap())
-            };
+            let changes =
+                crate::repo::resolve_stack_changes_lib(loaded_repo, base.as_ref().unwrap());
             (base, changes)
         }
     }

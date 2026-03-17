@@ -31,7 +31,7 @@ pub fn run_stack(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    mut loaded_repo: Option<&mut LoadedRepo>,
+    loaded_repo: &mut LoadedRepo,
 ) -> crate::error::Result<i32> {
     // -----------------------------------------------------------------------
     // 1. Parse args: `-r <rev>` and positional stack name
@@ -65,7 +65,7 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 3. Flush local plan edits to jj descriptions
     // -----------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
+    crate::flush::flush_all(&plan_dir.path, jj, &*loaded_repo);
 
     // -----------------------------------------------------------------------
     // 4. Create new change
@@ -103,15 +103,14 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 6. Read back the change ID of the new change
     // -----------------------------------------------------------------------
-    let (_log_status, log_stdout, _log_stderr) = jj.run_silent(&[
-        "log",
-        "-r",
-        "@",
-        "-T",
-        "change_id.shortest(8)",
-        "--no-graph",
-    ])?;
-    let change_id = log_stdout.trim().to_string();
+    loaded_repo.reload();
+    let change_id = match crate::repo::read_change_id_at_wc(&*loaded_repo) {
+        Some(id) => id,
+        None => {
+            eprintln!("jj plan stack: could not read new change ID");
+            return Ok(1);
+        }
+    };
 
     // -----------------------------------------------------------------------
     // 7. Set templated description
@@ -123,10 +122,8 @@ pub fn run_stack(
     // 8. Print summary and sync
     // -----------------------------------------------------------------------
     eprintln!("Started new stack: {} ({})", bookmark_name, change_id);
-    if let Some(ref mut repo) = loaded_repo {
-        repo.reload();
-    }
-    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
+    loaded_repo.reload();
+    crate::wrap::resolve_and_sync(plan_dir, jj, &loaded_repo);
 
     Ok(0)
 }

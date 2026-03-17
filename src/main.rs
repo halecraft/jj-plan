@@ -14,7 +14,7 @@ mod wrap;
 use error::JjPlanError;
 use jj_binary::JjBinary;
 use plan_dir::{find_repo_root, resolve_plan_dir};
-use repo::LoadedRepo;
+
 
 /// Read-only commands that get zero-overhead passthrough via exec.
 /// Note: status/st are NOT here — they get special handling to append .stack.
@@ -79,11 +79,9 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     let subcommand = &args[0];
 
     // Resolve repo root — if not in a repo, passthrough
-    // Uses filesystem walk for .jj/ instead of `jj root` subprocess (~15ms saved)
     let repo_root = match find_repo_root() {
         Some(root) => root,
         None => {
-            // Not in a jj repo — passthrough (jj will produce its own error)
             jj.exec_strings(args)?;
             unreachable!();
         }
@@ -93,38 +91,38 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     let plan_dir = match resolve_plan_dir(Some(&repo_root)) {
         Some(pd) => pd,
         None => {
-            // No plan directory — not activated, full passthrough
             jj.exec_strings(args)?;
             unreachable!();
         }
     };
 
-    // Load jj-lib repo for in-process reads (graceful: None on failure)
-    let mut loaded_repo = repo::load_repo(&repo_root);
+    // Load jj-lib repo for in-process reads.
+    // If loading fails, degrade to passthrough — the jj command runs directly
+    // without plan sync. This only happens on version mismatch or corrupt repo.
+    let mut loaded_repo = match repo::load_repo(&repo_root) {
+        Some(r) => r,
+        None => {
+            eprintln!("jj-plan: warning: could not load repository via jj-lib, running without plan sync");
+            jj.exec_strings(args)?;
+            unreachable!();
+        }
+    };
 
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, loaded_repo.as_mut());
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut loaded_repo);
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, loaded_repo.as_mut());
+        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut loaded_repo);
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args, loaded_repo.as_mut());
+        return commands::describe::handle_describe(jj, &plan_dir, args, &mut loaded_repo);
     }
 
-    // All other commands: wrap handler (flush → command → sync → show)
-    //
-    // Commands like status/st, new, edit, and the general catch-all
-    // all go through the full lifecycle:
-    //   1. flush_all()  — write local plan file edits to jj descriptions
-    //   2. run jj       — execute the actual jj command
-    //   3. reload()     — refresh repo snapshot after mutation
-    //   4. sync()       — mirror jj state back to plan files
-    //   5. show_stack() — display the plan stack summary
-    wrap::wrap(&plan_dir, jj, args, loaded_repo.as_mut())
+    // All other commands: wrap lifecycle (flush → command → reload → sync → show)
+    wrap::wrap(&plan_dir, jj, args, &mut loaded_repo)
 }

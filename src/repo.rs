@@ -496,3 +496,127 @@ pub fn gather_descriptions(loaded: &LoadedRepo, change_ids: &[&str]) -> HashMap<
         None => HashMap::new(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Single-value read helpers (replace isolated subprocess reads in commands)
+// ---------------------------------------------------------------------------
+
+/// Read the working copy's shortest unique change ID (reverse hex).
+///
+/// Replaces `new.rs::read_current_change_id()` and the inline read in
+/// `stack.rs::run_stack()`.
+pub fn read_change_id_at_wc(loaded: &LoadedRepo) -> Option<String> {
+    let wc_commit_id = loaded
+        .repo
+        .view()
+        .get_wc_commit_id(loaded.workspace.workspace_name())?;
+    let commit = loaded.repo.store().get_commit(wc_commit_id).ok()?;
+    Some(short_change_id(&loaded.repo, &commit))
+}
+
+/// Read a change's description by evaluating a revset target.
+///
+/// Returns the description with trailing newline stripped.
+/// Replaces `done.rs::read_description()`.
+pub fn read_description_at(loaded: &LoadedRepo, target: &str) -> Option<String> {
+    let commits = evaluate_revset(&loaded.repo, &loaded.workspace, target)?;
+    let commit = commits.first()?;
+    let desc = commit.description().to_owned();
+    Some(desc.strip_suffix('\n').unwrap_or(&desc).to_string())
+}
+
+/// Resolve a revset target to a shortest unique change ID (reverse hex).
+///
+/// Replaces `describe.rs::resolve_target_change_id()`.
+pub fn resolve_change_id(loaded: &LoadedRepo, target: &str) -> Option<String> {
+    let commits = evaluate_revset(&loaded.repo, &loaded.workspace, target)?;
+    let commit = commits.first()?;
+    Some(short_change_id(&loaded.repo, &commit))
+}
+
+/// Check whether a commit identified by a revset target exists.
+///
+/// Returns `true` if the revset resolves to at least one commit.
+pub fn commit_exists(loaded: &LoadedRepo, target: &str) -> bool {
+    evaluate_revset(&loaded.repo, &loaded.workspace, target)
+        .map(|commits| !commits.is_empty())
+        .unwrap_or(false)
+}
+
+/// Return the first child's change ID for a given change ID.
+///
+/// Evaluates `children(change_id) ~ change_id` and returns the first
+/// result's shortest change ID, or `None` if no children exist.
+pub fn first_child_change_id(loaded: &LoadedRepo, change_id: &str) -> Option<String> {
+    let revset_str = format!("children({}) ~ {}", change_id, change_id);
+    let commits = evaluate_revset(&loaded.repo, &loaded.workspace, &revset_str)?;
+    let commit = commits.last()?; // reversed = parents first, so last is earliest child
+    Some(short_change_id(&loaded.repo, &commit))
+}
+
+/// Snapshot bookmark state for abandon recovery.
+///
+/// Reads the nearest `stack`/`stack/*` bookmark ancestor of `@`, records
+/// whether it is the working copy, and finds its first child.
+/// Returns `None` if no stack bookmark exists in the ancestry of `@`.
+///
+/// Replaces `abandon.rs::snapshot_stack_bookmark()`.
+pub fn snapshot_bookmark_state(loaded: &LoadedRepo) -> Option<BookmarkSnapshot> {
+    let repo = &loaded.repo;
+    let workspace = &loaded.workspace;
+
+    // Find the nearest stack bookmark ancestor of @
+    let revset_str = r#"heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)"#;
+    let commits = evaluate_revset(repo, workspace, revset_str)?;
+    let commit = commits.first()?;
+
+    let change_id = short_change_id(repo, &commit);
+
+    // Find the specific stack bookmark name
+    let bookmarks = commit_bookmarks(repo, &commit);
+    let bookmark_name = bookmarks
+        .iter()
+        .find(|b| *b == "stack" || b.starts_with("stack/"))?
+        .clone();
+
+    // Check if this commit is the working copy
+    let wc_commit_id = repo
+        .view()
+        .get_wc_commit_id(workspace.workspace_name());
+    let was_working_copy = wc_commit_id == Some(commit.id());
+
+    // Find first child
+    let first_child = first_child_change_id(loaded, &change_id);
+
+    Some(BookmarkSnapshot {
+        _change_id: change_id,
+        bookmark_name,
+        was_working_copy,
+        first_child,
+    })
+}
+
+/// Check whether a `stack`/`stack/*` bookmark still exists in the ancestry of `@`.
+///
+/// Replaces `abandon.rs::stack_bookmark_survives()`.
+pub fn stack_bookmark_survives(loaded: &LoadedRepo) -> bool {
+    let revset_str = r#"heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)"#;
+    evaluate_revset(&loaded.repo, &loaded.workspace, revset_str)
+        .map(|commits| !commits.is_empty())
+        .unwrap_or(false)
+}
+
+/// Pre-abandon snapshot of the stack bookmark state.
+///
+/// Captures enough information to recover the bookmark if the abandon
+/// removes the change that held it.
+pub struct BookmarkSnapshot {
+    /// Shortest unique change ID of the change holding the bookmark.
+    pub _change_id: String,
+    /// The `stack` or `stack/*` bookmark name.
+    pub bookmark_name: String,
+    /// True if the bookmarked change was the working copy (`@`).
+    pub was_working_copy: bool,
+    /// First child of the bookmarked change (if any), for recovery.
+    pub first_child: Option<String>,
+}

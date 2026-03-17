@@ -5,7 +5,6 @@ use std::path::Path;
 use crate::jj_binary::JjBinary;
 use crate::plan_file;
 use crate::repo::LoadedRepo;
-use crate::stack::{batch_read_by_ids, StackChange};
 
 /// Flush ALL local plan file edits to jj descriptions.
 ///
@@ -19,14 +18,14 @@ use crate::stack::{batch_read_by_ids, StackChange};
 /// - Gather: collect plan files + batch-read jj descriptions (I/O)
 /// - Plan: diff file contents against descriptions → `Vec<FlushAction>` (pure)
 /// - Execute: shell out `jj describe` for each FlushAction (I/O)
-pub fn flush_all(plan_dir: &Path, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) {
+pub fn flush_all(plan_dir: &Path, jj: &JjBinary, loaded_repo: &LoadedRepo) {
     // Don't flush if current.md points to error.md (error state)
     if plan_file::is_error_state(plan_dir) {
         return;
     }
 
     // GATHER — collect plan files and their contents + jj descriptions
-    let gathered = gather_flush_state(plan_dir, jj, loaded_repo);
+    let gathered = gather_flush_state(plan_dir, loaded_repo);
 
     // PLAN — pure diff logic, no I/O
     let actions = plan_flush(&gathered);
@@ -49,9 +48,8 @@ struct FlushGatherState {
 
 /// Collect plan file contents and corresponding jj descriptions.
 ///
-/// If `loaded_repo` is available, reads descriptions via jj-lib in-process.
-/// Otherwise falls back to subprocess-based `batch_read_by_ids`.
-fn gather_flush_state(plan_dir: &Path, jj: &JjBinary, loaded_repo: Option<&LoadedRepo>) -> FlushGatherState {
+/// Reads descriptions via jj-lib in-process using the provided `loaded_repo`.
+fn gather_flush_state(plan_dir: &Path, loaded_repo: &LoadedRepo) -> FlushGatherState {
     let plan_files = plan_file::plan_files_by_id(plan_dir);
 
     if plan_files.is_empty() {
@@ -70,17 +68,9 @@ fn gather_flush_state(plan_dir: &Path, jj: &JjBinary, loaded_repo: Option<&Loade
             }
     }
 
-    // Batch-read jj descriptions for all change IDs
-    // Prefer jj-lib in-process reads; fall back to subprocess
+    // Batch-read jj descriptions for all change IDs via jj-lib in-process
     let change_ids: Vec<&str> = plan_files.keys().map(|s| s.as_str()).collect();
-    let jj_descriptions = if let Some(loaded) = loaded_repo {
-        crate::repo::gather_descriptions(loaded, &change_ids)
-    } else {
-        match batch_read_by_ids(jj, &change_ids) {
-            Some(changes) => build_description_map(changes),
-            None => HashMap::new(),
-        }
-    };
+    let jj_descriptions = crate::repo::gather_descriptions(loaded_repo, &change_ids);
 
     FlushGatherState {
         file_contents,
@@ -146,18 +136,6 @@ fn execute_flush(jj: &JjBinary, actions: &[FlushAction]) {
             &action.content,
         ]);
     }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build a HashMap of change_id → description from a Vec<StackChange>.
-fn build_description_map(changes: Vec<StackChange>) -> HashMap<String, String> {
-    changes
-        .into_iter()
-        .map(|c| (c.change_id, c.description))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -238,30 +216,5 @@ mod tests {
         assert!(ids.contains(&"bbb"));
         assert!(ids.contains(&"ccc"));
         assert!(!ids.contains(&"aaa"));
-    }
-
-    #[test]
-    fn test_build_description_map() {
-        let changes = vec![
-            StackChange {
-                change_id: "abc".to_string(),
-                description: "desc A".to_string(),
-                is_empty: true,
-                is_working_copy: false,
-                bookmarks: vec![],
-            },
-            StackChange {
-                change_id: "def".to_string(),
-                description: "desc B".to_string(),
-                is_empty: false,
-                is_working_copy: true,
-                bookmarks: vec![],
-            },
-        ];
-
-        let map = build_description_map(changes);
-        assert_eq!(map.get("abc").unwrap(), "desc A");
-        assert_eq!(map.get("def").unwrap(), "desc B");
-        assert_eq!(map.len(), 2);
     }
 }

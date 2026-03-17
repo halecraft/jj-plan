@@ -18,7 +18,7 @@ use crate::stack::StackChange;
 ///
 /// When marking a single plan done (the default), if the target is the
 /// working copy (`@`), automatically advances to the next undone plan.
-pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_repo: Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
+pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: &mut LoadedRepo) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -39,23 +39,24 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_r
     // ------------------------------------------------------------------
     // 2. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
+    crate::flush::flush_all(&plan_dir.path, jj, &*loaded_repo);
 
     // ------------------------------------------------------------------
-    // 3. Resolve stack
+    // 3. Resolve stack (jj-lib — reload after flush in case flush mutated)
     // ------------------------------------------------------------------
-    let base = crate::stack::resolve_stack_base(jj);
+    loaded_repo.reload();
+    let base = crate::repo::resolve_stack_base_lib(&*loaded_repo);
     let changes = base
         .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
+        .and_then(|b| crate::repo::resolve_stack_changes_lib(&*loaded_repo, b));
 
     // ------------------------------------------------------------------
     // 4. Dispatch: --stack or single plan
     // ------------------------------------------------------------------
     if do_stack {
-        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, &mut loaded_repo)
+        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, loaded_repo)
     } else {
-        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, &mut loaded_repo)
+        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, loaded_repo)
     }
 }
 
@@ -70,7 +71,7 @@ fn run_done_stack(
     changes: Option<&[StackChange]>,
     keep_scratch: bool,
     dry_run: bool,
-    loaded_repo: &mut Option<&mut LoadedRepo>,
+    loaded_repo: &mut LoadedRepo,
 ) -> crate::error::Result<i32> {
     let changes = match changes {
         Some(c) => c,
@@ -103,10 +104,8 @@ fn run_done_stack(
     }
 
     // Reload after describes, then sync and show stack
-    if let Some(ref mut repo) = *loaded_repo {
-        repo.reload();
-    }
-    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
+    loaded_repo.reload();
+    crate::wrap::resolve_and_sync(plan_dir, jj, &loaded_repo);
 
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
@@ -129,7 +128,7 @@ fn run_done_single(
     target_id: Option<String>,
     keep_scratch: bool,
     dry_run: bool,
-    loaded_repo: &mut Option<&mut LoadedRepo>,
+    loaded_repo: &mut LoadedRepo,
 ) -> crate::error::Result<i32> {
     let target = target_id.clone().unwrap_or_else(|| "@".to_string());
     let is_default_target = target_id.is_none(); // targeting working copy
@@ -146,7 +145,7 @@ fn run_done_single(
         ),
         None => {
             // Not found in stack — read description from jj directly
-            let desc = match read_description(jj, &target) {
+            let desc = match read_description(&*loaded_repo, &target) {
                 Some(d) => d,
                 None => {
                     eprintln!("jj plan done: could not read description for '{}'", target);
@@ -186,10 +185,8 @@ fn run_done_single(
     }
 
     // Reload after describe, then sync and show stack
-    if let Some(ref mut repo) = *loaded_repo {
-        repo.reload();
-    }
-    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
+    loaded_repo.reload();
+    crate::wrap::resolve_and_sync(plan_dir, jj, &loaded_repo);
     Ok(0)
 }
 
@@ -210,17 +207,9 @@ fn find_change_in_stack<'a>(changes: &'a [StackChange], target: &str) -> Option<
     }
 }
 
-/// Read a change's description directly from jj.
-fn read_description(jj: &JjBinary, target: &str) -> Option<String> {
-    let (status, stdout, _) = jj
-        .run_silent(&["log", "-r", target, "-T", "description", "--no-graph"])
-        .ok()?;
-    if !status.success() {
-        return None;
-    }
-    // jj appends a trailing newline to descriptions; strip it
-    let desc = stdout.strip_suffix('\n').unwrap_or(&stdout);
-    Some(desc.to_string())
+/// Read a change's description via jj-lib.
+fn read_description(loaded_repo: &LoadedRepo, target: &str) -> Option<String> {
+    crate::repo::read_description_at(loaded_repo, target)
 }
 
 /// Append `plan-status: ✅` to a description if not already present.
@@ -241,12 +230,13 @@ fn append_done_marker(desc: &str, already_done: bool) -> String {
 /// Re-resolves the stack once (after the describe mutation), then searches
 /// forward (with wraparound) for the next undone change. After `jj edit`,
 /// calls `resolve_and_sync()` exactly once to update plan files.
-fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: &mut Option<&mut LoadedRepo>) {
+fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: &mut LoadedRepo) {
     // Re-resolve the stack once after the describe
-    let base = crate::stack::resolve_stack_base(jj);
+    loaded_repo.reload();
+    let base = crate::repo::resolve_stack_base_lib(&*loaded_repo);
     let changes = base
         .as_ref()
-        .and_then(|b| crate::stack::resolve_stack_changes(jj, b));
+        .and_then(|b| crate::repo::resolve_stack_changes_lib(&*loaded_repo, b));
 
     let changes = match changes {
         Some(c) => c,
@@ -267,11 +257,9 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, loaded_repo: &mut O
     match next_undone {
         Some(change) => {
             let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
-            if let Some(ref mut repo) = *loaded_repo {
-                repo.reload();
-            }
+            loaded_repo.reload();
             let max = crate::plan_dir::plan_max();
-            let (_base, changes2) = crate::wrap::resolve_fresh_stack(jj, &plan_dir.path, loaded_repo.as_deref());
+            let (_base, changes2) = crate::wrap::resolve_fresh_stack(jj, &plan_dir.path, &loaded_repo);
             crate::sync::sync(plan_dir, changes2.as_deref(), max);
         }
         None => {

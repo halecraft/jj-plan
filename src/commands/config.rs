@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::stack::{self, StackBase};
+use crate::repo::LoadedRepo;
+use crate::stack::StackBase;
 
 /// Run `jj plan config` — print resolved configuration and stack info.
 ///
@@ -10,10 +11,10 @@ use crate::stack::{self, StackBase};
 /// no side effects. It prints all resolved configuration as key: value pairs,
 /// matching the zsh shim's output format.
 ///
-/// Stack resolution is delegated to `stack::resolve_stack_base()` and
-/// `stack::resolve_stack_changes()` — the same code path used by wrap/sync.
+/// Stack resolution is delegated to `crate::repo::resolve_stack_base_lib()` and
+/// `crate::repo::resolve_stack_changes_lib()` — the same code path used by wrap/sync.
 /// No duplicate resolution logic.
-pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path) {
+pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, loaded_repo: &LoadedRepo) {
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -44,8 +45,8 @@ pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path) {
     println!("  resolution source: {}", plan_dir.source);
     println!();
 
-    // Stack info — uses the shared stack resolution from stack.rs
-    let base = stack::resolve_stack_base(jj);
+    // Stack info — uses the shared stack resolution from repo.rs
+    let base = crate::repo::resolve_stack_base_lib(loaded_repo);
     match &base {
         Some(StackBase::Ambiguous(_)) | None => {
             println!("  stack base:       (none)");
@@ -55,7 +56,7 @@ pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path) {
             if let Some((base_str, mode_str)) = stack_base.display_pair() {
                 println!("  stack base:       {} ({})", base_str, mode_str);
 
-                let size = stack::resolve_stack_changes(jj, stack_base)
+                let size = crate::repo::resolve_stack_changes_lib(loaded_repo, stack_base)
                     .map(|c| c.len())
                     .unwrap_or(0);
                 println!("  stack size:       {}", size);

@@ -21,7 +21,7 @@ pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    loaded_repo: Option<&mut LoadedRepo>,
+    loaded_repo: &mut LoadedRepo,
 ) -> crate::error::Result<i32> {
     // 1. Parse describe args to find -m/--message values and -r/--revision target
     let parsed = parse_describe_args(args);
@@ -38,7 +38,7 @@ pub fn handle_describe(
     let target = parsed.revision.as_deref().unwrap_or("@");
 
     // 4. Resolve the target change ID
-    let target_change_id = resolve_target_change_id(jj, target);
+    let target_change_id = resolve_target_change_id(&*loaded_repo, target);
 
     // 5. Find the matching plan file and write the message to it
     if let Some(ref change_id) = target_change_id {
@@ -182,31 +182,9 @@ fn parse_describe_args(args: &[String]) -> ParsedDescribeArgs {
 // Change ID resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve a revision specifier to a change ID using jj.
-///
-/// Runs `jj log -r <target> -T change_id.shortest(8) --no-graph` silently
-/// and returns the trimmed output, or None on failure.
-fn resolve_target_change_id(jj: &JjBinary, target: &str) -> Option<String> {
-    let result = jj.run_silent(&[
-        "log",
-        "-r",
-        target,
-        "-T",
-        "change_id.shortest(8)",
-        "--no-graph",
-    ]);
-
-    match result {
-        Ok((status, stdout, _)) if status.success() => {
-            let id = stdout.trim().to_string();
-            if id.is_empty() {
-                None
-            } else {
-                Some(id)
-            }
-        }
-        _ => None,
-    }
+/// Resolve a revision specifier to a change ID using the loaded repo.
+fn resolve_target_change_id(loaded_repo: &LoadedRepo, target: &str) -> Option<String> {
+    crate::repo::resolve_change_id(loaded_repo, target)
 }
 
 // ---------------------------------------------------------------------------

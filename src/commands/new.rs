@@ -16,7 +16,7 @@ use crate::template;
 ///
 /// After creating the change, a placeholder description is set and the
 /// plan directory is synced to reflect the new stack state.
-pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_repo: Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
+pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: &mut LoadedRepo) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -47,20 +47,21 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
     // ------------------------------------------------------------------
     // 2. Flush local plan edits to jj descriptions
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, loaded_repo.as_deref());
+    crate::flush::flush_all(&plan_dir.path, jj, &*loaded_repo);
 
     // ------------------------------------------------------------------
     // 3. Resolve stack if --first or --last
     // ------------------------------------------------------------------
     if plan_first || plan_last {
-        let base = match crate::stack::resolve_stack_base(jj) {
+        loaded_repo.reload();
+        let base = match crate::repo::resolve_stack_base_lib(&*loaded_repo) {
             Some(b) => b,
             None => {
                 eprintln!("jj plan new: could not resolve stack base");
                 return Ok(1);
             }
         };
-        let changes = match crate::stack::resolve_stack_changes(jj, &base) {
+        let changes = match crate::repo::resolve_stack_changes_lib(&*loaded_repo, &base) {
             Some(c) => c,
             None => {
                 eprintln!("jj plan new: could not resolve stack changes");
@@ -82,7 +83,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
                 return Ok(status.code().unwrap_or(1));
             }
 
-            let new_id = match read_current_change_id(jj) {
+            loaded_repo.reload();
+            let new_id = match read_current_change_id(&*loaded_repo) {
                 Some(id) => id,
                 None => {
                     eprintln!("jj plan new: could not read new change ID");
@@ -99,7 +101,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
                 let _ = jj.run_silent(&["bookmark", "set", &bm_name, "-r", "@", "-B"]);
             }
 
-            return finish(jj, plan_dir, &new_id, &mut loaded_repo);
+            return finish(jj, plan_dir, &new_id, loaded_repo);
         } else {
             // -------------------------------------------------------
             // 5. --last: insert after the last change
@@ -114,7 +116,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
                 return Ok(status.code().unwrap_or(1));
             }
 
-            let new_id = match read_current_change_id(jj) {
+            loaded_repo.reload();
+            let new_id = match read_current_change_id(&*loaded_repo) {
                 Some(id) => id,
                 None => {
                     eprintln!("jj plan new: could not read new change ID");
@@ -125,7 +128,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
             let description = template::render_template(&plan_dir.path, &new_id);
             let _ = jj.run_silent(&["describe", "-m", &description]);
 
-            return finish(jj, plan_dir, &new_id, &mut loaded_repo);
+            return finish(jj, plan_dir, &new_id, loaded_repo);
         }
     }
 
@@ -144,7 +147,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
         return Ok(status.code().unwrap_or(1));
     }
 
-    let new_id = match read_current_change_id(jj) {
+    loaded_repo.reload();
+    let new_id = match read_current_change_id(&*loaded_repo) {
         Some(id) => id,
         None => {
             eprintln!("jj plan new: could not read new change ID");
@@ -155,7 +159,7 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
     let description = template::render_template(&plan_dir.path, &new_id);
     let _ = jj.run_silent(&["describe", "-m", &description]);
 
-    finish(jj, plan_dir, &new_id, &mut loaded_repo)
+    finish(jj, plan_dir, &new_id, loaded_repo)
 }
 
 // ---------------------------------------------------------------------------
@@ -163,22 +167,8 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], mut loaded_re
 // ---------------------------------------------------------------------------
 
 /// Read the current working-copy change ID (shortest 8-char prefix).
-fn read_current_change_id(jj: &JjBinary) -> Option<String> {
-    if let Ok((status, stdout, _)) = jj.run_silent(&[
-        "log",
-        "-r",
-        "@",
-        "-T",
-        "change_id.shortest(8)",
-        "--no-graph",
-    ])
-        && status.success() {
-            let id = stdout.trim().to_string();
-            if !id.is_empty() {
-                return Some(id);
-            }
-        }
-    None
+fn read_current_change_id(loaded_repo: &LoadedRepo) -> Option<String> {
+    crate::repo::read_change_id_at_wc(loaded_repo)
 }
 
 /// Find the first bookmark that is exactly `"stack"` or starts with `"stack/"`.
@@ -192,11 +182,9 @@ fn find_stack_bookmark(bookmarks: &[String]) -> Option<String> {
 /// Sync plan files, print the creation message, and show the stack.
 ///
 /// Shared epilogue for all three paths (--first, --last, default).
-fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str, loaded_repo: &mut Option<&mut LoadedRepo>) -> crate::error::Result<i32> {
+fn finish(jj: &JjBinary, plan_dir: &PlanDir, new_id: &str, loaded_repo: &mut LoadedRepo) -> crate::error::Result<i32> {
     eprintln!("Created plan change: jj:{}", new_id);
-    if let Some(repo) = loaded_repo {
-        repo.reload();
-    }
-    crate::wrap::resolve_and_sync(plan_dir, jj, loaded_repo.as_deref());
+    loaded_repo.reload();
+    crate::wrap::resolve_and_sync(plan_dir, jj, &loaded_repo);
     Ok(0)
 }
