@@ -1,0 +1,22 @@
+[package]
+name = "jj-plan"
+description = "Plan-oriented programming for Jujutsu VCS"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+readme = "README.md"
+keywords = ["jj", "jujutsu", "vcs", "planning"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "jj-plan"
+path = "src/main.rs"
+
+[dependencies]
+jj-lib = { version = "0.38", default-features = false, features = ["git"] }
+regex = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
