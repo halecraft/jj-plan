@@ -182,7 +182,7 @@ jj plan new                    # add another plan change (templated)
 jj plan done                   # mark current plan done, strip working memory
 ```
 
-New plans are seeded with a structured template (Background, Approach, Tasks, Scratchpad). The template is customizable via `.jj-plan/template.md` or the `JJ_PLAN_TEMPLATE` environment variable.
+New plans are seeded with a minimal self-referencing summary line. For structured sections (Background, Tasks, etc.), create a `.jj-plan/template.md` or set the `JJ_PLAN_TEMPLATE` environment variable.
 
 ### Plans are reviewed before code exists
 

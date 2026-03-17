@@ -293,27 +293,16 @@ Template resolution chain:
 2. **`.jj-plan/template.md`** → read file if it exists
 3. **Built-in default** (embedded in binary as `DEFAULT_TEMPLATE`)
 
-The built-in default template:
+The built-in default is intentionally minimal — just the self-referencing summary line:
 ```
 (plan: jj:{{CHANGE_ID}})
-
-## Background
-
-
-## Approach
-
-
-## Tasks
-
-- [ ]
-
-## Scratchpad [scratch]
-
 ```
+
+The binary does not impose any plan structure. Developers who want sections (Background, Tasks, Scratchpad, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
 
 `apply_template()` replaces `{{CHANGE_ID}}` with the actual change ID. If a custom template has no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line.
 
-14 unit tests cover template resolution, interpolation, fallback chain, and injection.
+12 unit tests cover template resolution, interpolation, fallback chain, and injection.
 
 ## Describe Interception (`src/commands/describe.rs`)
 

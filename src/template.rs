@@ -3,27 +3,11 @@ use std::path::Path;
 
 /// Built-in default template for new plan changes.
 ///
-/// The first line is the commit summary — `(plan: jj:CHANGE_ID)` is a
-/// recognizable pattern that signals "this is an unedited template" while
-/// embedding the self-reference. The `## Scratchpad [scratch]` section at
-/// the bottom is the default place for working memory, discoverable by
-/// convention.
-const DEFAULT_TEMPLATE: &str = "\
-(plan: jj:{{CHANGE_ID}})
-
-## Background
-
-
-## Approach
-
-
-## Tasks
-
-- [ ]
-
-## Scratchpad [scratch]
-
-";
+/// Intentionally minimal: just the self-referencing summary line. The binary
+/// does not impose any plan structure — developers who want sections
+/// (Background, Tasks, etc.) should create a `.jj-plan/template.md` or set
+/// `JJ_PLAN_TEMPLATE`.
+const DEFAULT_TEMPLATE: &str = "(plan: jj:{{CHANGE_ID}})\n";
 
 /// Resolve the template content using the standard fallback chain:
 ///
@@ -108,14 +92,6 @@ mod tests {
             "Default template should contain {{{{CHANGE_ID}}}} placeholder"
         );
         assert!(
-            result.contains("## Background"),
-            "Default template should have Background section"
-        );
-        assert!(
-            result.contains("## Scratchpad [scratch]"),
-            "Default template should have Scratchpad [scratch] section"
-        );
-        assert!(
             result.starts_with("(plan: jj:{{CHANGE_ID}})"),
             "Default template should start with the plan summary line"
         );
@@ -139,7 +115,6 @@ mod tests {
         let result = resolve_template(tmp.path());
         // Empty file should fall through to built-in default
         assert!(result.contains("{{CHANGE_ID}}"));
-        assert!(result.contains("## Background"));
     }
 
     #[test]
@@ -210,15 +185,6 @@ mod tests {
         assert_eq!(result, "Title line\n<!-- jj:testid -->\n");
     }
 
-    #[test]
-    fn test_apply_default_template() {
-        let result = apply_template(DEFAULT_TEMPLATE, "kpqxywon");
-        assert!(result.starts_with("(plan: jj:kpqxywon)"));
-        assert!(!result.contains("{{CHANGE_ID}}"));
-        assert!(result.contains("## Background"));
-        assert!(result.contains("## Scratchpad [scratch]"));
-    }
-
     // ── render_template integration tests ─────────────────────────────
 
     #[test]
@@ -254,45 +220,5 @@ mod tests {
         let result = render_template(tmp.path(), "myid");
         assert!(result.contains("<!-- jj:myid -->"));
         assert!(result.starts_with("No placeholder here\n"));
-    }
-
-    // ── DEFAULT_TEMPLATE structure tests ──────────────────────────────
-
-    #[test]
-    fn test_default_template_structure() {
-        let lines: Vec<&str> = DEFAULT_TEMPLATE.lines().collect();
-
-        // First line is the plan summary
-        assert_eq!(lines[0], "(plan: jj:{{CHANGE_ID}})");
-
-        // Has all expected sections
-        assert!(
-            DEFAULT_TEMPLATE.contains("## Background"),
-            "Missing Background section"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("## Approach"),
-            "Missing Approach section"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("## Tasks"),
-            "Missing Tasks section"
-        );
-        assert!(
-            DEFAULT_TEMPLATE.contains("## Scratchpad [scratch]"),
-            "Missing Scratchpad [scratch] section"
-        );
-
-        // Has a task checkbox
-        assert!(
-            DEFAULT_TEMPLATE.contains("- [ ]"),
-            "Missing task checkbox placeholder"
-        );
-
-        // Ends with a newline
-        assert!(
-            DEFAULT_TEMPLATE.ends_with('\n'),
-            "Template should end with newline"
-        );
     }
 }

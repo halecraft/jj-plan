@@ -1644,27 +1644,6 @@ plan-status: ✅"
 # Plan templates
 # =============================================================================
 
-@test "jj plan new produces structured template content" {
-  jj describe -m "Existing plan"
-  jj plan new
-  local content
-  content=$(cat .jj-plan/current.md)
-  [[ "$content" == "(plan: jj:"* ]]
-  [[ "$content" == *"## Background"* ]]
-  [[ "$content" == *"## Approach"* ]]
-  [[ "$content" == *"## Tasks"* ]]
-  [[ "$content" == *"## Scratchpad [scratch]"* ]]
-}
-
-@test "jj plan stack produces structured template content" {
-  jj plan stack newstack
-  local content
-  content=$(cat .jj-plan/current.md)
-  [[ "$content" == "(plan: jj:"* ]]
-  [[ "$content" == *"## Background"* ]]
-  [[ "$content" == *"## Scratchpad [scratch]"* ]]
-}
-
 @test "custom template.md overrides default template" {
   printf "Custom: {{CHANGE_ID}}\n\n## My Section\n" > .jj-plan/template.md
   jj plan new
@@ -1672,7 +1651,6 @@ plan-status: ✅"
   content=$(cat .jj-plan/current.md)
   [[ "$content" == *"Custom: "* ]]
   [[ "$content" == *"## My Section"* ]]
-  [[ "$content" != *"## Background"* ]]
 }
 
 @test "JJ_PLAN_TEMPLATE env var overrides template.md" {

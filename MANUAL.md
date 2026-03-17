@@ -493,28 +493,15 @@ Commands not listed above (`new`, `edit`, `rebase`, `squash`, `split`, `move`, `
 
 ## Plan Templates
 
-New plan changes created by `jj plan stack` and `jj plan new` are seeded with a structured template.
+New plan changes created by `jj plan stack` and `jj plan new` are seeded with a template.
 
 ### Built-in default template
 
 ```markdown
 (plan: jj:{{CHANGE_ID}})
-
-## Background
-
-
-## Approach
-
-
-## Tasks
-
-- [ ]
-
-## Scratchpad [scratch]
-
 ```
 
-The first line `(plan: jj:{{CHANGE_ID}})` is the commit summary — a recognizable pattern that signals "this is an unedited template" while embedding a self-reference.
+The built-in default is intentionally minimal — just the self-referencing summary line `(plan: jj:CHANGE_ID)`. This signals "this is an unedited plan" while embedding a stable self-reference. The binary does not impose any plan structure; developers who want sections (Background, Tasks, Scratchpad, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
 
 ### Template resolution chain
 
