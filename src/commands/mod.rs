@@ -12,6 +12,14 @@ use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::repo::LoadedRepo;
 
+/// Returns true if any element in `args` is `"--help"` or `"-h"`.
+///
+/// Used to intercept help requests in subcommand args before they reach
+/// handlers that would interpret them as passthrough flags to jj.
+fn sub_args_request_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
 /// Dispatch `jj plan <subcommand>` to the appropriate handler.
 ///
 /// `args` is the full argument list starting with "plan".
@@ -26,13 +34,23 @@ pub fn dispatch_plan(
     // args[0] is "plan", args[1] is the subcommand (if present)
     let subcommand = args.get(1).map(|s| s.as_str());
 
-    match subcommand {
-        // --help / -h before subcommand dispatch
-        Some("--help" | "-h") => {
-            help::print_help();
-            Ok(0)
-        }
+    // Intercept `--help` / `-h` as the subcommand itself (e.g. `jj plan --help`)
+    if matches!(subcommand, Some("--help" | "-h")) {
+        help::print_help();
+        return Ok(0);
+    }
 
+    // Central help guard: if any sub_args after the subcommand contain
+    // --help / -h, show the top-level plan help and exit with no side effects.
+    // This uniformly covers stack, new, done, go, next, prev, and config
+    // without requiring each handler to check for --help itself.
+    let sub_args = if args.len() > 2 { &args[2..] } else { &[] as &[String] };
+    if sub_args_request_help(sub_args) {
+        help::print_help();
+        return Ok(0);
+    }
+
+    match subcommand {
         Some("config") => {
             config::run_config(jj, plan_dir, repo_root, loaded_repo);
             Ok(0)
@@ -40,15 +58,12 @@ pub fn dispatch_plan(
 
         // plan stack, plan new, plan done — placeholders for jj:swlkutql
         Some("stack") => {
-            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
             stack::run_stack(jj, plan_dir, sub_args, loaded_repo)
         }
         Some("new") => {
-            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
             new::run_new(jj, plan_dir, sub_args, loaded_repo)
         }
         Some("done") => {
-            let sub_args = if args.len() > 2 { &args[2..] } else { &[] };
             done::run_done(jj, plan_dir, sub_args, loaded_repo)
         }
 
@@ -70,5 +85,39 @@ pub fn dispatch_plan(
 
         // Unknown subcommand
         Some(unknown) => Err(JjPlanError::PlanUnknownSubcommand(unknown.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sub_args_request_help_with_long_flag() {
+        assert!(sub_args_request_help(&args(&["--help"])));
+    }
+
+    #[test]
+    fn sub_args_request_help_with_short_flag() {
+        assert!(sub_args_request_help(&args(&["-h"])));
+    }
+
+    #[test]
+    fn sub_args_request_help_mixed_with_other_flags() {
+        assert!(sub_args_request_help(&args(&["--first", "--help"])));
+    }
+
+    #[test]
+    fn sub_args_request_help_no_help_flag() {
+        assert!(!sub_args_request_help(&args(&["--first"])));
+    }
+
+    #[test]
+    fn sub_args_request_help_empty() {
+        assert!(!sub_args_request_help(&args(&[])));
     }
 }

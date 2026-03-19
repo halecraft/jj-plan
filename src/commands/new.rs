@@ -78,23 +78,10 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
             let mut cmd_args: Vec<&str> = vec!["new", "--insert-before", first_id.as_str()];
             cmd_args.extend_from_slice(&jj_args);
 
-            let status = jj.run_inherit(&cmd_args)?;
-            if !status.success() {
-                return Ok(status.code().unwrap_or(1));
-            }
-
-            loaded_repo.reload();
-            let new_id = match read_current_change_id(&*loaded_repo) {
+            let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, loaded_repo)? {
                 Some(id) => id,
-                None => {
-                    eprintln!("jj plan new: could not read new change ID");
-                    return Ok(1);
-                }
+                None => return Ok(1),
             };
-
-            // Set templated description
-            let description = template::render_template(&plan_dir.path, &new_id);
-            let _ = jj.run_silent(&["describe", "-m", &description]);
 
             // Move stack bookmark to the new first change
             if let Some(bm_name) = find_stack_bookmark(&changes[0].bookmarks) {
@@ -111,22 +98,10 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
             let mut cmd_args: Vec<&str> = vec!["new", "--insert-after", last_id.as_str()];
             cmd_args.extend_from_slice(&jj_args);
 
-            let status = jj.run_inherit(&cmd_args)?;
-            if !status.success() {
-                return Ok(status.code().unwrap_or(1));
-            }
-
-            loaded_repo.reload();
-            let new_id = match read_current_change_id(&*loaded_repo) {
+            let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, loaded_repo)? {
                 Some(id) => id,
-                None => {
-                    eprintln!("jj plan new: could not read new change ID");
-                    return Ok(1);
-                }
+                None => return Ok(1),
             };
-
-            let description = template::render_template(&plan_dir.path, &new_id);
-            let _ = jj.run_silent(&["describe", "-m", &description]);
 
             return finish(jj, plan_dir, &new_id, loaded_repo);
         }
@@ -142,22 +117,10 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
     }
     cmd_args.extend_from_slice(&jj_args);
 
-    let status = jj.run_inherit(&cmd_args)?;
-    if !status.success() {
-        return Ok(status.code().unwrap_or(1));
-    }
-
-    loaded_repo.reload();
-    let new_id = match read_current_change_id(&*loaded_repo) {
+    let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, loaded_repo)? {
         Some(id) => id,
-        None => {
-            eprintln!("jj plan new: could not read new change ID");
-            return Ok(1);
-        }
+        None => return Ok(1),
     };
-
-    let description = template::render_template(&plan_dir.path, &new_id);
-    let _ = jj.run_silent(&["describe", "-m", &description]);
 
     finish(jj, plan_dir, &new_id, loaded_repo)
 }
@@ -165,6 +128,56 @@ pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], loaded_repo: 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Create a jj change via `jj new` and set a templated description on it.
+///
+/// This is the shared core for all three `run_new` paths (`--first`, `--last`,
+/// default). It includes a before/after guard: the WC change ID is captured
+/// before and after the `jj new` call. If the ID is unchanged (meaning `jj new`
+/// exited 0 without actually creating a change — e.g. because `--help` was
+/// passed through), the function aborts instead of destructively describing the
+/// existing working copy.
+///
+/// Returns `Ok(Some(new_change_id))` on success, `Ok(None)` if `jj new` failed
+/// or the WC didn't change.
+fn create_change_and_describe(
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
+    cmd_args: &[&str],
+    loaded_repo: &mut LoadedRepo,
+) -> crate::error::Result<Option<String>> {
+    // 1. Capture WC change ID before
+    loaded_repo.reload();
+    let wc_before = read_current_change_id(&*loaded_repo);
+
+    // 2. Run `jj new ...`
+    let status = jj.run_inherit(cmd_args)?;
+    if !status.success() {
+        return Ok(None);
+    }
+
+    // 3. Reload and read WC change ID after
+    loaded_repo.reload();
+    let new_id = match read_current_change_id(&*loaded_repo) {
+        Some(id) => id,
+        None => {
+            eprintln!("jj plan new: could not read new change ID");
+            return Ok(None);
+        }
+    };
+
+    // 4. Before/after guard: bail if WC didn't actually change
+    if wc_before.as_deref() == Some(new_id.as_str()) {
+        eprintln!("jj plan new: jj new exited 0 but working copy did not change — aborting");
+        return Ok(None);
+    }
+
+    // 5. Set templated description
+    let description = template::render_template(&plan_dir.path, &new_id);
+    let _ = jj.run_silent(&["describe", "-m", &description]);
+
+    Ok(Some(new_id))
+}
 
 /// Read the current working-copy change ID (shortest 8-char prefix).
 fn read_current_change_id(loaded_repo: &LoadedRepo) -> Option<String> {

@@ -1190,7 +1190,7 @@ Need JWT and API key support
 @test "jj plan --help prints help" {
   run jj plan --help
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"Subcommands:"* ]]
+  [[ "$output" == *"Commands:"* ]]
   [[ "$output" == *"--first"* ]]
   [[ "$output" == *"--last"* ]]
 }
@@ -1198,7 +1198,59 @@ Need JWT and API key support
 @test "jj plan -h prints help" {
   run jj plan -h
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"Subcommands:"* ]]
+  [[ "$output" == *"Commands:"* ]]
+}
+
+# =============================================================================
+# jj plan <subcommand> --help (no side effects)
+# =============================================================================
+
+@test "jj plan new --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan new --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan stack --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan stack --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan done --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan done --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan go --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan go --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan next --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan next --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan prev --help prints help without side effects" {
+  jj describe -m "Precious content"
+  run jj plan prev --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
 }
 
 # =============================================================================

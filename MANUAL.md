@@ -418,6 +418,10 @@ This help screen is intentionally compact. It is the fast overview, not the exha
 - `--color auto` follows terminal-aware default behavior
 - if no explicit `--color` flag is provided, jj-plan follows the resolved/default jj color mode
 
+**Subcommand help:**
+
+`jj plan new --help`, `jj plan stack --help`, and other subcommand variants also show the top-level plan help screen. Per-subcommand documentation lives here in `MANUAL.md`, not in terminal help.
+
 **Notes:**
 
 - Use `jj plan --help` for the compact terminal summary.

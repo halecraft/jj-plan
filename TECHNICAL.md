@@ -136,6 +136,8 @@ jj [global options] <subcommand> [args...]
 ├─ no subcommand or read-only? ─────────→ exec $REAL_JJ (zero overhead)
 ├─ no repo root or no plan dir? ────────→ exec $REAL_JJ (not activated)
 ├─ "plan" ──────────────────────────────→ subcommand dispatch:
+│   ├─ "--help" / "-h" as subcommand ───→ print_help(), exit 0
+│   ├─ sub_args contain --help/-h? ─────→ print_help(), exit 0 (no side effects)
 │   ├─ "plan stack" ────────────────────→ atomic stack creation (templated description)
 │   ├─ "plan new" ──────────────────────→ templated plan change creation
 │   │     ├─ --first ───────────────────→ insert before first stack member (moves bookmark)
@@ -156,6 +158,8 @@ jj [global options] <subcommand> [args...]
 ```
 
 The `plan --help` path is intentionally handled before repo-root and plan-directory resolution. This makes `jj plan --help` work even outside an activated repo and also fixes invocations where jj-style global options appear before `plan`, such as `jj --color always plan --help`.
+
+Subcommand-level `--help` (e.g. `jj plan new --help`, `jj plan go --help`) is intercepted by a central guard in `dispatch_plan` that scans `&args[2..]` for `--help`/`-h` before any handler is called. This ensures no flush, describe, or sync occurs — the help is pure read-only. The `sub_args_request_help()` helper function handles the check uniformly for all subcommands including those that don't use a `sub_args` slice (like `go`, `next`, `prev`).
 
 Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that `status`/`st` are NOT in that list — they get the flush→sync→show treatment to display the stack. Also note that the new normalization is intentionally narrow in scope: it recognizes the top-level help path cleanly without attempting full generic normalization of all jj global options for every custom subcommand.
 
@@ -358,10 +362,10 @@ Creates a change with a templated description:
 
 1. Parse args: strip `--first` and `--last` (shim flags); detect explicit positioning flags; collect remaining args for `jj new`.
 2. `flush_all()` — flush pending edits.
-3. Create the change (varies by flag).
-4. Read back the new change's ID.
-5. Set templated description via `template::render_template()`.
-6. `sync()` + `show_stack()`.
+3. Create the change and set its description via `create_change_and_describe()`.
+4. `sync()` + `show_stack()`.
+
+The `create_change_and_describe()` helper consolidates the post-`jj new` sequence that was previously duplicated across all three paths. It includes a **before/after WC guard**: the working copy change ID is captured before and after the `jj new` call. If the ID is unchanged (meaning `jj new` exited 0 without actually creating a change), the function aborts instead of destructively describing the existing working copy. This guards against any jj flag that exits 0 without mutation (e.g. `--help` passed through to jj).
 
 ### Default (no flags)
 
@@ -374,6 +378,10 @@ Insert before the first stack member. Moves the `stack`/`stack/*` bookmark to th
 ### `--last`
 
 Insert after the last stack member.
+
+### Known limitation
+
+`run_stack` does not have a before/after WC guard. The central `--help` intercept in `dispatch_plan` covers the help case; other 0-exit-without-mutation flags in `jj new` are not currently known.
 
 ## `jj plan done` (`src/commands/done.rs`)
 
@@ -503,7 +511,7 @@ Two complementary test suites:
 
 ### Bats (behavioral/acceptance)
 
-`bats jj-plan.bats` — 138 tests validating the installed binary from the outside:
+`bats jj-plan.bats` — 142 tests validating the installed binary from the outside:
 - **Template repo**: `setup_file()` pre-creates a jj repo with `stack` bookmark + `.jj-plan/`. Each test gets an isolated copy via `cp -r` (~2ms vs ~100ms for `jj git init`).
 - **Per-test isolation**: `setup()` copies the template and `cd`s into it. `teardown()` removes it. No shared mutable state between tests.
 - **Direct bats style**: Tests run commands inline (no `run_in_repo` wrapper, no `zsh -c` subprocess). Assertions use direct value checks (`[[ "$(cat file)" == "..." ]]`) instead of echo/grep patterns.
@@ -513,10 +521,12 @@ Two complementary test suites:
 
 ### Cargo (unit tests)
 
-`cargo test` — 87 unit tests for pure functions:
+`cargo test` — 108 unit tests for pure functions:
 - `markdown`: 20 tests (scratch stripping, code fence immunity, edge cases)
 - `template`: 14 tests (resolve chain, interpolation, default structure)
 - `commands/describe`: 17 tests (arg parsing for -m/-r variants)
+- `commands/help`: 18 tests (invocation classification, color resolution, rendering)
+- `commands/mod`: 5 tests (`sub_args_request_help` detection)
 - `sync`: 11 tests (plan_sync pure logic)
 - `flush`: 4 tests (plan_flush pure logic)
 - `plan_file`: 13 tests (filename parsing, I/O helpers)
