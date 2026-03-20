@@ -22,31 +22,42 @@
 //! - **Full hex change IDs in `LogEntry`.** Short reverse-hex prefixes for CLI
 //!   use are computed on demand via `short_change_id()`.
 //!
-//! ## Git write operations (deferred)
+//! ## Git write operations
 //!
 //! `git_fetch`, `git_push`, `delete_bookmark`, `rebase_bookmark_onto_trunk`,
-//! `git_remotes`, and `default_branch` are deferred to jj:zypnnqyt where they
-//! can be tested end-to-end with their first callers.
+//! `git_remotes`, and `default_branch` are implemented via jj-lib's in-process
+//! API (arrived in jj:zypnnqyt).
 
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
+use jj_lib::git::{
+    self, GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitRefUpdate,
+    GitSettings, GitSidebandLineTerminator, GitSubprocessCallback, expand_fetch_refspecs,
+    export_refs,
+};
 use jj_lib::hex_util::encode_reverse_hex;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store;
+use jj_lib::op_store::{RefTarget, RemoteRef, RemoteRefState};
+use jj_lib::ref_name::{RefName, RemoteName, RemoteNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo as _, StoreFactories};
 use jj_lib::revset::{
     self, RevsetAliasesMap, RevsetDiagnostics, RevsetExtensions, RevsetIteratorExt as _,
     RevsetParseContext, RevsetWorkspaceContext, SymbolResolver, SymbolResolverExtension,
 };
+use jj_lib::rewrite::{MoveCommitsLocation, MoveCommitsTarget, RebaseOptions, move_commits};
 use jj_lib::settings::UserSettings;
+use jj_lib::str_util::{StringExpression, StringMatcher};
 use jj_lib::time_util::DatePatternContext;
 use jj_lib::workspace::default_working_copy_factories;
 
-use crate::types::{Bookmark, LogEntry};
+use crate::error::JjPlanError;
+use crate::types::{Bookmark, GitRemote, LogEntry};
 
 /// A loaded jj repository ready for in-process reads.
 ///
@@ -57,6 +68,38 @@ use crate::types::{Bookmark, LogEntry};
 pub struct Workspace {
     workspace: jj_lib::workspace::Workspace,
     repo: Arc<ReadonlyRepo>,
+}
+
+/// No-op callback for git subprocess operations.
+///
+/// Used by git_fetch and git_push. Can be upgraded later to wire into
+/// indicatif progress reporting.
+struct NoopGitCallback;
+
+impl GitSubprocessCallback for NoopGitCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+
+    fn progress(&mut self, _progress: &GitProgress) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn local_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn remote_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Workspace {
@@ -368,11 +411,327 @@ impl Workspace {
     pub fn jj_workspace(&self) -> &jj_lib::workspace::Workspace {
         &self.workspace
     }
+
+    // -----------------------------------------------------------------------
+    // Git write operations (deferred from jj:pozrnomw, arriving in jj:zypnnqyt)
+    // -----------------------------------------------------------------------
+
+    /// Get all git remotes with their URLs.
+    pub fn git_remotes(&self) -> std::result::Result<Vec<GitRemote>, JjPlanError> {
+        let remote_names = git::get_all_remote_names(self.repo.store())
+            .map_err(|_| JjPlanError::Git("Not a git-backed repo".to_string()))?;
+
+        let git_repo = git::get_git_repo(self.repo.store())
+            .map_err(|_| JjPlanError::Git("Not a git-backed repo".to_string()))?;
+
+        let mut remotes = Vec::new();
+        for name in remote_names {
+            let url = git_repo
+                .try_find_remote(name.as_str())
+                .and_then(std::result::Result::ok)
+                .and_then(|remote| {
+                    remote
+                        .url(gix::remote::Direction::Push)
+                        .map(|u| u.to_bstring().to_string())
+                })
+                .unwrap_or_default();
+
+            remotes.push(GitRemote {
+                name: name.as_str().to_string(),
+                url,
+            });
+        }
+
+        Ok(remotes)
+    }
+
+    /// Get the default branch name by checking remote HEAD first, then common names.
+    pub fn default_branch(&self) -> String {
+        // Try to detect from git remote HEAD
+        if let Ok(git_repo) = git::get_git_repo(self.repo.store()) {
+            if let Some((branch, _)) = detect_default_branch_from_remote(&git_repo) {
+                return branch;
+            }
+        }
+
+        // Fall back to checking local bookmarks for common names
+        let view = self.repo.view();
+        for name in &["main", "master", "trunk"] {
+            let target = view.get_local_bookmark(RefName::new(name));
+            if target.is_present() {
+                return (*name).to_string();
+            }
+        }
+
+        // Final fallback
+        "main".to_string()
+    }
+
+    /// Fetch from a git remote.
+    pub fn git_fetch(&mut self, remote: &str) -> std::result::Result<(), JjPlanError> {
+        // Reload to get fresh state before write
+        self.reload();
+
+        let settings = build_minimal_settings()?;
+        let git_settings = GitSettings::from_settings(&settings)
+            .map_err(|e| JjPlanError::Config(format!("Invalid git settings: {e}")))?;
+
+        let mut tx = self.repo.start_transaction();
+
+        let import_options = GitImportOptions {
+            auto_local_bookmark: git_settings.auto_local_bookmark,
+            abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+            remote_auto_track_bookmarks: std::iter::once((
+                RemoteNameBuf::from(remote),
+                StringMatcher::all(),
+            ))
+            .collect(),
+        };
+
+        let mut fetch = GitFetch::new(
+            tx.repo_mut(),
+            git_settings.to_subprocess_options(),
+            &import_options,
+        )
+        .map_err(|e| JjPlanError::Git(format!("Failed to create fetch: {e}")))?;
+
+        let remote_name = RemoteName::new(remote);
+        let refspecs = expand_fetch_refspecs(
+            remote_name,
+            GitFetchRefExpression {
+                bookmark: StringExpression::all(),
+                tag: StringExpression::none(),
+            },
+        )
+        .map_err(|e| JjPlanError::Git(format!("Failed to expand refspecs: {e}")))?;
+
+        let mut callback = NoopGitCallback;
+        fetch
+            .fetch(remote_name, refspecs, &mut callback, None, None)
+            .map_err(|e| JjPlanError::Git(format!("Failed to fetch: {e}")))?;
+
+        fetch
+            .import_refs()
+            .map_err(|e| JjPlanError::Git(format!("Failed to import refs: {e}")))?;
+
+        // Rebase descendants if there were any rewrites from the import
+        if tx.repo().has_rewrites() {
+            tx.repo_mut()
+                .rebase_descendants()
+                .map_err(|e| JjPlanError::Git(format!("Failed to rebase descendants: {e}")))?;
+        }
+
+        let new_repo = tx
+            .commit(format!("fetch from {remote}"))
+            .map_err(|e| JjPlanError::Git(format!("Failed to commit fetch: {e}")))?;
+        self.repo = new_repo;
+
+        Ok(())
+    }
+
+    /// Push a bookmark to a remote.
+    pub fn git_push(
+        &mut self,
+        bookmark: &str,
+        remote: &str,
+    ) -> std::result::Result<(), JjPlanError> {
+        // Reload to get fresh state before write
+        self.reload();
+
+        let settings = build_minimal_settings()?;
+        let git_settings = GitSettings::from_settings(&settings)
+            .map_err(|e| JjPlanError::Config(format!("Invalid git settings: {e}")))?;
+
+        let view = self.repo.view();
+        let ref_name = RefName::new(bookmark);
+        let target = view.get_local_bookmark(ref_name);
+
+        if !target.is_present() {
+            return Err(JjPlanError::BookmarkNotFound(bookmark.to_string()));
+        }
+
+        let new_target = target.as_normal().cloned();
+
+        let remote_name = RemoteName::new(remote);
+        let remote_symbol = ref_name.to_remote_symbol(remote_name);
+        let remote_ref = view.get_remote_bookmark(remote_symbol);
+        let expected_current_target = remote_ref.target.as_normal().cloned();
+
+        let mut tx = self.repo.start_transaction();
+
+        // Export refs to underlying git repo before pushing
+        let export_stats = export_refs(tx.repo_mut())
+            .map_err(|e| JjPlanError::Git(format!("Failed to export refs: {e}")))?;
+
+        if export_stats
+            .failed_bookmarks
+            .iter()
+            .any(|(symbol, _)| symbol.name.as_str() == bookmark)
+        {
+            return Err(JjPlanError::Git(format!(
+                "Failed to export bookmark '{bookmark}' to git"
+            )));
+        }
+
+        let update = GitRefUpdate {
+            qualified_name: format!("refs/heads/{bookmark}").into(),
+            expected_current_target,
+            new_target,
+        };
+
+        let mut callback = NoopGitCallback;
+        git::push_updates(
+            tx.repo().base_repo().as_ref(),
+            git_settings.to_subprocess_options(),
+            remote_name,
+            &[update],
+            &mut callback,
+        )
+        .map_err(|e| JjPlanError::Git(format!("Failed to push: {e}")))?;
+
+        // Update the remote tracking ref
+        let new_remote_ref = RemoteRef {
+            target: target.clone(),
+            state: RemoteRefState::Tracked,
+        };
+        tx.repo_mut()
+            .set_remote_bookmark(remote_symbol, new_remote_ref);
+
+        let new_repo = tx
+            .commit(format!("push {bookmark} to {remote}"))
+            .map_err(|e| JjPlanError::Git(format!("Failed to commit push: {e}")))?;
+        self.repo = new_repo;
+
+        Ok(())
+    }
+
+    /// Rebase a bookmark and its descendants onto trunk.
+    pub fn rebase_bookmark_onto_trunk(
+        &mut self,
+        bookmark: &str,
+    ) -> std::result::Result<(), JjPlanError> {
+        // Reload to get fresh state before write
+        self.reload();
+
+        // Resolve trunk
+        let trunk_commits = self.evaluate_revset("trunk()");
+        let trunk_commit = trunk_commits
+            .as_ref()
+            .and_then(|v| v.first())
+            .ok_or_else(|| {
+                JjPlanError::RebaseFailed("trunk() resolved to empty set".to_string())
+            })?;
+        let trunk_commit_id = trunk_commit.id().clone();
+
+        // Resolve the bookmark
+        let bookmark_commits = self.evaluate_revset(bookmark);
+        let bookmark_commit = bookmark_commits
+            .as_ref()
+            .and_then(|v| v.first())
+            .ok_or_else(|| {
+                JjPlanError::RebaseFailed(format!(
+                    "bookmark '{bookmark}' resolved to empty set"
+                ))
+            })?;
+        let bookmark_commit_id = bookmark_commit.id().clone();
+
+        let mut tx = self.repo.start_transaction();
+
+        let location = MoveCommitsLocation {
+            new_parent_ids: vec![trunk_commit_id],
+            new_child_ids: vec![],
+            target: MoveCommitsTarget::Roots(vec![bookmark_commit_id]),
+        };
+
+        let options = RebaseOptions::default();
+
+        move_commits(tx.repo_mut(), &location, &options)
+            .map_err(|e| JjPlanError::RebaseFailed(format!("Failed to rebase: {e}")))?;
+
+        let new_repo = tx
+            .commit(format!("rebase {bookmark} onto trunk"))
+            .map_err(|e| JjPlanError::RebaseFailed(format!("Failed to commit rebase: {e}")))?;
+        self.repo = new_repo;
+
+        Ok(())
+    }
+
+    /// Delete a local bookmark.
+    pub fn delete_bookmark(&mut self, bookmark: &str) -> std::result::Result<(), JjPlanError> {
+        // Reload to get fresh state before write
+        self.reload();
+
+        let mut tx = self.repo.start_transaction();
+
+        let ref_name = RefName::new(bookmark);
+        tx.repo_mut()
+            .set_local_bookmark_target(ref_name, RefTarget::absent());
+
+        let new_repo = tx
+            .commit(format!("delete bookmark {bookmark}"))
+            .map_err(|e| JjPlanError::Git(format!("Failed to commit bookmark deletion: {e}")))?;
+        self.repo = new_repo;
+
+        Ok(())
+    }
 }
 
 // ===========================================================================
 // Private helpers
 // ===========================================================================
+
+/// Detect default branch from git remote HEAD (e.g., refs/remotes/origin/HEAD).
+///
+/// Returns `(branch_name, remote_name)` if found.
+fn detect_default_branch_from_remote(
+    git_repo: &gix::Repository,
+) -> Option<(String, &'static str)> {
+    const REMOTE_PREFERENCE: &[&str] = &["origin", "upstream"];
+
+    for &remote in REMOTE_PREFERENCE {
+        let ref_name = format!("refs/remotes/{remote}/HEAD");
+        if let Some(reference) = git_repo.try_find_reference(&ref_name).ok().flatten()
+            && let Some(target_name) = reference.target().try_name()
+        {
+            let target_str = target_name.to_string();
+            let prefix = format!("refs/remotes/{remote}/");
+            if let Some(branch) = target_str.strip_prefix(&prefix) {
+                return Some((branch.to_string(), remote));
+            }
+        }
+    }
+    None
+}
+
+/// Select a remote from a list of available remotes.
+///
+/// - If `specified` is provided and exists, use it
+/// - If only one remote exists, use it
+/// - If multiple remotes exist, prefer "origin", else use first
+pub fn select_remote(
+    remotes: &[GitRemote],
+    specified: Option<&str>,
+) -> std::result::Result<String, JjPlanError> {
+    if remotes.is_empty() {
+        return Err(JjPlanError::NoSupportedRemotes);
+    }
+
+    if let Some(name) = specified {
+        if !remotes.iter().any(|r| r.name == name) {
+            return Err(JjPlanError::RemoteNotFound(name.to_string()));
+        }
+        return Ok(name.to_string());
+    }
+
+    if remotes.len() == 1 {
+        return Ok(remotes[0].name.clone());
+    }
+
+    Ok(remotes
+        .iter()
+        .find(|r| r.name == "origin")
+        .map_or_else(|| remotes[0].name.clone(), |r| r.name.clone()))
+}
 
 /// Error type for op-head resolution that satisfies jj-lib's trait bounds.
 #[derive(Debug)]
@@ -403,6 +762,19 @@ impl From<jj_lib::op_store::OpStoreError> for OpResolveError {
 // ---------------------------------------------------------------------------
 // Config loading
 // ---------------------------------------------------------------------------
+
+/// Build a minimal `UserSettings` for write operations.
+///
+/// Uses the same config as `build_minimal_config()` but returns Result
+/// instead of Option for better error reporting.
+fn build_minimal_settings() -> std::result::Result<UserSettings, JjPlanError> {
+    // We need a UserSettings for GitSettings::from_settings.
+    // Build a minimal config — the actual user config is not critical for
+    // git_fetch/git_push since they only need git.auto-local-bookmark etc.
+    let config = StackedConfig::with_defaults();
+    UserSettings::from_config(config)
+        .map_err(|e| JjPlanError::Config(format!("Failed to build settings: {e}")))
+}
 
 /// Build a minimal StackedConfig for workspace loading.
 ///

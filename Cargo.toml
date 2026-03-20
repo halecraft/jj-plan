@@ -14,13 +14,42 @@ name = "jj-plan"
 path = "src/main.rs"
 
 [dependencies]
+# Core / VCS
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 jj-lib = { version = "0.38", default-features = false, features = ["git"] }
 pollster = "0.4"
+
+# Git remote HEAD detection (for default_branch)
+gix = { version = "0.78", default-features = false, features = ["blocking-network-client"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
-thiserror = "2"
+serde_json = "1"
 toml = "0.8"
 toml_edit = "0.24"
+
+# Async runtime (only used by jj stack commands)
+tokio = { version = "1", features = ["rt", "macros", "process"] }
+
+# HTTP + APIs
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+octocrab = { version = "0.47", default-features = false, features = ["rustls", "default-client"] }
+
+# Utilities
+async-trait = "0.1"
+base64 = "0.22"
+regex = "1"
+thiserror = "2"
+url = "2"
+urlencoding = "2"
+
+# CLI interaction
+dialoguer = "0.11"
+indicatif = "0.17"
+
+# Styling
+anstream = "0.6"
+owo-colors = { version = "4", features = ["supports-colors"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,8 +8,8 @@
 //! - `LogEntry.change_id` stores **full standard hex** (64 chars, 0-9 a-f),
 //!   stable across repo mutations. Short reverse-hex prefixes for CLI use
 //!   are computed on demand via `Workspace::short_change_id()`.
-//! - No `Serialize`/`Deserialize` — these are in-memory types. Serde derives
-//!   arrive in jj:zypnnqyt when PR cache serialization is needed.
+//! - `LogEntry` and `Bookmark` now have `Serialize`/`Deserialize` derives
+//!   (enabled in jj:zypnnqyt for PR cache and API response handling).
 //! - `BookmarkSegment.changes` uses newest-first ordering (tip toward trunk
 //!   within each segment), matching ryu's convention. `Stack.segments` is
 //!   ordered trunk (index 0) to tip (last index).
@@ -25,7 +25,7 @@ use serde::{Serialize, Deserialize};
 ///
 /// Represents a local bookmark with optional remote tracking status.
 /// `commit_id` and `change_id` store full standard hex (64 chars).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Bookmark {
     /// Bookmark name.
     pub name: String,
@@ -46,7 +46,7 @@ pub struct Bookmark {
 ///
 /// `change_id` stores full standard hex (64 chars). Use
 /// `Workspace::short_change_id()` for CLI-facing short reverse-hex.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
     /// Git commit ID (full hex).
     pub commit_id: String,
@@ -166,6 +166,18 @@ pub struct UnbookmarkedChange {
     pub description_first_line: String,
 }
 
+/// A chain of segments from trunk to a target bookmark, for submission.
+///
+/// Built by `collect_submission_chain()`. Includes gap information
+/// for the `--allow-gaps` check at submit time.
+#[derive(Debug)]
+pub struct SubmissionChain {
+    /// Segments from trunk (index 0) to target (last index).
+    pub segments: Vec<BookmarkSegment>,
+    /// Gaps in the chain (unbookmarked changes between segments).
+    pub gaps: Vec<Gap>,
+}
+
 // ---------------------------------------------------------------------------
 // Plan registry types (persistent, serde-enabled)
 // ---------------------------------------------------------------------------
@@ -268,6 +280,159 @@ impl PlanRegistry {
 pub struct NarrowedBookmarkSegment {
     pub bookmark: Bookmark,
     pub changes: Vec<LogEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// PR and platform types (deferred from jj:pozrnomw, ported from jj-ryu)
+// ---------------------------------------------------------------------------
+
+/// A git remote with name and URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitRemote {
+    pub name: String,
+    pub url: String,
+}
+
+/// Supported hosting platforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Platform {
+    GitHub,
+    GitLab,
+}
+
+impl std::fmt::Display for Platform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GitHub => write!(f, "GitHub"),
+            Self::GitLab => write!(f, "GitLab"),
+        }
+    }
+}
+
+/// Configuration for a hosting platform repository.
+#[derive(Debug, Clone)]
+pub struct PlatformConfig {
+    pub platform: Platform,
+    pub owner: String,
+    pub repo: String,
+    pub host: Option<String>,
+}
+
+/// A pull request / merge request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequest {
+    pub number: u64,
+    pub html_url: String,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub title: String,
+    pub node_id: Option<String>,
+    pub is_draft: bool,
+}
+
+/// A comment on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrComment {
+    pub id: u64,
+    pub body: String,
+}
+
+/// State of a pull request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl std::fmt::Display for PrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open => write!(f, "open"),
+            Self::Closed => write!(f, "closed"),
+            Self::Merged => write!(f, "merged"),
+        }
+    }
+}
+
+/// Extended PR details for merge operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestDetails {
+    pub number: u64,
+    pub title: String,
+    pub body: Option<String>,
+    pub state: PrState,
+    pub is_draft: bool,
+    pub mergeable: Option<bool>,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub html_url: String,
+}
+
+/// Merge readiness assessment.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct MergeReadiness {
+    pub is_approved: bool,
+    pub ci_passed: bool,
+    pub is_mergeable: Option<bool>,
+    pub is_draft: bool,
+    pub blocking_reasons: Vec<String>,
+    pub uncertainties: Vec<String>,
+}
+
+impl MergeReadiness {
+    pub const fn is_blocked(&self) -> bool {
+        !self.is_approved
+            || !self.ci_passed
+            || self.is_draft
+            || matches!(self.is_mergeable, Some(false))
+    }
+
+    pub fn uncertainty(&self) -> Option<&str> {
+        self.uncertainties.first().map(String::as_str)
+    }
+}
+
+/// Result of a merge operation.
+#[derive(Debug, Clone)]
+pub struct MergeResult {
+    pub merged: bool,
+    pub sha: Option<String>,
+    pub message: Option<String>,
+}
+
+/// Method for merging a PR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl std::fmt::Display for MergeMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Squash => write!(f, "squash"),
+            Self::Merge => write!(f, "merge"),
+            Self::Rebase => write!(f, "rebase"),
+        }
+    }
+}
+
+/// A cached PR association for persistence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedPr {
+    /// Bookmark name this PR is associated with.
+    pub bookmark: String,
+    /// PR/MR number.
+    pub number: u64,
+    /// Web URL for the PR.
+    pub url: String,
+    /// Remote this PR was pushed to.
+    pub remote: String,
+    /// When this cache entry was last updated.
+    pub updated_at: DateTime<Utc>,
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,8 @@
 //!
 //! Context: jj:pozrnomw, jj:ntksslnn
 
-use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, NarrowedBookmarkSegment, PlanRegistry, Stack, StackResult, UnbookmarkedChange};
+use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, NarrowedBookmarkSegment, PlanRegistry, Stack, StackResult, SubmissionChain, UnbookmarkedChange};
+use std::result::Result as StdResult;
 use crate::workspace::Workspace;
 
 /// The revset expression for the full stack range.
@@ -284,6 +285,44 @@ pub fn narrow_segments(stack: &Stack, registry: &PlanRegistry) -> Vec<NarrowedBo
             })
         })
         .collect()
+}
+
+/// Collect the submission chain from trunk to a target bookmark.
+///
+/// Walks the stack from trunk to the segment containing `target_bookmark`,
+/// collecting all segments and gaps along the way. This is the input to
+/// the submit engine's analysis phase.
+///
+/// Returns an error string if the target bookmark is not found.
+pub fn collect_submission_chain(
+    stack: &Stack,
+    target_bookmark: &str,
+) -> StdResult<SubmissionChain, String> {
+    // Find the target segment index
+    let target_index = stack
+        .segments
+        .iter()
+        .position(|seg| seg.bookmarks.iter().any(|b| b.name == target_bookmark))
+        .ok_or_else(|| format!("bookmark '{target_bookmark}' not found in stack"))?;
+
+    // Collect segments from trunk (0) to target (inclusive)
+    let segments: Vec<BookmarkSegment> = stack.segments[0..=target_index].to_vec();
+
+    // Collect gaps that fall within the chain
+    // A gap is relevant if its before_bookmark is one of the collected segments' bookmarks
+    let segment_bookmark_names: Vec<&str> = segments
+        .iter()
+        .flat_map(|seg| seg.bookmarks.iter().map(|b| b.name.as_str()))
+        .collect();
+
+    let gaps: Vec<Gap> = stack
+        .gaps
+        .iter()
+        .filter(|gap| segment_bookmark_names.contains(&gap.before_bookmark.as_str()))
+        .cloned()
+        .collect();
+
+    Ok(SubmissionChain { segments, gaps })
 }
 
 // ===========================================================================
@@ -924,5 +963,118 @@ mod tests {
             }
             other => panic!("Expected Ok, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_submission_chain tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_collect_chain_clean() {
+        // Build a stack with 3 segments, no gaps
+        let stack = Stack {
+            segments: vec![
+                BookmarkSegment {
+                    bookmarks: vec![Bookmark {
+                        name: "feat-a".to_string(),
+                        commit_id: "aa".to_string(),
+                        change_id: "a1".to_string(),
+                        has_remote: false,
+                        is_synced: false,
+                    }],
+                    changes: vec![],
+                },
+                BookmarkSegment {
+                    bookmarks: vec![Bookmark {
+                        name: "feat-b".to_string(),
+                        commit_id: "bb".to_string(),
+                        change_id: "b1".to_string(),
+                        has_remote: false,
+                        is_synced: false,
+                    }],
+                    changes: vec![],
+                },
+                BookmarkSegment {
+                    bookmarks: vec![Bookmark {
+                        name: "feat-c".to_string(),
+                        commit_id: "cc".to_string(),
+                        change_id: "c1".to_string(),
+                        has_remote: false,
+                        is_synced: false,
+                    }],
+                    changes: vec![],
+                },
+            ],
+            gaps: vec![],
+        };
+
+        // Chain up to feat-b should include feat-a and feat-b
+        let chain = collect_submission_chain(&stack, "feat-b").unwrap();
+        assert_eq!(chain.segments.len(), 2);
+        assert_eq!(chain.segments[0].bookmarks[0].name, "feat-a");
+        assert_eq!(chain.segments[1].bookmarks[0].name, "feat-b");
+        assert!(chain.gaps.is_empty());
+    }
+
+    #[test]
+    fn test_collect_chain_with_gap() {
+        let stack = Stack {
+            segments: vec![
+                BookmarkSegment {
+                    bookmarks: vec![Bookmark {
+                        name: "feat-a".to_string(),
+                        commit_id: "aa".to_string(),
+                        change_id: "a1".to_string(),
+                        has_remote: false,
+                        is_synced: false,
+                    }],
+                    changes: vec![],
+                },
+                BookmarkSegment {
+                    bookmarks: vec![Bookmark {
+                        name: "feat-b".to_string(),
+                        commit_id: "bb".to_string(),
+                        change_id: "b1".to_string(),
+                        has_remote: false,
+                        is_synced: false,
+                    }],
+                    changes: vec![],
+                },
+            ],
+            gaps: vec![Gap {
+                unbookmarked: vec![UnbookmarkedChange {
+                    short_id: "xxxx".to_string(),
+                    description_first_line: "wip commit".to_string(),
+                }],
+                before_bookmark: "feat-b".to_string(),
+                after_bookmark: Some("feat-a".to_string()),
+            }],
+        };
+
+        let chain = collect_submission_chain(&stack, "feat-b").unwrap();
+        assert_eq!(chain.segments.len(), 2);
+        assert_eq!(chain.gaps.len(), 1);
+        assert_eq!(chain.gaps[0].before_bookmark, "feat-b");
+    }
+
+    #[test]
+    fn test_collect_chain_not_found() {
+        let stack = Stack {
+            segments: vec![BookmarkSegment {
+                bookmarks: vec![Bookmark {
+                    name: "feat-a".to_string(),
+                    commit_id: "aa".to_string(),
+                    change_id: "a1".to_string(),
+                    has_remote: false,
+                    is_synced: false,
+                }],
+                changes: vec![],
+            }],
+            gaps: vec![],
+        };
+
+        let result = collect_submission_chain(&stack, "nonexistent");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 }
