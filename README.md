@@ -35,15 +35,14 @@ echo '.jj-plan' >> ~/.config/git/ignore
 # Activate in any jj repo
 mkdir .jj-plan
 
-# Start a named stack — creates a change + bookmark
-jj plan stack my-feature
+# Start a named stack — creates a change + bookmark + registers in PlanRegistry
+jj plan new my-feature
 
 # Write the plan (your editor, an AI agent, or both)
 $EDITOR .jj-plan/current.md
 
 # Add more plans to the stack
-jj plan new                    # insert after current
-jj plan new --last             # append to end
+jj plan new my-feature         # insert after current
 
 # Implement — every jj command syncs the plan files automatically
 # Edit code... jj status shows your plan stack on every invocation
@@ -176,9 +175,9 @@ Plans aren't metadata *about* changes. Plans *are* changes.
 Each change in a stack is one unit of work: the description *is* the plan, the diff *is* the implementation.
 
 ```sh
-jj plan stack my-feature       # start a named stack (creates change + bookmark)
+jj plan new my-feature         # start a named stack (creates change + bookmark + registers in PlanRegistry)
 # Edit .jj-plan/current.md — write the plan
-jj plan new                    # add another plan change (templated)
+jj plan new my-feature         # add another plan change (templated)
 jj plan done                   # mark current plan done, strip working memory
 ```
 
@@ -206,7 +205,7 @@ The plan change is the review surface. Collaborators read the description and re
 When a plan grows beyond one PR, create new plan changes referencing the original:
 
 ```sh
-jj plan stack phase2
+jj plan new phase2
 # Edit .jj-plan/current.md — "Phase 2 — continues jj:kpqxywon"
 ```
 
@@ -248,29 +247,30 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Plans have working memory | `[scratch]` sections for drafts; `jj plan done` strips them |
 | `jj describe` works naturally | `-m` mode intercepted and routed through plan files |
 | Stack is always visible | `jj status` appends the plan stack summary |
-| Stack is navigable | `jj plan next`/`prev`/`go` for index-based movement |
-| Multiple concurrent stacks | `stack/*` bookmarks with nearest-ancestor resolution |
+| Stack is navigable | `jj plan next`/`prev`/`go` for index, change ID, or bookmark-based movement |
+| Multiple concurrent stacks | PlanRegistry tracks bookmarks with nearest-ancestor resolution |
 | Stack bookmark is intuitive | Bookmark is ON the first change, not before it (inclusive) |
-| New plans are structured | Configurable templates with `{{CHANGE_ID}}` interpolation |
+| New plans are structured | Configurable templates with `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation |
 
-## Stack Bookmarks
+## Plan Bookmarks and the PlanRegistry
 
-The binary uses `stack` / `stack/*` bookmarks to identify which changes belong to the current plan stack. The bookmark is placed **on the first change in the stack** — the bookmarked change is included as a stack member.
+The binary uses the **PlanRegistry** (`.jj/repo/jj-plan/plans.toml`) to track which bookmarks identify plan stacks. The bookmark is placed **on the first change in the stack** — the bookmarked change is included as a stack member.
 
-- **`stack`** (bare) — a quick unnamed stack. Use when you have one stack at a time.
-- **`stack/my-feature`** (named) — a named stack for concurrent work. `jj bookmark list stack/*` shows all active stacks.
+- `jj plan new <bookmark>` creates a bookmark and automatically registers it in the PlanRegistry.
+- `jj plan track <bookmark>` registers an existing bookmark in the PlanRegistry.
+- `jj plan untrack <bookmark>` removes a bookmark from the PlanRegistry (the bookmark itself remains).
 
 When you finish a stack, just start a new one:
 
 ```sh
-jj plan stack next-task
+jj plan new next-task
 ```
 
-The old bookmark stays — the binary automatically picks the nearer bookmark as the active stack base. No cleanup needed.
+The old bookmark stays — the binary automatically picks the nearer registered bookmark as the active stack base. No cleanup needed. Use `jj plan untrack old-task` to clean up if desired.
 
-If no `stack` bookmark is an ancestor of `@`, the binary falls back to `trunk()` with an exclusive range (the trunk commit is not part of your stack).
+If no registered bookmark is an ancestor of `@`, the binary falls back to `trunk()` with an exclusive range (the trunk commit is not part of your stack).
 
-For details on the resolution algorithm (nearest-ancestor selection, ambiguous bookmark handling, trunk fallback), see [TECHNICAL.md](TECHNICAL.md#stack-bookmarks).
+For details on the resolution algorithm (nearest-ancestor selection, ambiguous bookmark handling, trunk fallback, registry filtering), see [TECHNICAL.md](TECHNICAL.md#planregistry).
 
 ## Development
 

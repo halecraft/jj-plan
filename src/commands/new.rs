@@ -1,209 +1,185 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::workspace::Workspace;
+use crate::plan_registry;
 use crate::template;
+use crate::types::PlannedBookmark;
+use crate::workspace::Workspace;
 
-/// Run `jj plan new` — create a new plan change in the stack.
+/// Run `jj plan new <bookmark-name>` — create a new plan change with a bookmark.
 ///
-/// Supports positional flags:
-/// - `--first`: insert before the first change in the stack
-/// - `--last`: insert after the last change in the stack
-/// - (default): insert after the current working copy (`@`)
+/// This is the primary entry point for creating plans. It:
+/// 1. Validates the bookmark name is provided and doesn't already exist
+/// 2. Flushes pending plan edits
+/// 3. Creates a new jj change (`jj new`)
+/// 4. Creates a bookmark on the new change
+/// 5. Registers the bookmark in the PlanRegistry
+/// 6. Sets a templated description with {{CHANGE_ID}} and {{BOOKMARK}}
+/// 7. Syncs plan directory and prints summary
 ///
-/// Any other arguments are forwarded to `jj new`. If `-r`, `-A`,
-/// `--insert-after`, `-B`, or `--insert-before` are present, the default
-/// `--insert-after @` is suppressed so the user's explicit position wins.
+/// ## Args
 ///
-/// After creating the change, a placeholder description is set and the
-/// plan directory is synced to reflect the new stack state.
-pub fn run_new(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &mut Workspace) -> crate::error::Result<i32> {
+/// `args` contains everything after `plan new`, e.g. for
+/// `jj plan new feat-auth -r main`, args is `["feat-auth", "-r", "main"]`.
+pub fn run_new(
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
+    args: &[String],
+    workspace: &mut Workspace,
+) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
-    // 1. Parse args
+    // 1. Parse args: bookmark name (required positional) + jj new flags
     // ------------------------------------------------------------------
-    let mut plan_first = false;
-    let mut plan_last = false;
+    let mut bookmark_name: Option<String> = None;
     let mut has_explicit_position = false;
-    let mut jj_args: Vec<&str> = Vec::new();
+    let mut jj_passthrough: Vec<String> = Vec::new();
+    let mut i = 0;
 
-    for arg in args {
+    while i < args.len() {
+        let arg = &args[i];
         match arg.as_str() {
-            "--first" => plan_first = true,
-            "--last" => plan_last = true,
             "-r" | "-A" | "--insert-after" | "-B" | "--insert-before" => {
                 has_explicit_position = true;
-                jj_args.push(arg.as_str());
+                jj_passthrough.push(arg.clone());
+                // These flags take a value argument
+                if i + 1 < args.len() {
+                    i += 1;
+                    jj_passthrough.push(args[i].clone());
+                }
             }
             _ => {
-                jj_args.push(arg.as_str());
+                if bookmark_name.is_none() && !arg.starts_with('-') {
+                    bookmark_name = Some(arg.clone());
+                } else {
+                    jj_passthrough.push(arg.clone());
+                }
             }
         }
+        i += 1;
     }
 
-    if plan_first && plan_last {
-        eprintln!("jj plan new: cannot specify both --first and --last");
+    let bookmark_name = match bookmark_name {
+        Some(name) => name,
+        None => {
+            eprintln!("jj plan new: missing required <bookmark-name> argument");
+            eprintln!();
+            eprintln!("Usage: jj plan new <bookmark-name> [-r REV] [-A REV] [-B REV]");
+            eprintln!();
+            eprintln!("Creates a new plan: jj change + bookmark + plan file + registry entry.");
+            eprintln!("The bookmark name becomes the plan name (e.g. feat-auth, fix-login).");
+            return Ok(1);
+        }
+    };
+
+    // ------------------------------------------------------------------
+    // 2. Validate bookmark doesn't already exist
+    // ------------------------------------------------------------------
+    let existing_bookmarks = workspace.local_bookmarks();
+    if existing_bookmarks.iter().any(|b| b.name == bookmark_name) {
+        eprintln!(
+            "jj plan new: bookmark '{}' already exists. Use `jj plan track {}` to adopt it as a plan.",
+            bookmark_name, bookmark_name
+        );
+        return Ok(1);
+    }
+
+    // Check registry too
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let registry = plan_registry::load_registry(&repo_root);
+    if registry.is_tracked(&bookmark_name) {
+        eprintln!(
+            "jj plan new: '{}' is already registered as a plan",
+            bookmark_name
+        );
         return Ok(1);
     }
 
     // ------------------------------------------------------------------
-    // 2. Flush local plan edits to jj descriptions
+    // 3. Flush pending plan edits
     // ------------------------------------------------------------------
     crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
     // ------------------------------------------------------------------
-    // 3. Resolve stack if --first or --last
+    // 4. Create new jj change
     // ------------------------------------------------------------------
-    if plan_first || plan_last {
-        workspace.reload();
-        let stack_result = crate::stack_builder::build_stack(workspace);
-        let changes = match stack_result {
-            crate::types::StackResult::Ok(ref stack) if !stack.segments.is_empty() => {
-                // Build flat list of short change IDs for the segment tips
-                let mut views = Vec::new();
-                for segment in &stack.segments {
-                    if let Some(tip) = segment.changes.first() {
-                        let short_id = workspace
-                            .resolve_change_id(&tip.change_id)
-                            .unwrap_or_else(|| tip.change_id[..8.min(tip.change_id.len())].to_string());
-                        views.push((short_id, tip.local_bookmarks.clone()));
-                    }
-                }
-                views
-            }
-            _ => {
-                eprintln!("jj plan new: could not resolve stack");
-                return Ok(1);
-            }
-        };
+    // Capture WC change ID before
+    workspace.reload();
+    let wc_before = workspace.read_change_id_at_wc();
 
-        if plan_first {
-            // -------------------------------------------------------
-            // 4. --first: insert before the first change
-            // -------------------------------------------------------
-            let first_id = &changes[0].0;
-
-            let mut cmd_args: Vec<&str> = vec!["new", "--insert-before", first_id.as_str()];
-            cmd_args.extend_from_slice(&jj_args);
-
-            let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, workspace)? {
-                Some(id) => id,
-                None => return Ok(1),
-            };
-
-            // Move stack bookmark to the new first change
-            if let Some(bm_name) = find_stack_bookmark(&changes[0].1) {
-                let _ = jj.run_silent(&["bookmark", "set", &bm_name, "-r", "@", "-B"]);
-            }
-
-            return finish(jj, plan_dir, &new_id, workspace);
-        } else {
-            // -------------------------------------------------------
-            // 5. --last: insert after the last change
-            // -------------------------------------------------------
-            let last_id = &changes[changes.len() - 1].0;
-
-            let mut cmd_args: Vec<&str> = vec!["new", "--insert-after", last_id.as_str()];
-            cmd_args.extend_from_slice(&jj_args);
-
-            let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, workspace)? {
-                Some(id) => id,
-                None => return Ok(1),
-            };
-
-            return finish(jj, plan_dir, &new_id, workspace);
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // 6. Default path (no --first / --last)
-    // ------------------------------------------------------------------
-    let mut cmd_args: Vec<&str> = vec!["new"];
+    let mut new_args: Vec<&str> = vec!["new"];
     if !has_explicit_position {
-        cmd_args.push("--insert-after");
-        cmd_args.push("@");
+        new_args.push("--insert-after");
+        new_args.push("@");
     }
-    cmd_args.extend_from_slice(&jj_args);
+    for arg in &jj_passthrough {
+        new_args.push(arg.as_str());
+    }
 
-    let new_id = match create_change_and_describe(jj, plan_dir, &cmd_args, workspace)? {
-        Some(id) => id,
-        None => return Ok(1),
-    };
-
-    finish(jj, plan_dir, &new_id, workspace)
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Create a jj change via `jj new` and set a templated description on it.
-///
-/// This is the shared core for all three `run_new` paths (`--first`, `--last`,
-/// default). It includes a before/after guard: the WC change ID is captured
-/// before and after the `jj new` call. If the ID is unchanged (meaning `jj new`
-/// exited 0 without actually creating a change — e.g. because `--help` was
-/// passed through), the function aborts instead of destructively describing the
-/// existing working copy.
-///
-/// Returns `Ok(Some(new_change_id))` on success, `Ok(None)` if `jj new` failed
-/// or the WC didn't change.
-fn create_change_and_describe(
-    jj: &JjBinary,
-    plan_dir: &PlanDir,
-    cmd_args: &[&str],
-    workspace: &mut Workspace,
-) -> crate::error::Result<Option<String>> {
-    // 1. Capture WC change ID before
-    workspace.reload();
-    let wc_before = read_current_change_id(workspace);
-
-    // 2. Run `jj new ...`
-    let status = jj.run_inherit(cmd_args)?;
+    let status = jj.run_inherit(&new_args)?;
     if !status.success() {
-        return Ok(None);
+        return Ok(status.code().unwrap_or(1));
     }
 
-    // 3. Reload and read WC change ID after
+    // Reload and verify WC actually changed
     workspace.reload();
-    let new_id = match read_current_change_id(workspace) {
+    let new_change_id = match workspace.read_change_id_at_wc() {
         Some(id) => id,
         None => {
             eprintln!("jj plan new: could not read new change ID");
-            return Ok(None);
+            return Ok(1);
         }
     };
 
-    // 4. Before/after guard: bail if WC didn't actually change
-    if wc_before.as_deref() == Some(new_id.as_str()) {
+    if wc_before.as_deref() == Some(new_change_id.as_str()) {
         eprintln!("jj plan new: jj new exited 0 but working copy did not change — aborting");
-        return Ok(None);
+        return Ok(1);
     }
 
-    // 5. Set templated description
-    let description = template::render_template(&plan_dir.path, &new_id);
+    // ------------------------------------------------------------------
+    // 5. Create bookmark on the new change
+    // ------------------------------------------------------------------
+    let (bm_status, _bm_stdout, bm_stderr) =
+        jj.run_silent(&["bookmark", "create", &bookmark_name, "-r", "@"])?;
+
+    if !bm_status.success() {
+        eprintln!(
+            "jj plan new: failed to create bookmark '{}': {}",
+            bookmark_name,
+            bm_stderr.trim()
+        );
+        // Roll back the `jj new`
+        let _ = jj.run_silent(&["undo"]);
+        return Ok(bm_status.code().unwrap_or(1));
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Register in PlanRegistry
+    // ------------------------------------------------------------------
+    // Read full change ID for the registry entry
+    workspace.reload();
+    let full_change_id = workspace
+        .read_change_id_at_wc()
+        .unwrap_or_else(|| new_change_id.clone());
+
+    let mut registry = plan_registry::load_registry(&repo_root);
+    registry.track(PlannedBookmark::new(
+        bookmark_name.clone(),
+        full_change_id.clone(),
+    ));
+    plan_registry::save_registry(&repo_root, &registry);
+
+    // ------------------------------------------------------------------
+    // 7. Set templated description
+    // ------------------------------------------------------------------
+    let description =
+        template::render_template_with_bookmark(&plan_dir.path, &new_change_id, &bookmark_name);
     let _ = jj.run_silent(&["describe", "-m", &description]);
 
-    Ok(Some(new_id))
-}
-
-/// Read the current working-copy change ID (shortest 8-char prefix).
-fn read_current_change_id(workspace: &Workspace) -> Option<String> {
-    workspace.read_change_id_at_wc()
-}
-
-/// Find the first bookmark that is exactly `"stack"` or starts with `"stack/"`.
-fn find_stack_bookmark(bookmarks: &[String]) -> Option<String> {
-    bookmarks
-        .iter()
-        .find(|b| *b == "stack" || b.starts_with("stack/"))
-        .cloned()
-}
-
-/// Sync plan files, print the creation message, and show the stack.
-///
-/// Shared epilogue for all three paths (--first, --last, default).
-fn finish(_jj: &JjBinary, plan_dir: &PlanDir, new_id: &str, workspace: &mut Workspace) -> crate::error::Result<i32> {
-    eprintln!("Created plan change: jj:{}", new_id);
+    // ------------------------------------------------------------------
+    // 8. Reload, sync, and show
+    // ------------------------------------------------------------------
+    eprintln!("Created plan: {} (jj:{})", bookmark_name, new_change_id);
     workspace.reload();
     crate::wrap::resolve_and_sync(plan_dir, workspace);
+
     Ok(0)
 }

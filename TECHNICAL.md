@@ -34,8 +34,10 @@ If jj-lib cannot load the repository (version mismatch, corrupt state), the bina
 | `src/commands/mod.rs` | 73 | `jj plan` subcommand dispatch |
 | `src/commands/config.rs` | 68 | `jj plan config` — read-only introspection (jj-lib reads) |
 | `src/commands/help.rs` | 645 | Top-level `plan --help` classification, color-mode resolution, structured help rendering |
-| `src/commands/stack.rs` | 128 | `jj plan stack` — atomic stack creation |
-| `src/commands/new.rs` | 189 | `jj plan new` — plan change creation with `--first`/`--last` |
+| `src/commands/new.rs` | 189 | `jj plan new <bookmark>` — plan stack/change creation with PlanRegistry |
+| `src/commands/track.rs` | ~60 | `jj plan track <bookmark>` — register bookmark in PlanRegistry |
+| `src/commands/untrack.rs` | ~60 | `jj plan untrack <bookmark>` — remove bookmark from PlanRegistry |
+| `src/registry.rs` | ~120 | PlanRegistry — persistence layer for tracked plan bookmarks |
 | `src/commands/done.rs` | 303 | `jj plan done` — completion marking, scratch stripping, advance |
 | `src/commands/nav.rs` | 159 | `jj plan next`/`prev`/`go` — stack navigation |
 | `src/commands/abandon.rs` | 121 | `jj abandon` — bookmark recovery handler (jj-lib reads, subprocess writes) |
@@ -64,9 +66,34 @@ When `.jj-plan/` and `.jj-plans/` both exist, `.jj-plan/` wins.
 
 Implementation: `src/plan_dir.rs` — `find_repo_root()` returns `Option<PathBuf>`, `resolve_plan_dir()` returns `Option<PlanDir>` with `PlanDirSource` enum.
 
-## Stack Bookmarks
+## PlanRegistry
 
-The binary uses `stack` / `stack/*` bookmarks to determine which changes belong to the current plan stack. For user-facing documentation, see [MANUAL.md § Stacks](MANUAL.md#stacks).
+The PlanRegistry replaces the old `stack` / `stack/*` bookmark naming convention with an explicit registry of tracked plan bookmarks. For user-facing documentation, see [MANUAL.md § Stacks](MANUAL.md#stacks).
+
+### Persistence model
+
+Tracked bookmarks are stored in `.jj/repo/jj-plan/plans.toml`:
+
+```toml
+# .jj/repo/jj-plan/plans.toml
+[plans]
+bookmarks = ["auth-refactor", "api-keys", "phase2"]
+```
+
+The file is created automatically when the first bookmark is registered (via `jj plan new <bookmark>` or `jj plan track <bookmark>`). It lives inside the `.jj/repo/` directory so it is per-repo, not per-working-copy, and is not visible to the working tree.
+
+### API
+
+The `PlanRegistry` struct (`src/registry.rs`) provides:
+
+| Method | Purpose |
+|---|---|
+| `load(repo_root)` | Load the registry from `plans.toml`, returning empty if not found |
+| `save()` | Write the registry back to `plans.toml` |
+| `track(bookmark)` | Add a bookmark to the registry (idempotent) |
+| `untrack(bookmark)` | Remove a bookmark from the registry (idempotent) |
+| `is_tracked(bookmark)` | Check if a bookmark is registered |
+| `bookmarks()` | Return all tracked bookmark names |
 
 ### Inclusive model
 
@@ -74,22 +101,17 @@ The bookmark is placed **on the first change in the stack**, not before it. The 
 
 ```
 ○ landed work
-○ feat: SchemaRef          ← stack/typed-interpret (first member)
+○ feat: SchemaRef          ← auth-refactor (first member, tracked in PlanRegistry)
 ○ feat: typed interpret
 ○ refactor: remove casts
 @ docs: update TECHNICAL
 ```
 
-### Bare `stack` vs named `stack/*`
-
-- **`stack`** (bare) — a quick unnamed stack. Use when you only have one stack at a time.
-- **`stack/my-feature`** (named) — a named stack. Use when you have concurrent work. `jj bookmark list stack/*` shows all active stacks.
-
 ### Resolution algorithm
 
-Resolution is implemented in `resolve_stack_base_lib()` in `src/repo.rs`:
+Resolution is implemented in `resolve_stack_base_lib()` in `src/repo.rs`. The function now accepts `Option<&PlanRegistry>` for registry-based filtering:
 
-1. **`stack` / `stack/*` bookmarks** — evaluates `heads((bookmarks(exact:"stack") | bookmarks(glob:"stack/*")) & ::@)`. If exactly one head: **inclusive** range (`base::@`). The bookmarked change IS the first stack member. If multiple equidistant heads: error (ambiguous siblings).
+1. **Registered bookmarks** — reads the PlanRegistry, builds a revset from all tracked bookmark names, evaluates `heads((<registered bookmarks revset>) & ::@)`. If exactly one head: **inclusive** range (`base::@`). The bookmarked change IS the first stack member. If multiple equidistant heads: error (ambiguous siblings).
 2. **`trunk()`** — if it resolves to something other than `root()`: **exclusive** range (`trunk()..@`). The trunk commit is NOT part of the stack.
 3. **No usable base** — no sync occurs.
 
@@ -99,33 +121,37 @@ Returns `StackBase` enum: `Inclusive(change_id)`, `Exclusive`, or `Ambiguous(Vec
 
 ### Nearest-ancestor resolution
 
-When multiple `stack` / `stack/*` bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the binary always picks the right one:
+When multiple registered bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the binary always picks the right one:
 
 ```
-○ stack/phase1 (old, farther from @)
+○ phase1 (old, farther from @, tracked in PlanRegistry)
 ○ phase 1 work
-○ stack/phase2 (nearer to @, wins)
+○ phase2 (nearer to @, wins, tracked in PlanRegistry)
 ○ phase 2 work
 @ current
 ```
 
-If two `stack/*` bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), `StackBase::Ambiguous` is returned and an error is produced asking the user to advance or remove one.
+If two registered bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), `StackBase::Ambiguous` is returned and an error is produced asking the user to advance or remove one.
 
 ### Fallback to `trunk()`
 
-If no `stack` / `stack/*` bookmark is an ancestor of `@`, the binary falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
+If no registered bookmark is an ancestor of `@`, the binary falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
 
-If neither a stack bookmark nor `trunk()` can be resolved, no sync occurs.
+If neither a registered bookmark nor `trunk()` can be resolved, no sync occurs.
 
 ### "Done" workflow
 
 When you finish a stack, you don't need to move or delete any bookmarks. Just start a new stack:
 
 ```sh
-jj plan stack next-task                # atomic: creates change + sets stack/next-task bookmark
+jj plan new next-task                  # atomic: creates change + sets bookmark + registers in PlanRegistry
 ```
 
-The old `stack/old-task` bookmark stays where it is — it's historical. The binary automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's.
+The old bookmark stays where it is — it's historical and remains in the PlanRegistry. The binary automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's. Use `jj plan untrack old-task` to clean up if desired.
+
+### `build_stack()` registry filtering
+
+The `build_stack()` function (used internally by sync and display) now accepts `Option<&PlanRegistry>`. When `Some(registry)` is provided, only bookmarks present in the registry are considered as potential stack bases. When `None` is passed, the function falls back to `trunk()` only. This allows callers to control whether registry-based resolution is used.
 
 ## Command Dispatch
 
@@ -138,18 +164,23 @@ jj [global options] <subcommand> [args...]
 ├─ "plan" ──────────────────────────────→ subcommand dispatch:
 │   ├─ "--help" / "-h" as subcommand ───→ print_help(), exit 0
 │   ├─ sub_args contain --help/-h? ─────→ print_help(), exit 0 (no side effects)
-│   ├─ "plan stack" ────────────────────→ atomic stack creation (templated description)
-│   ├─ "plan new" ──────────────────────→ templated plan change creation
-│   │     ├─ --first ───────────────────→ insert before first stack member (moves bookmark)
-│   │     └─ --last ────────────────────→ insert after last stack member
+│   ├─ "plan new <bookmark>" ───────────→ plan stack/change creation (templated, PlanRegistry)
+│   ├─ "plan track <bookmark>" ─────────→ register bookmark in PlanRegistry
+│   ├─ "plan untrack <bookmark>" ───────→ remove bookmark from PlanRegistry
 │   ├─ "plan done" ─────────────────────→ mark done, strip [scratch], advance
 │   │     ├─ --stack ───────────────────→ mark all plans done
 │   │     ├─ --keep-scratch ────────────→ skip [scratch] stripping
 │   │     └─ --dry-run ─────────────────→ preview what would change
 │   ├─ "plan next" ─────────────────────→ advance @ to next plan in stack
 │   ├─ "plan prev" ─────────────────────→ move @ to previous plan in stack
-│   ├─ "plan go" ───────────────────────→ jump to plan by index or change ID
+│   ├─ "plan go" ───────────────────────→ jump to plan by index, change ID, or bookmark name
 │   ├─ "plan config" ───────────────────→ read-only introspection
+│   └─ anything else ───────────────────→ usage error (suggests --help)
+├─ "stack" ─────────────────────────────→ jj stack dispatch:
+│   ├─ "stack submit" ──────────────────→ stub (not yet implemented)
+│   ├─ "stack sync" ────────────────────→ stub (not yet implemented)
+│   ├─ "stack merge" ──────────────────→ stub (not yet implemented)
+│   ├─ "stack auth" ───────────────────→ stub (not yet implemented)
 │   └─ anything else ───────────────────→ usage error (suggests --help)
 ├─ "abandon" ───────────────────────────→ bookmark recovery handler
 ├─ "describe" ──────────────────────────→ -m interception (write to plan file first)
@@ -162,6 +193,17 @@ The `plan --help` path is intentionally handled before repo-root and plan-direct
 Subcommand-level `--help` (e.g. `jj plan new --help`, `jj plan go --help`) is intercepted by a central guard in `dispatch_plan` that scans `&args[2..]` for `--help`/`-h` before any handler is called. This ensures no flush, describe, or sync occurs — the help is pure read-only. The `sub_args_request_help()` helper function handles the check uniformly for all subcommands including those that don't use a `sub_args` slice (like `go`, `next`, `prev`).
 
 Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that `status`/`st` are NOT in that list — they get the flush→sync→show treatment to display the stack. Also note that the new normalization is intentionally narrow in scope: it recognizes the top-level help path cleanly without attempting full generic normalization of all jj global options for every custom subcommand.
+
+### `jj stack` dispatch
+
+The `jj stack` namespace is handled in `src/main.rs` alongside the `plan` dispatch. When the first argument is `stack`, dispatch routes to stub handlers:
+
+- `jj stack submit` — prints "not yet implemented" and exits 0.
+- `jj stack sync` — prints "not yet implemented" and exits 0.
+- `jj stack merge` — prints "not yet implemented" and exits 0.
+- `jj stack auth` — prints "not yet implemented" and exits 0.
+
+Unknown `jj stack` subcommands produce a usage error suggesting `--help`. The `jj stack` namespace is reserved for future stack-level operations (submit for review, sync with remote, merge to target branch, authenticate with hosting provider).
 
 ## Plan Help Rendering (`src/commands/help.rs`)
 
@@ -250,7 +292,7 @@ Commands that read stack state after `flush_all()` (which may call `jj describe`
 
 | Function | Purpose |
 |---|---|
-| `resolve_stack_base_lib()` | Find nearest `stack`/`stack/*` bookmark or `trunk()` fallback |
+| `resolve_stack_base_lib()` | Find nearest registered bookmark (via `Option<&PlanRegistry>`) or `trunk()` fallback |
 | `resolve_stack_changes_lib()` | Evaluate stack revset, return ordered `Vec<StackChange>` |
 | `batch_read_changes_lib()` | Evaluate arbitrary revset, return `Vec<StackChange>` |
 | `gather_descriptions()` | Read descriptions for plan file comparison (flush) |
@@ -263,6 +305,8 @@ Commands that read stack state after `flush_all()` (which may call `jj describe`
 | `first_child_change_id()` | First child of a change (for abandon recovery) |
 
 All functions use jj-lib's revset engine (`revset::parse()` → `resolve_user_expression()` → `evaluate()`) and commit API (`Commit::description()`, `Commit::change_id()`, `Commit::parent_tree()`).
+
+| `build_stack()` | Build stack changes, accepts `Option<&PlanRegistry>` for registry-based filtering |
 
 ### Domain types (`src/stack.rs`)
 
@@ -304,7 +348,7 @@ The built-in default is intentionally minimal — just the self-referencing summ
 
 The binary does not impose any plan structure. Developers who want sections (Background, Tasks, Scratchpad, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
 
-`apply_template()` replaces `{{CHANGE_ID}}` with the actual change ID. If a custom template has no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line.
+`apply_template()` replaces `{{CHANGE_ID}}` with the actual change ID and `{{BOOKMARK}}` with the bookmark name associated with the plan stack. If a custom template has no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line.
 
 12 unit tests cover template resolution, interpolation, fallback chain, and injection.
 
@@ -334,54 +378,43 @@ Three commands, all following the same lifecycle: flush → resolve stack → na
 
 - **`jj plan next`**: Find `@` position in stack. If last → print "Already at the last plan" and stay put. Otherwise → `jj edit -r $next_id`.
 - **`jj plan prev`**: Find `@` position in stack. If first → print "Already at the first plan" and stay put. Otherwise → `jj edit -r $prev_id`.
-- **`jj plan go TARGET`**: Parse target as 1-based index (validates range) or change ID (pass through). → `jj edit -r $resolved_id`.
+- **`jj plan go TARGET`**: Parse target as 1-based index (validates range), change ID (pass through), or bookmark name (resolved via PlanRegistry). → `jj edit -r $resolved_id`.
 
 Shared helper `resolve_stack_and_position()` returns `(Vec<StackChange>, current_index)`.
-
-## `jj plan stack` (`src/commands/stack.rs`)
-
-For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan stack](MANUAL.md#jj-plan-stack).
-
-Atomic stack creation:
-
-1. Parse args: `-r REV` (optional root revision), positional name (optional).
-2. Determine bookmark name: `stack/$name` or bare `stack`.
-3. `flush_all()` — flush pending edits.
-4. `jj new [-r REV]` — create the change.
-5. `jj bookmark set $bookmark_name -r @ -B` — set bookmark (allows backwards with `-B`).
-6. On bookmark failure: `jj undo` to roll back.
-7. Read back change ID via `jj log -r @ -T change_id.shortest(8)`.
-8. Set templated description via `template::render_template()`.
-9. `sync()` + `show_stack()`.
 
 ## `jj plan new` (`src/commands/new.rs`)
 
 For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan new](MANUAL.md#jj-plan-new).
 
-Creates a change with a templated description:
+Creates a plan stack or adds a change to an existing stack with a templated description:
 
-1. Parse args: strip `--first` and `--last` (shim flags); detect explicit positioning flags; collect remaining args for `jj new`.
+1. Parse args: extract `<bookmark-name>` (required positional), `-r REV` (optional root revision), detect explicit positioning flags; collect remaining args for `jj new`.
 2. `flush_all()` — flush pending edits.
-3. Create the change and set its description via `create_change_and_describe()`.
-4. `sync()` + `show_stack()`.
+3. `jj new [-r REV]` — create the change.
+4. `jj bookmark set $bookmark_name -r @ -B` — set bookmark (allows backwards with `-B`).
+5. On bookmark failure: `jj undo` to roll back.
+6. Register the bookmark in the PlanRegistry via `registry.track(bookmark_name)`.
+7. Set templated description via `create_change_and_describe()`.
+8. `sync()` + `show_stack()`.
 
-The `create_change_and_describe()` helper consolidates the post-`jj new` sequence that was previously duplicated across all three paths. It includes a **before/after WC guard**: the working copy change ID is captured before and after the `jj new` call. If the ID is unchanged (meaning `jj new` exited 0 without actually creating a change), the function aborts instead of destructively describing the existing working copy. This guards against any jj flag that exits 0 without mutation (e.g. `--help` passed through to jj).
+The `create_change_and_describe()` helper consolidates the post-`jj new` sequence. It includes a **before/after WC guard**: the working copy change ID is captured before and after the `jj new` call. If the ID is unchanged (meaning `jj new` exited 0 without actually creating a change), the function aborts instead of destructively describing the existing working copy. This guards against any jj flag that exits 0 without mutation (e.g. `--help` passed through to jj).
 
-### Default (no flags)
+### Default behavior
 
-`jj new --insert-after @` preserves stack linearity. Suppressed if user provides explicit positioning flags.
+When the bookmark already exists and is registered, the new change is inserted after `@` with `jj new --insert-after @`, preserving stack linearity. Suppressed if the user provides explicit positioning flags (`-A`, `-B`).
 
-### `--first`
-
-Insert before the first stack member. Moves the `stack`/`stack/*` bookmark to the new change.
-
-### `--last`
-
-Insert after the last stack member.
+When the bookmark does not exist, it is created on the new change and registered in the PlanRegistry — this is equivalent to starting a new stack.
 
 ### Known limitation
 
-`run_stack` does not have a before/after WC guard. The central `--help` intercept in `dispatch_plan` covers the help case; other 0-exit-without-mutation flags in `jj new` are not currently known.
+The central `--help` intercept in `dispatch_plan` covers the help case; other 0-exit-without-mutation flags in `jj new` are not currently known.
+
+## `jj plan track` / `jj plan untrack` (`src/commands/track.rs`, `src/commands/untrack.rs`)
+
+For user-facing documentation, see [MANUAL.md § jj plan track](MANUAL.md#jj-plan-track) and [MANUAL.md § jj plan untrack](MANUAL.md#jj-plan-untrack).
+
+- **`jj plan track <bookmark>`**: Loads the PlanRegistry, calls `registry.track(bookmark)`, saves. Verifies the bookmark exists in the repository. Idempotent.
+- **`jj plan untrack <bookmark>`**: Loads the PlanRegistry, calls `registry.untrack(bookmark)`, saves. Idempotent. Does not delete the bookmark itself.
 
 ## `jj plan done` (`src/commands/done.rs`)
 
@@ -414,7 +447,7 @@ Read-only introspection — no flush, no sync. Prints:
 
 For user-facing documentation, see [MANUAL.md § jj abandon](MANUAL.md#jj-abandon).
 
-Protects `stack`/`stack/*` bookmarks from accidental deletion:
+Protects registered plan bookmarks from accidental deletion:
 
 1. **Before abandon**: Snapshot bookmark state — which change holds it, whether it's `@`, its first child.
 2. **Run `jj abandon`** with all original args.
@@ -437,6 +470,9 @@ Protects `stack`/`stack/*` bookmarks from accidental deletion:
   .stack            # One-line-per-change summary (for display)
   error.md          # Transient: exists only during error state
   template.md       # Optional: custom plan template (overrides built-in default)
+
+.jj/repo/jj-plan/
+  plans.toml        # PlanRegistry: tracked plan bookmarks
 ```
 
 - **`NN-CHANGEID.md`**: sort index + shortest unique change ID. Index `01` is closest to the stack base.
@@ -476,8 +512,7 @@ All repository reads are in-process via jj-lib. Only mutations use subprocess ca
 | `jj plan next/prev` | 1 (`jj edit`) | Flush reads + stack resolution are jj-lib |
 | `jj plan done` (single) | 1-2 (`jj describe` + optional `jj edit` for advance) | Stack resolution via jj-lib |
 | `jj plan done --stack` | N (`jj describe` × N changes) | One subprocess per change |
-| `jj plan new` | 1-2 (`jj new` + `jj describe`) | Plus `jj bookmark set` if `--first` |
-| `jj plan stack` | 3 (`jj new` + `jj bookmark set` + `jj describe`) | Atomic stack creation |
+| `jj plan new` | 2-3 (`jj new` + `jj bookmark set` + `jj describe`) | Plus PlanRegistry write |
 
 Flush adds 1 `jj describe` subprocess per changed plan file (only when file content differs from jj description).
 
@@ -555,7 +590,10 @@ If you were using the zsh shim (`jj-plan.zsh`):
 4. **Verify**: `jj plan config` — `shim path:` should point to the new binary (not `.zsh`).
 5. **Behavioral changes**:
    - `jj describe -m "..."` is now intercepted and routed through plan files automatically. The "NEVER call `jj describe` directly" rule is no longer needed.
-   - `jj plan new` and `jj plan stack` now seed descriptions with a structured template instead of `(placeholder: jj:CHANGE_ID)`. The template starts with `(plan: jj:CHANGE_ID)`.
-   - New commands available: `done`, `next`, `prev`, `go`.
+   - `jj plan stack` has been removed. Use `jj plan new <bookmark>` to create a new stack. The `<bookmark-name>` argument is now required.
+   - `--first` and `--last` flags on `jj plan new` have been removed.
+   - The `stack`/`stack/*` bookmark naming convention is replaced by the PlanRegistry. Use `jj plan track <bookmark>` to register existing bookmarks.
+   - New commands available: `done`, `next`, `prev`, `go`, `track`, `untrack`.
+   - New namespace: `jj stack` with stubs for `submit`, `sync`, `merge`, `auth`.
    - `[scratch]` convention: mark any heading with `[scratch]` for working memory that gets cleaned up on `jj plan done`.
 6. The zsh shim (`jj-plan.zsh`) remains in the repo as a reference but is no longer maintained.

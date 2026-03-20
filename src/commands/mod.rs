@@ -5,7 +5,9 @@ pub mod done;
 pub mod help;
 pub mod nav;
 pub mod new;
-pub mod stack;
+pub mod stack_cmd;
+pub mod track;
+pub mod untrack;
 
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
@@ -56,12 +58,14 @@ pub fn dispatch_plan(
             Ok(0)
         }
 
-        // plan stack, plan new, plan done — placeholders for jj:swlkutql
-        Some("stack") => {
-            stack::run_stack(jj, plan_dir, sub_args, workspace)
-        }
         Some("new") => {
             new::run_new(jj, plan_dir, sub_args, workspace)
+        }
+        Some("track") => {
+            track::run_track(jj, plan_dir, sub_args, workspace)
+        }
+        Some("untrack") => {
+            untrack::run_untrack(jj, plan_dir, sub_args, workspace)
         }
         Some("done") => {
             done::run_done(jj, plan_dir, sub_args, workspace)
@@ -74,7 +78,7 @@ pub fn dispatch_plan(
             match target {
                 Some(t) => nav::plan_go(jj, plan_dir, t, workspace),
                 None => {
-                    eprintln!("jj plan go: missing target (index or change ID)");
+                    eprintln!("jj plan go: missing target (index, bookmark name, or change ID)");
                     Ok(1)
                 }
             }

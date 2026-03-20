@@ -46,8 +46,12 @@ pub fn wrap(
 pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
     let max_stack_size = crate::plan_dir::plan_max();
 
-    // Build the stack using the new builder
-    let stack_result = crate::stack_builder::build_stack(workspace);
+    // Load plan registry for filtered stack building
+    let repo_root = workspace.jj_workspace().workspace_root();
+    let registry = crate::plan_registry::load_registry(repo_root);
+
+    // Build the stack using the new builder with registry filtering
+    let stack_result = crate::stack_builder::build_stack(workspace, Some(&registry));
 
     // Convert to the adapter type that sync expects
     let sync_changes = stack_to_sync_changes(&stack_result, workspace);

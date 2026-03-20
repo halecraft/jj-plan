@@ -197,33 +197,29 @@ pub fn build_plan_help() -> PlanHelp {
     PlanHelp {
         title: "jj plan — plan-oriented programming commands",
         mental_model:
-            "Manage plan-oriented work as jj change descriptions synced to `.jj-plan/` markdown files.",
+            "One bookmark = one plan = one PR. Plans are jj change descriptions synced to `.jj-plan/` markdown files.",
         usage: vec![
             "jj plan <SUBCOMMAND>",
             "jj plan --help [--color <WHEN>]",
         ],
         workflow: vec![
-            ("jj plan stack [name]", "Start a new stack (creates change + bookmark)"),
+            ("jj plan new <bookmark>", "Create a plan (change + bookmark + template)"),
             ("$EDITOR .jj-plan/current.md", "Write the current plan"),
-            ("jj plan new", "Add another plan to the stack"),
+            ("jj plan new <next-bookmark>", "Add another plan to the stack"),
             ("jj plan done", "Mark the current plan done and advance"),
         ],
         commands: vec![
             HelpEntry {
-                label: "stack [name] [-r REV]",
-                description: "Start a new stack (creates change + bookmark)",
+                label: "new <bookmark> [-r REV]",
+                description: "Create a plan (change + bookmark + plan file + registry entry)",
             },
             HelpEntry {
-                label: "new [flags] [jj-new-args]",
-                description: "Create a plan change with a templated description",
+                label: "track <bookmark>",
+                description: "Adopt an existing bookmark as a plan",
             },
             HelpEntry {
-                label: "  --first",
-                description: "Insert before the first stack member (moves bookmark)",
-            },
-            HelpEntry {
-                label: "  --last",
-                description: "Insert after the last stack member",
+                label: "untrack <bookmark>",
+                description: "Remove a bookmark from plan tracking",
             },
             HelpEntry {
                 label: "done [flags] [CHANGE_ID]",
@@ -250,8 +246,8 @@ pub fn build_plan_help() -> PlanHelp {
                 description: "Move @ to the previous plan in the stack",
             },
             HelpEntry {
-                label: "go <N | CHANGE_ID>",
-                description: "Jump to a plan by index (1-based) or change ID",
+                label: "go <N | bookmark | ID>",
+                description: "Jump to a plan by index (1-based), bookmark name, or change ID",
             },
             HelpEntry {
                 label: "config",
@@ -271,6 +267,7 @@ pub fn build_plan_help() -> PlanHelp {
         notes: vec![
             "`jj status` shows the current plan stack.",
             "`.jj-plan/current.md` is the main editing surface.",
+            "`jj stack submit/sync/merge` — PR operations (coming soon).",
         ],
         docs: vec![
             HelpEntry {
@@ -615,9 +612,13 @@ mod tests {
     fn render_help_contains_mental_model_workflow_and_docs() {
         let text = render_plan_help(&build_plan_help(), ColorWhen::Never);
 
-        assert!(text.contains("Manage plan-oriented work as jj change descriptions synced to `.jj-plan/` markdown files."));
+        assert!(text.contains("One bookmark = one plan = one PR."));
+        assert!(text.contains("jj plan new <bookmark>"));
+        assert!(text.contains("track <bookmark>"));
+        assert!(text.contains("untrack <bookmark>"));
         assert!(text.contains("$EDITOR .jj-plan/current.md"));
         assert!(text.contains("`jj status` shows the current plan stack."));
+        assert!(text.contains("`jj stack submit/sync/merge`"));
         assert!(text.contains("README.md"));
         assert!(text.contains("MANUAL.md"));
     }

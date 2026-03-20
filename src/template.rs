@@ -46,23 +46,43 @@ pub fn resolve_template(plan_dir: &Path) -> String {
 /// Apply a template by interpolating the change ID.
 ///
 /// - Replaces all occurrences of `{{CHANGE_ID}}` with the actual change ID.
+/// - Replaces all occurrences of `{{BOOKMARK}}` with the bookmark name
+///   (if provided via `apply_template_full`).
 /// - If no `{{CHANGE_ID}}` placeholder exists in the template, prepends a
 ///   self-referencing comment `<!-- jj:CHANGE_ID -->` as the second line
 ///   (after the title line) so the change always has a self-reference.
 pub fn apply_template(template: &str, change_id: &str) -> String {
-    if template.contains("{{CHANGE_ID}}") {
-        template.replace("{{CHANGE_ID}}", change_id)
+    apply_template_full(template, change_id, None)
+}
+
+/// Apply a template by interpolating the change ID and optional bookmark name.
+///
+/// - Replaces all occurrences of `{{CHANGE_ID}}` with the actual change ID.
+/// - Replaces all occurrences of `{{BOOKMARK}}` with the bookmark name (if provided).
+/// - If no `{{CHANGE_ID}}` placeholder exists in the template, prepends a
+///   self-referencing comment `<!-- jj:CHANGE_ID -->` as the second line.
+pub fn apply_template_full(template: &str, change_id: &str, bookmark: Option<&str>) -> String {
+    // First pass: replace {{BOOKMARK}} if provided
+    let after_bookmark = if let Some(bm) = bookmark {
+        template.replace("{{BOOKMARK}}", bm)
+    } else {
+        template.to_string()
+    };
+
+    // Second pass: replace {{CHANGE_ID}} or inject self-reference
+    if after_bookmark.contains("{{CHANGE_ID}}") {
+        after_bookmark.replace("{{CHANGE_ID}}", change_id)
     } else {
         // No placeholder found — inject a self-reference after the first line
         let comment = format!("<!-- jj:{} -->", change_id);
-        match template.find('\n') {
+        match after_bookmark.find('\n') {
             Some(pos) => {
-                let (first_line, rest) = template.split_at(pos + 1);
+                let (first_line, rest) = after_bookmark.split_at(pos + 1);
                 format!("{}{}\n{}", first_line, comment, rest)
             }
             None => {
                 // Single-line template (no newline)
-                format!("{}\n{}\n", template, comment)
+                format!("{}\n{}\n", after_bookmark, comment)
             }
         }
     }
@@ -73,6 +93,16 @@ pub fn apply_template(template: &str, change_id: &str) -> String {
 pub fn render_template(plan_dir: &Path, change_id: &str) -> String {
     let raw = resolve_template(plan_dir);
     apply_template(&raw, change_id)
+}
+
+/// Convenience: resolve the template and apply it with both change ID and
+/// bookmark name. Returns the fully interpolated description string.
+///
+/// This is the preferred entry point for `jj plan new <bookmark>`, where
+/// both `{{CHANGE_ID}}` and `{{BOOKMARK}}` should be interpolated.
+pub fn render_template_with_bookmark(plan_dir: &Path, change_id: &str, bookmark: &str) -> String {
+    let raw = resolve_template(plan_dir);
+    apply_template_full(&raw, change_id, Some(bookmark))
 }
 
 #[cfg(test)]
@@ -183,6 +213,46 @@ mod tests {
         let template = "Title line\n";
         let result = apply_template(template, "testid");
         assert_eq!(result, "Title line\n<!-- jj:testid -->\n");
+    }
+
+    // ── {{BOOKMARK}} interpolation tests ──────────────────────────────
+
+    #[test]
+    fn test_apply_template_bookmark_placeholder() {
+        let template = "(plan: {{BOOKMARK}} jj:{{CHANGE_ID}})\n";
+        let result = apply_template_full(template, "abcdefgh", Some("feat-auth"));
+        assert_eq!(result, "(plan: feat-auth jj:abcdefgh)\n");
+    }
+
+    #[test]
+    fn test_apply_template_bookmark_multiple_occurrences() {
+        let template = "# {{BOOKMARK}}\n\n(plan: {{BOOKMARK}} jj:{{CHANGE_ID}})\n";
+        let result = apply_template_full(template, "xyz", Some("my-feature"));
+        assert_eq!(result, "# my-feature\n\n(plan: my-feature jj:xyz)\n");
+    }
+
+    #[test]
+    fn test_apply_template_bookmark_only_no_change_id() {
+        let template = "# {{BOOKMARK}}\n\nSome content\n";
+        let result = apply_template_full(template, "testid", Some("feat-x"));
+        // No {{CHANGE_ID}} → injects comment
+        assert_eq!(
+            result,
+            "# feat-x\n<!-- jj:testid -->\n\nSome content\n"
+        );
+    }
+
+    #[test]
+    fn test_render_template_with_bookmark() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("template.md"),
+            "# {{BOOKMARK}}\n\n(plan: jj:{{CHANGE_ID}})\n",
+        )
+        .unwrap();
+
+        let result = render_template_with_bookmark(tmp.path(), "abc123", "feat-auth");
+        assert_eq!(result, "# feat-auth\n\n(plan: jj:abc123)\n");
     }
 
     // ── render_template integration tests ─────────────────────────────

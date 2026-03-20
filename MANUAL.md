@@ -25,9 +25,11 @@ Plans are reviewed, debated, and validated *before* code is written. Once implem
 
 ### Stacks
 
-A **stack** is a sequence of related plan changes. A stack is bounded by a `stack` or `stack/*` bookmark placed **on the first change** (inclusive — the bookmarked change is a stack member). Changes from the bookmark through `@` and its descendants form the stack.
+A **stack** is a sequence of related plan changes. A stack is bounded by a bookmark registered in the **PlanRegistry** and placed **on the first change** (inclusive — the bookmarked change is a stack member). Changes from the bookmark through `@` and its descendants form the stack.
 
-If no `stack` bookmark exists, the binary falls back to `trunk()` as the base (exclusive — the trunk commit is not part of your stack).
+The PlanRegistry stores tracked plan bookmarks in `.jj/repo/jj-plan/plans.toml`. You register bookmarks with `jj plan track <bookmark>` and unregister them with `jj plan untrack <bookmark>`. The `jj plan new <bookmark>` command automatically registers its bookmark.
+
+If no registered bookmark is an ancestor of `@`, the binary falls back to `trunk()` as the base (exclusive — the trunk commit is not part of your stack).
 
 ### The `.jj-plan/` Directory
 
@@ -110,90 +112,50 @@ Use `jj:CHANGE_ID` in:
 
 ## Commands
 
-### `jj plan stack`
-
-Create a new stack with a single plan change.
-
-**Synopsis:**
-
-```
-jj plan stack [NAME] [-r REV]
-```
-
-**Description:**
-
-Creates a new jj change, sets a `stack` or `stack/NAME` bookmark on it, and seeds the description with a plan template. This is the entry point for starting a new unit of work.
-
-**Options:**
-
-| Option | Description |
-|---|---|
-| `NAME` | Optional stack name. Creates `stack/NAME` bookmark. Omit for a bare `stack` bookmark. |
-| `-r REV` | Revision to create the new change after. Defaults to `@`. Use `-r main` to root a stack off the main branch. |
-
-**Examples:**
-
-```sh
-# Start a bare unnamed stack after the current change
-jj plan stack
-
-# Start a named stack
-jj plan stack auth-refactor
-
-# Start a named stack rooted off main
-jj plan stack -r main auth-refactor
-```
-
-**Notes:**
-
-- The operation is atomic: if the bookmark set fails, the `jj new` is rolled back via `jj undo`.
-- The bookmark is set with `-B` (allow backwards move), so you can reuse stack names.
-- The new change's description is seeded with the plan template (see [Plan Templates](#plan-templates)).
-- After creation, `.jj-plan/` is synced and the stack summary is displayed.
-
----
-
 ### `jj plan new`
 
-Create a new plan change in the current stack.
+Create a new plan stack or add a plan change to an existing stack.
 
 **Synopsis:**
 
 ```
-jj plan new [--first | --last] [jj-new-args...]
+jj plan new <bookmark-name> [-r REV] [jj-new-args...]
 ```
 
 **Description:**
 
-Creates a new jj change within the current stack, seeds it with a plan template, and syncs the plan directory. By default, the change is inserted after the current working copy (`@`), preserving stack linearity.
+Creates a new jj change, sets a bookmark with the given name on it, registers it in the PlanRegistry, and seeds the description with a plan template. If the bookmark already exists and is registered, the new change is inserted after the current working copy (`@`) within the existing stack, preserving stack linearity.
 
 **Options:**
 
 | Option | Description |
 |---|---|
-| `--first` | Insert before the first stack member. Moves the `stack`/`stack/*` bookmark to the new change. |
-| `--last` | Insert after the last stack member. |
-| `--insert-after`, `-A`, `--insert-before`, `-B`, `-r` | Forwarded to `jj new`. If any explicit positioning flag is present, the default `--insert-after @` is suppressed. |
+| `<bookmark-name>` | **Required.** The bookmark name for this plan stack. Creates the bookmark if it doesn't exist, or adds to the existing stack if it does. |
+| `-r REV` | Revision to create the new change after. Defaults to `@`. Use `-r main` to root a stack off the main branch. |
+| `--insert-after`, `-A`, `--insert-before`, `-B` | Forwarded to `jj new`. If any explicit positioning flag is present, the default `--insert-after @` is suppressed. |
 
 **Examples:**
 
 ```sh
-# Insert a new plan after the current change (default)
-jj plan new
+# Start a new plan stack with a bookmark
+jj plan new auth-refactor
 
-# Prepend a plan to the start of the stack
-jj plan new --first
+# Start a plan stack rooted off main
+jj plan new -r main auth-refactor
 
-# Append a plan to the end of the stack
-jj plan new --last
+# Add another plan to an existing stack
+jj plan new auth-refactor
 ```
 
 **Notes:**
 
-- `--first` and `--last` are mutually exclusive.
-- `--first` moves the stack bookmark to the newly created change (since it becomes the new first member). `--last` does not move the bookmark.
+- The `<bookmark-name>` argument is required. Use any valid bookmark name — the old `stack`/`stack/*` naming convention is no longer needed.
+- The operation is atomic: if the bookmark set fails, the `jj new` is rolled back via `jj undo`.
+- The bookmark is set with `-B` (allow backwards move), so you can reuse bookmark names.
+- The bookmark is automatically registered in the PlanRegistry (`.jj/repo/jj-plan/plans.toml`).
+- The new change's description is seeded with the plan template (see [Plan Templates](#plan-templates)).
+- After creation, `.jj-plan/` is synced and the stack summary is displayed.
 - The default `--insert-after @` ensures the new change is a child of `@`, keeping the stack linear. This prevents the "sibling instead of child" issue that raw `jj new` can cause.
-- The new change's description is seeded with the plan template.
 - All unrecognized arguments are forwarded to the underlying `jj new` command.
 
 ---
@@ -296,12 +258,12 @@ jj plan prev
 
 ### `jj plan go`
 
-Jump to a specific plan by index or change ID.
+Jump to a specific plan by index, change ID, or bookmark name.
 
 **Synopsis:**
 
 ```
-jj plan go <N | CHANGE_ID>
+jj plan go <N | CHANGE_ID | BOOKMARK>
 ```
 
 **Description:**
@@ -310,6 +272,7 @@ Moves the working copy (`@`) to a specific plan. The target can be:
 
 - A **1-based index** matching the `NN-CHANGEID.md` file numbering (e.g., `1` for the first plan, `3` for the third).
 - A **change ID** (passed through to `jj edit -r`).
+- A **bookmark name** registered in the PlanRegistry (resolved to the bookmarked change).
 
 **Options:**
 
@@ -317,6 +280,7 @@ Moves the working copy (`@`) to a specific plan. The target can be:
 |---|---|
 | `N` | 1-based plan index. Must be in range `1` to stack size. |
 | `CHANGE_ID` | A jj change ID (or unique prefix). |
+| `BOOKMARK` | A bookmark name registered in the PlanRegistry. |
 
 **Examples:**
 
@@ -326,12 +290,16 @@ jj plan go 3
 
 # Jump to a specific change by ID
 jj plan go kpqxywon
+
+# Jump to the base of a tracked bookmark's stack
+jj plan go auth-refactor
 ```
 
 **Notes:**
 
 - Index `0` is an error (1-based, not 0-based).
 - Out-of-range indices produce an error with the valid range.
+- Bookmark names are checked against the PlanRegistry; unregistered bookmarks are not resolved.
 
 ---
 
@@ -390,6 +358,62 @@ jj-plan configuration:
 
 ---
 
+### `jj plan track`
+
+Register a bookmark in the PlanRegistry.
+
+**Synopsis:**
+
+```
+jj plan track <bookmark>
+```
+
+**Description:**
+
+Adds the given bookmark to the PlanRegistry (`.jj/repo/jj-plan/plans.toml`). Once tracked, the bookmark is recognized as a plan stack base during stack resolution. This is useful for adopting existing bookmarks as plan stacks without recreating them.
+
+**Examples:**
+
+```sh
+# Track an existing bookmark
+jj plan track my-feature
+```
+
+**Notes:**
+
+- If the bookmark is already tracked, this is a no-op.
+- The bookmark must exist in the repository.
+
+---
+
+### `jj plan untrack`
+
+Remove a bookmark from the PlanRegistry.
+
+**Synopsis:**
+
+```
+jj plan untrack <bookmark>
+```
+
+**Description:**
+
+Removes the given bookmark from the PlanRegistry. The bookmark itself is not deleted — it remains in the repository, but it will no longer be recognized as a plan stack base during stack resolution.
+
+**Examples:**
+
+```sh
+# Stop tracking a bookmark
+jj plan untrack my-feature
+```
+
+**Notes:**
+
+- If the bookmark is not tracked, this is a no-op.
+- The bookmark and its changes are not affected — only the registry entry is removed.
+
+---
+
 ### `jj plan --help`
 
 Print a compact terminal summary of what jj-plan can do.
@@ -420,7 +444,7 @@ This help screen is intentionally compact. It is the fast overview, not the exha
 
 **Subcommand help:**
 
-`jj plan new --help`, `jj plan stack --help`, and other subcommand variants also show the top-level plan help screen. Per-subcommand documentation lives here in `MANUAL.md`, not in terminal help.
+`jj plan new --help`, `jj plan track --help`, and other subcommand variants also show the top-level plan help screen. Per-subcommand documentation lives here in `MANUAL.md`, not in terminal help.
 
 **Notes:**
 
@@ -428,6 +452,60 @@ This help screen is intentionally compact. It is the fast overview, not the exha
 - Use `MANUAL.md` when you want the full command reference, examples, and recipes.
 - Use `README.md` for the project overview, philosophy, and quick start.
 - Use `TECHNICAL.md` for architecture and implementation details.
+
+---
+
+## `jj stack` Commands
+
+The `jj stack` namespace provides stubs for stack-level operations. These commands operate on the stack as a whole rather than individual plans.
+
+> **Note:** These commands are stubs in the current release. They are defined for forward compatibility and will print a "not yet implemented" message.
+
+### `jj stack submit`
+
+Submit the current stack for review.
+
+```
+jj stack submit
+```
+
+**Status:** Stub — not yet implemented.
+
+---
+
+### `jj stack sync`
+
+Synchronize the current stack with the remote.
+
+```
+jj stack sync
+```
+
+**Status:** Stub — not yet implemented.
+
+---
+
+### `jj stack merge`
+
+Merge the current stack into the target branch.
+
+```
+jj stack merge
+```
+
+**Status:** Stub — not yet implemented.
+
+---
+
+### `jj stack auth`
+
+Authenticate with the remote hosting provider.
+
+```
+jj stack auth
+```
+
+**Status:** Stub — not yet implemented.
 
 ---
 
@@ -497,7 +575,7 @@ Commands not listed above (`new`, `edit`, `rebase`, `squash`, `split`, `move`, `
 
 ## Plan Templates
 
-New plan changes created by `jj plan stack` and `jj plan new` are seeded with a template.
+New plan changes created by `jj plan new` are seeded with a template.
 
 ### Built-in default template
 
@@ -517,9 +595,9 @@ Templates are resolved in order:
 
 If an env var or file is empty or unreadable, the next source in the chain is tried.
 
-### `{{CHANGE_ID}}` interpolation
+### `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation
 
-All occurrences of `{{CHANGE_ID}}` in the template are replaced with the actual change ID of the new plan. If a custom template contains no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line, ensuring every plan has a self-reference.
+All occurrences of `{{CHANGE_ID}}` in the template are replaced with the actual change ID of the new plan. All occurrences of `{{BOOKMARK}}` are replaced with the bookmark name associated with the plan stack. If a custom template contains no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line, ensuring every plan has a self-reference.
 
 ### Custom template example
 
@@ -617,10 +695,10 @@ grep -roh 'jj:[a-z]\+' src/ | sort -u
 jj show kpqxywon
 ```
 
-### List all active stack bookmarks
+### List all tracked plan bookmarks
 
 ```sh
-jj bookmark list stack/*
+jj plan config   # shows tracked bookmarks from the PlanRegistry
 ```
 
 ### Show what scratch content was stripped
@@ -684,29 +762,29 @@ Shows the shim path, real jj binary, resolved plan directory, stack base, and st
 
 ```sh
 # The old stack's bookmark stays — no cleanup needed
-jj plan stack next-task
+jj plan new next-task
 
 # Or root it off main
-jj plan stack -r main next-task
+jj plan new -r main next-task
 ```
 
 ### Work with multiple concurrent stacks
 
 ```sh
 # Create named stacks
-jj plan stack auth-refactor
+jj plan new auth-refactor
 # ... work ...
-jj plan stack -r main api-keys
+jj plan new -r main api-keys
 
-# List all stacks
-jj bookmark list stack/*
+# List all tracked plan bookmarks
+jj plan config
 
-# The binary automatically picks the nearest ancestor bookmark
+# The binary automatically picks the nearest registered ancestor bookmark
 ```
 
-### Use plans without a stack bookmark
+### Use plans without a tracked bookmark
 
-If your repo has a remote with `trunk()` configured (e.g., `main@origin`), you don't need a stack bookmark at all. The binary falls back to `trunk()` as an exclusive base — all changes between trunk and `@` form the stack.
+If your repo has a remote with `trunk()` configured (e.g., `main@origin`), you don't need a tracked bookmark at all. The binary falls back to `trunk()` as an exclusive base — all changes between trunk and `@` form the stack.
 
 ---
 

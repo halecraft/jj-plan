@@ -107,7 +107,7 @@ fn run_done_stack(
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
     eprintln!("All plans in stack are done 🎉");
-    eprintln!("Start a new stack: jj plan stack [-r REV] [name]");
+    eprintln!("Start a new plan: jj plan new <bookmark-name>");
 
     Ok(0)
 }
@@ -223,7 +223,10 @@ fn append_done_marker(desc: &str, already_done: bool) -> String {
 
 /// Build SyncChangeView list from the stack for done's consumption.
 fn build_sync_views_for_done(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
-    let stack_result = crate::stack_builder::build_stack(workspace);
+    // Load registry for filtered stack building
+    let repo_root = workspace.jj_workspace().workspace_root();
+    let registry = crate::plan_registry::load_registry(repo_root);
+    let stack_result = crate::stack_builder::build_stack(workspace, Some(&registry));
     match stack_result {
         crate::types::StackResult::Ok(stack) => {
             let mut views = Vec::new();

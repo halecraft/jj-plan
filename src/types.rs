@@ -15,6 +15,7 @@
 //!   ordered trunk (index 0) to tip (last index).
 
 use chrono::{DateTime, Utc};
+use serde::{Serialize, Deserialize};
 
 // ---------------------------------------------------------------------------
 // Core domain types (adopted from jj-ryu)
@@ -166,6 +167,110 @@ pub struct UnbookmarkedChange {
 }
 
 // ---------------------------------------------------------------------------
+// Plan registry types (persistent, serde-enabled)
+// ---------------------------------------------------------------------------
+
+/// Version constant for the plan registry file format.
+pub const PLAN_REGISTRY_VERSION: u32 = 1;
+
+/// Persistent record that a bookmark is a plan.
+///
+/// Stored in the plan registry file. Unlike the in-memory `Bookmark` type,
+/// this carries `Serialize`/`Deserialize` for TOML persistence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlannedBookmark {
+    pub name: String,
+    pub change_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    pub planned_at: DateTime<Utc>,
+}
+
+impl PlannedBookmark {
+    /// Create a new planned bookmark (local only).
+    pub fn new(name: impl Into<String>, change_id: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            change_id: change_id.into(),
+            remote: None,
+            planned_at: Utc::now(),
+        }
+    }
+
+    /// Create a new planned bookmark with a remote.
+    pub fn with_remote(
+        name: impl Into<String>,
+        change_id: impl Into<String>,
+        remote: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            change_id: change_id.into(),
+            remote: Some(remote.into()),
+            planned_at: Utc::now(),
+        }
+    }
+}
+
+/// Persistent plan registry — the on-disk state of tracked plan bookmarks.
+///
+/// Serialized to/from TOML. Adopted from ryu's `TrackingState`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PlanRegistry {
+    pub version: u32,
+    #[serde(default)]
+    pub bookmarks: Vec<PlannedBookmark>,
+}
+
+impl PlanRegistry {
+    /// Create a new empty registry with the current version.
+    pub const fn new() -> Self {
+        Self {
+            version: PLAN_REGISTRY_VERSION,
+            bookmarks: Vec::new(),
+        }
+    }
+
+    /// Whether a bookmark with the given name is tracked.
+    pub fn is_tracked(&self, name: &str) -> bool {
+        self.bookmarks.iter().any(|b| b.name == name)
+    }
+
+    /// Get a tracked bookmark by name.
+    pub fn get(&self, name: &str) -> Option<&PlannedBookmark> {
+        self.bookmarks.iter().find(|b| b.name == name)
+    }
+
+    /// Track a bookmark. No-op if already tracked.
+    pub fn track(&mut self, bookmark: PlannedBookmark) {
+        if !self.is_tracked(&bookmark.name) {
+            self.bookmarks.push(bookmark);
+        }
+    }
+
+    /// Untrack a bookmark by name. Returns `true` if it was removed.
+    pub fn untrack(&mut self, name: &str) -> bool {
+        let len_before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b.name != name);
+        self.bookmarks.len() < len_before
+    }
+
+    /// Names of all tracked bookmarks.
+    pub fn tracked_names(&self) -> Vec<&str> {
+        self.bookmarks.iter().map(|b| b.name.as_str()).collect()
+    }
+}
+
+/// A narrowed bookmark segment for downstream submit/merge operations.
+///
+/// Pairs a single `Bookmark` with the changes that belong to it.
+#[derive(Debug, Clone)]
+pub struct NarrowedBookmarkSegment {
+    pub bookmark: Bookmark,
+    pub changes: Vec<LogEntry>,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -173,6 +278,7 @@ pub struct UnbookmarkedChange {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use toml;
 
     fn make_log_entry(desc: &str) -> LogEntry {
         LogEntry {
@@ -235,32 +341,71 @@ mod tests {
         assert!(!entry.is_done());
     }
 
+    // -----------------------------------------------------------------------
+    // PlanRegistry tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn test_bookmark_equality() {
-        let b1 = Bookmark {
-            name: "feat-auth".to_string(),
-            commit_id: "aabb".to_string(),
-            change_id: "ccdd".to_string(),
-            has_remote: false,
-            is_synced: false,
-        };
-        let b2 = b1.clone();
-        assert_eq!(b1, b2);
+    fn test_plan_registry_track_untrack() {
+        let mut reg = PlanRegistry::new();
+        assert_eq!(reg.version, PLAN_REGISTRY_VERSION);
+        assert!(reg.bookmarks.is_empty());
+
+        // Track a bookmark
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        assert!(reg.is_tracked("feat-auth"));
+        assert!(!reg.is_tracked("feat-other"));
+        assert_eq!(reg.tracked_names(), vec!["feat-auth"]);
+
+        // Get it back
+        let got = reg.get("feat-auth").unwrap();
+        assert_eq!(got.name, "feat-auth");
+        assert_eq!(got.change_id, "aabb");
+
+        // Track another
+        reg.track(PlannedBookmark::new("feat-other", "ccdd"));
+        assert_eq!(reg.tracked_names().len(), 2);
+
+        // Untrack first
+        assert!(reg.untrack("feat-auth"));
+        assert!(!reg.is_tracked("feat-auth"));
+        assert_eq!(reg.tracked_names(), vec!["feat-other"]);
+
+        // Untrack non-existent returns false
+        assert!(!reg.untrack("no-such"));
     }
 
     #[test]
-    fn test_stack_result_variants() {
-        // Smoke test: ensure all variants are constructible
-        let empty = StackResult::Empty;
-        let merge = StackResult::MergeCommits;
-        let ok = StackResult::Ok(Stack {
-            segments: vec![],
-            gaps: vec![],
-        });
+    fn test_plan_registry_duplicate_track_is_noop() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        reg.track(PlannedBookmark::new("feat-auth", "different-id"));
 
-        // Pattern matching works
-        assert!(matches!(empty, StackResult::Empty));
-        assert!(matches!(merge, StackResult::MergeCommits));
-        assert!(matches!(ok, StackResult::Ok(_)));
+        // Should still have exactly one entry with the original change_id
+        assert_eq!(reg.bookmarks.len(), 1);
+        assert_eq!(reg.get("feat-auth").unwrap().change_id, "aabb");
+    }
+
+    #[test]
+    fn test_plan_registry_serialization() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        reg.track(PlannedBookmark::with_remote("feat-deploy", "ccdd", "origin"));
+
+        // Serialize to TOML
+        let toml_str = toml::to_string(&reg).expect("serialize");
+
+        // Deserialize back
+        let reg2: PlanRegistry = toml::from_str(&toml_str).expect("deserialize");
+
+        assert_eq!(reg2.version, PLAN_REGISTRY_VERSION);
+        assert_eq!(reg2.bookmarks.len(), 2);
+        assert_eq!(reg2.bookmarks[0].name, "feat-auth");
+        assert!(reg2.bookmarks[0].remote.is_none());
+        assert_eq!(reg2.bookmarks[1].name, "feat-deploy");
+        assert_eq!(reg2.bookmarks[1].remote.as_deref(), Some("origin"));
+
+        // Verify round-trip equality for the bookmarks
+        assert_eq!(reg.bookmarks, reg2.bookmarks);
     }
 }

@@ -6,6 +6,7 @@ mod template;
 mod jj_binary;
 mod plan_dir;
 mod plan_file;
+mod plan_registry;
 mod stack_builder;
 mod sync;
 mod types;
@@ -121,6 +122,11 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
         return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace);
+    }
+
+    // Special handling for "stack" subcommand (PR operations)
+    if subcommand == "stack" {
+        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace);
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost

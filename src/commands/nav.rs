@@ -1,36 +1,55 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::plan_registry;
+use crate::types::{PlanRegistry, Stack, StackResult};
 use crate::workspace::Workspace;
-use crate::wrap::SyncChangeView;
 
-/// Run `jj plan next` — advance `@` to the next change in the stack.
+/// A navigation target: a segment's tip commit info.
+struct NavTarget {
+    /// Short change ID (reverse-hex) for `jj edit`.
+    change_id: String,
+    /// Whether this segment contains the working copy.
+    is_working_copy: bool,
+    /// Bookmark names on the segment tip.
+    bookmarks: Vec<String>,
+}
+
+/// Run `jj plan next` — advance `@` to the next plan in the stack.
 ///
-/// Navigates between bookmarked segments. Each segment's tip commit is
-/// the navigation target.
-pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace) -> crate::error::Result<i32> {
+/// Navigates between plan-registered segments. Each segment's tip commit is
+/// the navigation target. If `@` is on an unbookmarked WIP commit, the
+/// nearest segment is used as the current position anchor.
+pub fn plan_next(
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
+    workspace: &mut Workspace,
+) -> crate::error::Result<i32> {
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
-    // 2. Resolve stack
+    // 2. Load registry and build stack
     workspace.reload();
-    let (changes, current_idx) = match resolve_stack_and_position(workspace) {
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let registry = plan_registry::load_registry(&repo_root);
+
+    let (targets, current_idx) = match resolve_targets_and_position(workspace, &registry) {
         Some(result) => result,
         None => {
-            eprintln!("jj plan next: could not resolve stack or find current position");
+            eprintln!("No plans in stack");
             return Ok(1);
         }
     };
 
     // 3. Check if already at the last plan
-    if current_idx >= changes.len() - 1 {
-        eprintln!("Already at the last plan in the stack");
+    if current_idx >= targets.len() - 1 {
+        eprintln!("Already at the last plan");
         workspace.reload();
         crate::wrap::resolve_and_sync(plan_dir, workspace);
         return Ok(0);
     }
 
-    // 4. Navigate to the next change
-    let next_id = &changes[current_idx + 1].change_id;
+    // 4. Navigate to the next segment's tip
+    let next_id = &targets[current_idx + 1].change_id;
     let status = jj.run_inherit(&["edit", "-r", next_id])?;
     if !status.success() {
         return Ok(status.code().unwrap_or(1));
@@ -42,31 +61,38 @@ pub fn plan_next(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace) -
     Ok(0)
 }
 
-/// Run `jj plan prev` — move `@` to the previous change in the stack.
-pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace) -> crate::error::Result<i32> {
+/// Run `jj plan prev` — move `@` to the previous plan in the stack.
+pub fn plan_prev(
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
+    workspace: &mut Workspace,
+) -> crate::error::Result<i32> {
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
-    // 2. Resolve stack
+    // 2. Load registry and build stack
     workspace.reload();
-    let (changes, current_idx) = match resolve_stack_and_position(workspace) {
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let registry = plan_registry::load_registry(&repo_root);
+
+    let (targets, current_idx) = match resolve_targets_and_position(workspace, &registry) {
         Some(result) => result,
         None => {
-            eprintln!("jj plan prev: could not resolve stack or find current position");
+            eprintln!("No plans in stack");
             return Ok(1);
         }
     };
 
     // 3. Check if already at the first plan
     if current_idx == 0 {
-        eprintln!("Already at the first plan in the stack");
+        eprintln!("Already at the first plan");
         workspace.reload();
         crate::wrap::resolve_and_sync(plan_dir, workspace);
         return Ok(0);
     }
 
-    // 4. Navigate to the previous change
-    let prev_id = &changes[current_idx - 1].change_id;
+    // 4. Navigate to the previous segment's tip
+    let prev_id = &targets[current_idx - 1].change_id;
     let status = jj.run_inherit(&["edit", "-r", prev_id])?;
     if !status.success() {
         return Ok(status.code().unwrap_or(1));
@@ -78,7 +104,13 @@ pub fn plan_prev(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace) -
     Ok(0)
 }
 
-/// Run `jj plan go TARGET` — move `@` to a specific change by index or change ID.
+/// Run `jj plan go TARGET` — move `@` to a specific plan by index, bookmark
+/// name, or change ID.
+///
+/// Target resolution:
+/// 1. If target is a number (1-based index), resolve to that segment's tip.
+/// 2. If target matches a bookmark name in the stack, resolve to that segment's tip.
+/// 3. Otherwise, pass through to `jj edit` as a change ID / revset.
 pub fn plan_go(
     jj: &JjBinary,
     plan_dir: &PlanDir,
@@ -88,29 +120,58 @@ pub fn plan_go(
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
-    // 2. Resolve stack
+    // 2. Load registry and build stack
     workspace.reload();
-    let changes = match build_sync_views(workspace) {
-        Some(c) => c,
-        None => {
-            eprintln!("jj plan go: could not resolve stack");
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let registry = plan_registry::load_registry(&repo_root);
+
+    let targets = match build_nav_targets(workspace, &registry) {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!("No plans in stack");
             return Ok(1);
         }
     };
 
-    // 3. Parse target: number (1-based index) or change ID
+    // 3. Resolve target
     let resolved_id = if let Ok(index) = target.parse::<usize>() {
-        if index == 0 || index > changes.len() {
+        // Numeric index (1-based)
+        if index == 0 || index > targets.len() {
             eprintln!(
                 "jj plan go: index {} is out of range (valid: 1-{})",
                 index,
-                changes.len()
+                targets.len()
             );
             return Ok(1);
         }
-        changes[index - 1].change_id.clone()
+        targets[index - 1].change_id.clone()
     } else {
-        target.to_string()
+        // Try bookmark name match first
+        match targets.iter().find(|t| t.bookmarks.iter().any(|b| b == target)) {
+            Some(t) => t.change_id.clone(),
+            None => {
+                // Not a known bookmark — suggest similar names
+                let bookmark_names: Vec<&str> = targets
+                    .iter()
+                    .flat_map(|t| t.bookmarks.iter().map(|b| b.as_str()))
+                    .collect();
+
+                if !bookmark_names.is_empty() {
+                    eprintln!("jj plan go: '{}' is not a plan bookmark", target);
+                    eprintln!();
+                    eprintln!("Available plan bookmarks:");
+                    for (i, t) in targets.iter().enumerate() {
+                        for bm in &t.bookmarks {
+                            eprintln!("  {}. {}", i + 1, bm);
+                        }
+                    }
+                    return Ok(1);
+                }
+
+                // Fall through to raw change ID / revset
+                target.to_string()
+            }
+        }
     };
 
     // 4. Navigate
@@ -129,38 +190,85 @@ pub fn plan_go(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the stack and find the current working copy position.
+/// Build navigation targets from registry-filtered stack.
 ///
-/// Returns `Some((changes, current_index))` or `None` if the stack can't
-/// be resolved or `@` is not found in the stack.
-fn resolve_stack_and_position(workspace: &Workspace) -> Option<(Vec<SyncChangeView>, usize)> {
-    let changes = build_sync_views(workspace)?;
-    let current_idx = changes.iter().position(|c| c.is_working_copy)?;
-    Some((changes, current_idx))
-}
-
-/// Build SyncChangeView list from the stack for navigation.
-fn build_sync_views(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
-    let stack_result = crate::stack_builder::build_stack(workspace);
+/// Each target is a segment's tip commit (the bookmarked commit).
+/// Only plan-registered segments are included.
+fn build_nav_targets(workspace: &Workspace, registry: &PlanRegistry) -> Option<Vec<NavTarget>> {
+    let stack_result = crate::stack_builder::build_stack(workspace, Some(registry));
     match stack_result {
-        crate::types::StackResult::Ok(stack) => {
-            let mut views = Vec::new();
-            for segment in &stack.segments {
-                if let Some(tip) = segment.changes.first() {
-                    let short_id = workspace
-                        .resolve_change_id(&tip.change_id)
-                        .unwrap_or_else(|| tip.change_id[..8.min(tip.change_id.len())].to_string());
-                    views.push(SyncChangeView {
-                        change_id: short_id,
-                        description: tip.description.clone(),
-                        is_empty: tip.is_empty,
-                        is_working_copy: tip.is_working_copy,
-                        bookmarks: tip.local_bookmarks.clone(),
-                    });
-                }
+        StackResult::Ok(stack) => {
+            let targets = stack_to_nav_targets(&stack, workspace);
+            if targets.is_empty() {
+                None
+            } else {
+                Some(targets)
             }
-            if views.is_empty() { None } else { Some(views) }
         }
         _ => None,
     }
+}
+
+/// Convert a `Stack` to a list of `NavTarget`s.
+fn stack_to_nav_targets(stack: &Stack, workspace: &Workspace) -> Vec<NavTarget> {
+    let mut targets = Vec::new();
+    for segment in &stack.segments {
+        if let Some(tip) = segment.changes.first() {
+            let short_id = workspace
+                .resolve_change_id(&tip.change_id)
+                .unwrap_or_else(|| {
+                    tip.change_id[..8.min(tip.change_id.len())].to_string()
+                });
+            targets.push(NavTarget {
+                change_id: short_id,
+                is_working_copy: tip.is_working_copy,
+                bookmarks: tip.local_bookmarks.clone(),
+            });
+        }
+    }
+    targets
+}
+
+/// Resolve the stack and find the current working copy position among
+/// plan-registered segments.
+///
+/// If `@` is directly on a segment's tip, that segment's index is returned.
+/// If `@` is on an unbookmarked WIP commit (not in any segment), we find
+/// the nearest segment as the anchor:
+/// - If `@` is beyond all segments (tip-ward), use the last segment.
+/// - Otherwise, use the last segment whose tip is an ancestor of `@`.
+///
+/// Returns `None` if the stack is empty or has no segments.
+fn resolve_targets_and_position(
+    workspace: &Workspace,
+    registry: &PlanRegistry,
+) -> Option<(Vec<NavTarget>, usize)> {
+    let stack_result = crate::stack_builder::build_stack(workspace, Some(registry));
+    let stack = match stack_result {
+        StackResult::Ok(stack) if !stack.segments.is_empty() => stack,
+        _ => return None,
+    };
+
+    let targets = stack_to_nav_targets(&stack, workspace);
+    if targets.is_empty() {
+        return None;
+    }
+
+    // Try to find @ directly in a segment's tip
+    if let Some(idx) = targets.iter().position(|t| t.is_working_copy) {
+        return Some((targets, idx));
+    }
+
+    // @ is on an unbookmarked WIP commit. Check if any segment's changes
+    // (not just the tip) contain the working copy.
+    let last_idx = targets.len() - 1;
+    for (seg_idx, segment) in stack.segments.iter().enumerate() {
+        if segment.changes.iter().any(|c| c.is_working_copy) {
+            return Some((targets, seg_idx));
+        }
+    }
+
+    // @ is not in any segment at all (e.g. unbookmarked WIP at tip after
+    // all segments). Default to the last segment as the anchor.
+    Some((targets, last_idx))
 }

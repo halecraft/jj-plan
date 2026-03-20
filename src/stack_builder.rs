@@ -8,8 +8,10 @@
 //!
 //! - **Pure logic.** `build_stack()` takes a `Workspace` reference and returns
 //!   a `StackResult`. It performs no I/O beyond jj-lib's in-process reads.
-//! - **All bookmarked commits produce segments** in this plan (no registry
-//!   filtering). Registry-based filtering arrives in jj:ntksslnn.
+//! - **Registry-based filtering.** When a `PlanRegistry` is provided, only
+//!   commits with at least one registered bookmark produce segments. Commits
+//!   with only non-registered bookmarks are treated as unbookmarked. When
+//!   `None`, all bookmarked commits produce segments (backwards-compatible).
 //! - **Segments are trunk-to-tip.** `Stack.segments[0]` is closest to trunk.
 //! - **Changes within each segment are newest-first** (tip toward trunk),
 //!   matching ryu's `BookmarkSegment` convention.
@@ -17,9 +19,9 @@
 //!   Unbookmarked commits before the first bookmark or after the last
 //!   bookmark are NOT gaps (they are pre-stack history or WIP respectively).
 //!
-//! Context: jj:pozrnomw
+//! Context: jj:pozrnomw, jj:ntksslnn
 
-use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, Stack, StackResult, UnbookmarkedChange};
+use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, NarrowedBookmarkSegment, PlanRegistry, Stack, StackResult, UnbookmarkedChange};
 use crate::workspace::Workspace;
 
 /// The revset expression for the full stack range.
@@ -33,11 +35,16 @@ const STACK_REVSET: &str = "trunk()..(@  | descendants(@))";
 /// Evaluates `trunk()..(@  | descendants(@))`, converts commits to `LogEntry`,
 /// groups them into `BookmarkSegment`s, and detects gaps.
 ///
+/// When `registry` is `Some`, only commits whose bookmarks appear in the
+/// registry produce segments. Commits with only non-registered bookmarks
+/// are treated as unbookmarked. When `registry` is `None`, all bookmarked
+/// commits produce segments (preserves pozrnomw behavior for testing).
+///
 /// Returns:
 /// - `StackResult::Empty` if the revset range is empty
 /// - `StackResult::MergeCommits` if any commit has multiple parents
 /// - `StackResult::Ok(stack)` on success
-pub fn build_stack(workspace: &Workspace) -> StackResult {
+pub fn build_stack(workspace: &Workspace, registry: Option<&PlanRegistry>) -> StackResult {
     // 1. Evaluate the stack revset (parents before children = trunk toward tip)
     let commits = match workspace.evaluate_revset_reversed(STACK_REVSET) {
         Some(c) if !c.is_empty() => c,
@@ -64,14 +71,14 @@ pub fn build_stack(workspace: &Workspace) -> StackResult {
         .collect();
 
     // 5. Build segments and detect gaps
-    build_segments_and_gaps(&entries, &short_ids)
+    build_segments_and_gaps(&entries, &short_ids, registry)
 }
 
 /// Internal: group entries into bookmark segments and detect gaps.
 ///
 /// `entries` and `short_ids` are parallel arrays, ordered trunk-to-tip
 /// (parents before children).
-fn build_segments_and_gaps(entries: &[LogEntry], short_ids: &[String]) -> StackResult {
+fn build_segments_and_gaps(entries: &[LogEntry], short_ids: &[String], registry: Option<&PlanRegistry>) -> StackResult {
     // We walk trunk-to-tip. We accumulate commits into a "current run."
     // When we hit a bookmarked commit, we finalize a segment.
     //
@@ -90,7 +97,14 @@ fn build_segments_and_gaps(entries: &[LogEntry], short_ids: &[String]) -> StackR
     let mut last_bookmark_name: Option<String> = None;
 
     for (idx, entry) in entries.iter().enumerate() {
-        let has_bookmarks = !entry.local_bookmarks.is_empty();
+        // When registry is provided, a commit is "bookmarked" only if at
+        // least one of its bookmarks is registered. Otherwise, all bookmarks
+        // count.
+        let has_bookmarks = if let Some(reg) = registry {
+            entry.local_bookmarks.iter().any(|b| reg.is_tracked(b))
+        } else {
+            !entry.local_bookmarks.is_empty()
+        };
 
         current_run.push((idx, entry));
 
@@ -105,7 +119,16 @@ fn build_segments_and_gaps(entries: &[LogEntry], short_ids: &[String]) -> StackR
 
             let unbookmarked_in_run: Vec<(usize, &LogEntry)> = current_run
                 .iter()
-                .filter(|(_, e)| e.local_bookmarks.is_empty())
+                .filter(|(_, e)| {
+                    // A commit is "unbookmarked" for gap purposes when it has
+                    // no bookmarks that count. With registry filtering, only
+                    // registered bookmarks count; without, all bookmarks count.
+                    if let Some(reg) = registry {
+                        !e.local_bookmarks.iter().any(|b| reg.is_tracked(b))
+                    } else {
+                        e.local_bookmarks.is_empty()
+                    }
+                })
                 .copied()
                 .collect();
 
@@ -235,6 +258,34 @@ fn first_bookmark_display_name(entry: &LogEntry) -> String {
         .unwrap_or_else(|| "(unknown)".to_string())
 }
 
+/// Narrow multi-bookmark segments to the single registered plan bookmark.
+///
+/// For each `BookmarkSegment`, finds the bookmark registered in the
+/// `PlanRegistry` and produces a `NarrowedBookmarkSegment` with just that
+/// bookmark. If a segment has multiple registered bookmarks (edge case),
+/// the first one wins.
+///
+/// This is used by downstream operations (submit, merge) that need exactly
+/// one bookmark per segment.
+pub fn narrow_segments(stack: &Stack, registry: &PlanRegistry) -> Vec<NarrowedBookmarkSegment> {
+    stack
+        .segments
+        .iter()
+        .filter_map(|seg| {
+            // Find the first bookmark that is registered in the plan registry
+            let plan_bookmark = seg
+                .bookmarks
+                .iter()
+                .find(|b| registry.is_tracked(&b.name))?;
+
+            Some(NarrowedBookmarkSegment {
+                bookmark: plan_bookmark.clone(),
+                changes: seg.changes.clone(),
+            })
+        })
+        .collect()
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -308,7 +359,7 @@ mod tests {
     #[test]
     fn test_build_stack_empty() {
         // Empty entries → StackResult::Ok with no segments
-        let result = build_segments_and_gaps(&[], &[]);
+        let result = build_segments_and_gaps(&[], &[], None);
         match result {
             StackResult::Ok(stack) => {
                 assert!(stack.segments.is_empty());
@@ -324,7 +375,7 @@ mod tests {
         let entries = vec![make_entry("ch1", "c1", &["feat-a"], true)];
         let ids = short_ids(1);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 assert!(stack.gaps.is_empty());
@@ -349,7 +400,7 @@ mod tests {
         ];
         let ids = short_ids(3);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 3);
                 assert!(stack.gaps.is_empty());
@@ -378,7 +429,7 @@ mod tests {
         ];
         let ids = short_ids(3);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 2);
                 assert_eq!(stack.gaps.len(), 1);
@@ -435,7 +486,7 @@ mod tests {
         ];
         let ids = short_ids(2);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 assert!(stack.gaps.is_empty(), "WIP at tip should not be a gap");
@@ -457,7 +508,7 @@ mod tests {
         ];
         let ids = short_ids(2);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 assert!(
@@ -486,7 +537,7 @@ mod tests {
         ];
         let ids = short_ids(3);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 3);
                 assert!(stack.gaps.is_empty());
@@ -510,7 +561,7 @@ mod tests {
         let entries = vec![make_entry("ch1", "c1", &["feat-a", "feat-b"], true)];
         let ids = short_ids(1);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 assert!(stack.gaps.is_empty());
@@ -547,7 +598,7 @@ mod tests {
         ];
         let ids = short_ids(2);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 let target = find_submit_target(&stack);
                 assert!(target.is_some());
@@ -567,7 +618,7 @@ mod tests {
         ];
         let ids = short_ids(2);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 // @ is not in any segment (it's WIP at tip)
                 let target = find_submit_target(&stack);
@@ -595,7 +646,7 @@ mod tests {
         ];
         let ids = short_ids(5);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 3);
                 assert_eq!(stack.gaps.len(), 2);
@@ -631,7 +682,7 @@ mod tests {
         ];
         let ids = short_ids(3);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 assert!(stack.gaps.is_empty());
@@ -653,10 +704,174 @@ mod tests {
         ];
         let ids = short_ids(2);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert!(stack.segments.is_empty());
                 assert!(stack.gaps.is_empty());
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Registry-based filtering tests
+    // -----------------------------------------------------------------------
+
+    fn make_registry(names: &[&str]) -> PlanRegistry {
+        let mut registry = PlanRegistry::new();
+        for name in names {
+            registry.track(crate::types::PlannedBookmark::new(
+                name.to_string(),
+                format!("change-for-{}", name),
+            ));
+        }
+        registry
+    }
+
+    #[test]
+    fn test_build_stack_registry_filters() {
+        // trunk <- c1(feat-a) <- c2(topic-x) <- c3(feat-b, @)
+        // Only feat-a and feat-b are registered; topic-x is not a plan.
+        // topic-x should be treated as unbookmarked.
+        let entries = vec![
+            make_entry("ch1", "c1", &["feat-a"], false),
+            make_entry("ch2", "c2", &["topic-x"], false),
+            make_entry("ch3", "c3", &["feat-b"], true),
+        ];
+        let ids = short_ids(3);
+        let registry = make_registry(&["feat-a", "feat-b"]);
+
+        match build_segments_and_gaps(&entries, &ids, Some(&registry)) {
+            StackResult::Ok(stack) => {
+                // Only 2 segments (feat-a, feat-b); topic-x is not a segment
+                assert_eq!(stack.segments.len(), 2);
+                assert_eq!(stack.segments[0].bookmarks[0].name, "feat-a");
+                assert_eq!(stack.segments[1].bookmarks[0].name, "feat-b");
+
+                // topic-x's commit (c2) is grouped into feat-b's segment
+                assert_eq!(stack.segments[1].changes.len(), 2);
+                assert_eq!(stack.segments[1].changes[0].commit_id, "c3");
+                assert_eq!(stack.segments[1].changes[1].commit_id, "c2");
+
+                // Gap: topic-x is unbookmarked (per registry) between two
+                // registered bookmarks
+                assert_eq!(stack.gaps.len(), 1);
+                assert_eq!(stack.gaps[0].before_bookmark, "feat-b");
+                assert_eq!(stack.gaps[0].after_bookmark.as_deref(), Some("feat-a"));
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_stack_registry_none_shows_all() {
+        // Same setup as above, but with None registry → all bookmarks produce segments
+        let entries = vec![
+            make_entry("ch1", "c1", &["feat-a"], false),
+            make_entry("ch2", "c2", &["topic-x"], false),
+            make_entry("ch3", "c3", &["feat-b"], true),
+        ];
+        let ids = short_ids(3);
+
+        match build_segments_and_gaps(&entries, &ids, None) {
+            StackResult::Ok(stack) => {
+                assert_eq!(stack.segments.len(), 3);
+                assert_eq!(stack.segments[0].bookmarks[0].name, "feat-a");
+                assert_eq!(stack.segments[1].bookmarks[0].name, "topic-x");
+                assert_eq!(stack.segments[2].bookmarks[0].name, "feat-b");
+                assert!(stack.gaps.is_empty());
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_stack_multi_bookmark_registry() {
+        // trunk <- c1(feat-a, topic-x, experiment, @)
+        // Only feat-a is registered. Commit has 3 bookmarks but only
+        // feat-a triggers the segment. All 3 bookmarks appear in the segment.
+        let entries = vec![make_entry(
+            "ch1",
+            "c1",
+            &["feat-a", "topic-x", "experiment"],
+            true,
+        )];
+        let ids = short_ids(1);
+        let registry = make_registry(&["feat-a"]);
+
+        match build_segments_and_gaps(&entries, &ids, Some(&registry)) {
+            StackResult::Ok(stack) => {
+                assert_eq!(stack.segments.len(), 1);
+                // All 3 bookmarks are listed on the segment
+                assert_eq!(stack.segments[0].bookmarks.len(), 3);
+                assert_eq!(stack.segments[0].bookmarks[0].name, "feat-a");
+                assert_eq!(stack.segments[0].bookmarks[1].name, "topic-x");
+                assert_eq!(stack.segments[0].bookmarks[2].name, "experiment");
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_stack_empty_registry_no_segments() {
+        // With an empty registry, no bookmarks are registered → no segments
+        let entries = vec![
+            make_entry("ch1", "c1", &["feat-a"], false),
+            make_entry("ch2", "c2", &["feat-b"], true),
+        ];
+        let ids = short_ids(2);
+        let registry = PlanRegistry::new(); // empty
+
+        match build_segments_and_gaps(&entries, &ids, Some(&registry)) {
+            StackResult::Ok(stack) => {
+                assert!(stack.segments.is_empty());
+                assert!(stack.gaps.is_empty());
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // narrow_segments tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_narrow_segments() {
+        // Build a stack with multi-bookmark segments, narrow to registered
+        let entries = vec![
+            make_entry("ch1", "c1", &["feat-a", "topic-x"], false),
+            make_entry("ch2", "c2", &["feat-b"], true),
+        ];
+        let ids = short_ids(2);
+        let registry = make_registry(&["feat-a", "feat-b"]);
+
+        match build_segments_and_gaps(&entries, &ids, Some(&registry)) {
+            StackResult::Ok(stack) => {
+                let narrowed = narrow_segments(&stack, &registry);
+                assert_eq!(narrowed.len(), 2);
+                // First segment narrowed to feat-a (the registered one)
+                assert_eq!(narrowed[0].bookmark.name, "feat-a");
+                assert_eq!(narrowed[0].changes.len(), 1);
+                // Second segment narrowed to feat-b
+                assert_eq!(narrowed[1].bookmark.name, "feat-b");
+                assert_eq!(narrowed[1].changes.len(), 1);
+            }
+            other => panic!("Expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_narrow_segments_picks_first_registered() {
+        // Commit has two registered bookmarks — narrow picks the first one
+        let entries = vec![make_entry("ch1", "c1", &["feat-a", "feat-b"], true)];
+        let ids = short_ids(1);
+        let registry = make_registry(&["feat-a", "feat-b"]);
+
+        match build_segments_and_gaps(&entries, &ids, Some(&registry)) {
+            StackResult::Ok(stack) => {
+                let narrowed = narrow_segments(&stack, &registry);
+                assert_eq!(narrowed.len(), 1);
+                assert_eq!(narrowed[0].bookmark.name, "feat-a");
             }
             other => panic!("Expected Ok, got {:?}", other),
         }
@@ -673,7 +888,7 @@ mod tests {
         ];
         let ids = short_ids(3);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.segments.len(), 1);
                 let seg = &stack.segments[0];
@@ -700,7 +915,7 @@ mod tests {
         ];
         let ids = short_ids(4);
 
-        match build_segments_and_gaps(&entries, &ids) {
+        match build_segments_and_gaps(&entries, &ids, None) {
             StackResult::Ok(stack) => {
                 assert_eq!(stack.gaps.len(), 1);
                 assert_eq!(stack.gaps[0].unbookmarked.len(), 2);
