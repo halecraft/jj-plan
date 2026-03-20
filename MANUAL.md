@@ -1,17 +1,21 @@
 # jj-plan Manual
 
-> Exhaustive command reference, best practices, and recipes.
+> Exhaustive command reference for `jj plan` and `jj stack`.
 
-For the project philosophy and quick start, see [README.md](README.md).
-For architecture and internals, see [TECHNICAL.md](TECHNICAL.md).
+For the quick-start guide, see [README.md](README.md). For architecture and internals, see [TECHNICAL.md](TECHNICAL.md).
 
 ---
 
 ## Overview
 
-jj-plan is a Rust binary that shadows the real `jj` binary on your `$PATH`. It intercepts mutating commands to keep a `.jj-plan/` directory in sync with the current stack's change descriptions. Read-only commands (`log`, `diff`, `show`, etc.) pass through with zero overhead.
+**jj-plan** is a transparent shim around [jj](https://github.com/jj-vcs/jj) (Jujutsu) that adds plan-oriented programming and stacked PR support. Install it as `jj` and it intercepts commands to keep `.jj-plan/` markdown files synchronized with change descriptions, then delegates to the real `jj` binary.
 
-Plans are stored as jj change descriptions — rich markdown documents that serve as the specification, context, and historical record for each unit of work. The `.jj-plan/` directory makes them co-editable as ordinary files.
+The tool provides two command namespaces:
+
+- **`jj plan`** — Create, navigate, and manage implementation plans.
+- **`jj stack`** — Visualize, submit, sync, and merge stacked PRs on GitHub and GitLab.
+
+All other `jj` commands pass through transparently with plan file synchronization.
 
 ---
 
@@ -19,57 +23,58 @@ Plans are stored as jj change descriptions — rich markdown documents that serv
 
 ### Plans
 
-A **plan** is a jj change whose description is the primary artifact. The description contains background, constraints, alternatives considered, and a step-by-step approach. The diff on that change is the implementation.
+A **plan** is a jj change whose description contains an implementation plan. The change is bookmarked, and a corresponding markdown file lives in `.jj-plan/`. The file and the description are kept in sync — edits to either propagate automatically.
 
-Plans are reviewed, debated, and validated *before* code is written. Once implementation is complete, `jj plan done` cleans working memory from the description and archives the plan in version history.
+Plans are written *before* code exists. They contain background, constraints, rationale, rejected alternatives, and concrete tasks. When submitted as a PR, the plan content becomes the PR description.
 
 ### Stacks
 
-A **stack** is a sequence of related plan changes. A stack is bounded by a bookmark registered in the **PlanRegistry** and placed **on the first change** (inclusive — the bookmarked change is a stack member). Changes from the bookmark through `@` and its descendants form the stack.
+A **stack** is the set of changes between `trunk()` and the working copy (including descendants): `trunk()..(@  | descendants(@))`. Within this range, bookmarked changes are **plan boundaries** — each bookmark = one plan = one PR.
 
-The PlanRegistry stores tracked plan bookmarks in `.jj/repo/jj-plan/plans.toml`. You register bookmarks with `jj plan track <bookmark>` and unregister them with `jj plan untrack <bookmark>`. The `jj plan new <bookmark>` command automatically registers its bookmark.
-
-If no registered bookmark is an ancestor of `@`, the binary falls back to `trunk()` as the base (exclusive — the trunk commit is not part of your stack).
+Unbookmarked changes are free-form work (WIP commits, experiments). They are not managed by jj-plan and are flagged as **gaps** at submit time.
 
 ### The `.jj-plan/` Directory
 
-The `.jj-plan/` directory is the sync surface between jj change descriptions and your filesystem. It must exist in the repo root to activate jj-plan features. Add it to your global gitignore.
+Created by `mkdir .jj-plan` to activate jj-plan in a repository. The binary maintains this directory automatically:
 
-| File | Description |
-|---|---|
-| `NN-CHANGEID.md` | Plan file for stack member at position NN (01 = closest to base). Content is synced bidirectionally with the jj change description. |
-| `current.md` | Symlink → the active change's plan file (whichever `NN-CHANGEID.md` corresponds to `@`). |
-| `.stack` | One-line-per-change summary of the full stack. Regenerated on every sync. |
-| `error.md` | Transient file created during error states (stack too large, ambiguous bookmarks). `current.md` points here during errors. Auto-cleared when the condition resolves. |
-| `template.md` | Optional custom plan template. Overrides the built-in default. See [Plan Templates](#plan-templates). |
+```
+.jj-plan/
+  current.md          → symlink to the active change's plan file
+  .stack              → one-line summary of the full stack
+  01-feat-auth.md     — first plan (closest to trunk)
+  02-feat-session.md  — second plan
+  03-feat-api.md      — third plan (tip)
+  template.md         — optional: custom plan template
+```
+
+Files are named `NN-BOOKMARKNAME.md` where `NN` is the 1-based position in the stack. Bookmarks containing `/` have slashes encoded as `--` in filenames (e.g., `stack/auth` → `01-stack--auth.md`).
 
 #### Status markers in `.stack`
 
-The `.stack` file uses single-character markers:
+The `.stack` file uses these markers:
 
 | Marker | Meaning |
 |---|---|
-| `*` | Working copy — you are here (`@`) |
-| `✓` | Done — description contains `plan-status: ✅` |
-| `~` | Has file changes (non-empty diff) |
-| ` ` | Empty change, not done, not working copy |
+| `*` | Working copy is here (`@`) |
+| `✓` | Plan is done (`plan-status: ✅` in description) |
+| `~` | Plan file has local changes (not yet flushed to description) |
 
 Example:
 
 ```
-  ✓ 01-kpqxywon :: Refactor auth middleware
-  ~ 02-mtzrlpvq :: Extract auth module
-*   03-ykvsnxrl :: Implement JWT strategy
-    04-abcdefgh :: Add API key support
+Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
+  ✓ 01-feat-auth    :: Extract auth module
+  ~ 02-feat-session  :: Implement session management
+*   03-feat-api      :: Add API endpoints
 ```
 
 ### Plan Status
 
-A plan is considered **done** when its description contains `plan-status: ✅` on its own line. This marker is appended by `jj plan done` and is idempotent — running `done` on an already-done plan does not duplicate the marker.
+A plan is considered **done** when its description contains `plan-status: ✅` on its own line. This is set by `jj plan done` and displayed in the stack summary.
 
 ### Working Memory (`[scratch]`)
 
-Any markdown heading suffixed with `[scratch]` (case-insensitive) designates a **working memory** section:
+Any markdown heading containing `[scratch]` marks a **working memory** section. These sections are shared workspace for humans and AI agents during implementation.
 
 ```markdown
 ## Analysis [scratch]
@@ -79,545 +84,476 @@ Approach B works but needs Y from the API.
 
 ### Sub-analysis [scratch]
 
-This is also working memory.
+Deeper investigation of approach B...
 ```
 
-Working memory conventions:
+`jj plan done` strips all `[scratch]` sections from the description, cleaning the archival record. Nested headings within scratch sections are also removed. The full working memory is always recoverable via `jj evolog`.
 
-- Use scratch sections for analysis, debugging notes, alternatives explored, open questions, and temporary context.
-- Scratch sections are **stripped** by `jj plan done`, cleaning the archival record.
-- The full pre-strip content is always recoverable via `jj evolog` (jj's evolution log).
-- Scratch stripping respects heading levels: a `## Foo [scratch]` section includes everything until the next `##` or higher-level heading.
-- Code fences inside scratch sections are handled correctly — headings inside fenced code blocks are not treated as section boundaries.
-- Use `--keep-scratch` on `jj plan done` to preserve scratch sections if desired.
+Scratch sections inside code fences are preserved (the `[scratch]` must be in an ATX heading, not in code).
 
 ### Change ID References (`jj:CHANGE_ID`)
 
-The `jj:CHANGE_ID` convention creates permanent, resolvable links between code and plans:
+Plans and code can reference other plans using `jj:CHANGE_ID`:
 
 ```rust
 // We bypass the cache here for consistency during concurrent writes.
 // Context: jj:kpqxywon
 ```
 
-Anyone can run `jj show kpqxywon` to retrieve the full plan. Change IDs are stable across rebase, amend, and rewrite operations — unlike git commit hashes.
+Anyone can run `jj show kpqxywon` to retrieve full context. Change IDs are stable across rebases and amends.
 
-Use `jj:CHANGE_ID` in:
+In plans, use `jj:CHANGE_ID` to reference sibling plans:
 
-- **Code comments** — link implementation to rationale.
-- **Plan descriptions** — reference other plans, forming a navigable knowledge graph.
-- **PR descriptions** — point reviewers to the full plan context.
+```markdown
+## Background
+
+This continues the work from jj:kpqxywon. See that plan for the
+constraints on the auth token format.
+```
 
 ---
 
-## Commands
+## `jj plan` Commands
 
-### `jj plan new`
+### `jj plan new <bookmark>`
 
-Create a new plan stack or add a plan change to an existing stack.
-
-**Synopsis:**
+Create a new plan: a jj change with a bookmark, registered in the PlanRegistry, with a templated plan file.
 
 ```
-jj plan new <bookmark-name> [-r REV] [jj-new-args...]
+jj plan new feat-auth
+jj plan new feat-session
 ```
 
-**Description:**
+**What it does:**
 
-Creates a new jj change, sets a bookmark with the given name on it, registers it in the PlanRegistry, and seeds the description with a plan template. If the bookmark already exists and is registered, the new change is inserted after the current working copy (`@`) within the existing stack, preserving stack linearity.
+1. Runs `jj new` to create a new change after the current one.
+2. Creates a bookmark with the given name on the new change.
+3. Registers the bookmark in the PlanRegistry (`.jj/repo/jj-plan/plans.toml`).
+4. Seeds the change description from the plan template.
+5. Syncs the `.jj-plan/` directory (creates the plan file, updates `current.md`).
 
-**Options:**
+**Arguments:**
 
-| Option | Description |
-|---|---|
-| `<bookmark-name>` | **Required.** The bookmark name for this plan stack. Creates the bookmark if it doesn't exist, or adds to the existing stack if it does. |
-| `-r REV` | Revision to create the new change after. Defaults to `@`. Use `-r main` to root a stack off the main branch. |
-| `--insert-after`, `-A`, `--insert-before`, `-B` | Forwarded to `jj new`. If any explicit positioning flag is present, the default `--insert-after @` is suppressed. |
+| Argument | Required | Description |
+|---|---|---|
+| `<bookmark>` | Yes | Name for the bookmark (e.g., `feat-auth`, `fix/login-bug`) |
 
-**Examples:**
+**Flags:**
 
-```sh
-# Start a new plan stack with a bookmark
-jj plan new auth-refactor
+Any flags not consumed by `jj plan new` are passed through to `jj new`:
 
-# Start a plan stack rooted off main
-jj plan new -r main auth-refactor
+- `-r <revset>` / `-A <revset>` — insert after a specific change instead of `@`
+- `-B <revset>` — insert before a specific change
 
-# Add another plan to an existing stack
-jj plan new auth-refactor
+**Errors:**
+
+- No bookmark name provided → error with usage hint.
+- Bookmark already exists → error (use `jj plan track` instead).
+
+---
+
+### `jj plan track <bookmark>`
+
+Register an existing bookmarked change as a plan. Use this to adopt changes that were created outside of `jj plan new`.
+
+```
+jj plan track feat-auth
 ```
 
-**Notes:**
+**What it does:**
 
-- The `<bookmark-name>` argument is required. Use any valid bookmark name — the old `stack`/`stack/*` naming convention is no longer needed.
-- The operation is atomic: if the bookmark set fails, the `jj new` is rolled back via `jj undo`.
-- The bookmark is set with `-B` (allow backwards move), so you can reuse bookmark names.
-- The bookmark is automatically registered in the PlanRegistry (`.jj/repo/jj-plan/plans.toml`).
-- The new change's description is seeded with the plan template (see [Plan Templates](#plan-templates)).
-- After creation, `.jj-plan/` is synced and the stack summary is displayed.
-- The default `--insert-after @` ensures the new change is a child of `@`, keeping the stack linear. This prevents the "sibling instead of child" issue that raw `jj new` can cause.
-- All unrecognized arguments are forwarded to the underlying `jj new` command.
+1. Verifies the bookmark exists.
+2. Registers it in the PlanRegistry.
+3. Syncs the `.jj-plan/` directory.
+
+---
+
+### `jj plan untrack <bookmark>`
+
+Remove a bookmark from plan tracking. The bookmark itself is not deleted — it just stops being managed by jj-plan.
+
+```
+jj plan untrack feat-auth
+```
 
 ---
 
 ### `jj plan done`
 
-Mark a plan as done, strip working memory, and advance.
-
-**Synopsis:**
+Mark a plan as done. Strips `[scratch]` sections and appends `plan-status: ✅` to the description. Automatically advances to the next undone plan.
 
 ```
-jj plan done [CHANGE_ID] [--stack] [--keep-scratch] [--dry-run]
+jj plan done                   # mark current plan (@) done
+jj plan done kpqxywon          # mark a specific change done
+jj plan done --stack            # mark all plans in the stack done
 ```
-
-**Description:**
-
-Marks a plan as complete by appending `plan-status: ✅` to its description and stripping all `[scratch]` sections. By default, operates on the current working copy (`@`) and advances to the next undone plan in the stack.
-
-**Options:**
-
-| Option | Description |
-|---|---|
-| `CHANGE_ID` | Target a specific change instead of `@`. |
-| `--stack` | Mark all plans in the stack as done. |
-| `--keep-scratch` | Skip `[scratch]` section stripping. |
-| `--dry-run` | Show what would be changed without modifying anything. |
-
-**Examples:**
-
-```sh
-# Mark the current plan done and advance to next undone plan
-jj plan done
-
-# Preview what would be stripped
-jj plan done --dry-run
-
-# Mark done but keep scratch sections
-jj plan done --keep-scratch
-
-# Mark a specific plan done
-jj plan done kpqxywon
-
-# Mark the entire stack done
-jj plan done --stack
-```
-
-**Behavior details:**
-
-- **Scratch stripping**: All headings with `[scratch]` (case-insensitive) and their content are removed. Nested headings within the scratch section are also removed. Code fences inside scratch sections are handled correctly. The pre-strip content is preserved in `jj evolog`.
-- **Done marker**: `plan-status: ✅` is appended on its own line. If already present, the marker is not duplicated (idempotent).
-- **Auto-advance**: When marking the working copy (`@`) as done (the default), the binary automatically `jj edit`s the next undone plan in the stack. Search is forward-then-wraparound. If all plans are done, a message is printed instead.
-- **`--stack` mode**: Marks every change in the stack as done. After completion, prints a suggestion to start a new stack. Does not auto-advance (since everything is done).
-- **`--dry-run` mode**: Prints the change ID, which scratch sections would be stripped, and whether the done marker would be appended. Makes no modifications.
-
----
-
-### `jj plan next`
-
-Advance to the next plan in the stack.
-
-**Synopsis:**
-
-```
-jj plan next
-```
-
-**Description:**
-
-Moves the working copy (`@`) to the next change in the stack via `jj edit`. If `@` is already the last plan, prints "Already at the last plan in the stack" and stays put.
-
-**Examples:**
-
-```sh
-jj plan next
-```
-
----
-
-### `jj plan prev`
-
-Move to the previous plan in the stack.
-
-**Synopsis:**
-
-```
-jj plan prev
-```
-
-**Description:**
-
-Moves the working copy (`@`) to the previous change in the stack via `jj edit`. If `@` is already the first plan, prints "Already at the first plan in the stack" and stays put.
-
-**Examples:**
-
-```sh
-jj plan prev
-```
-
----
-
-### `jj plan go`
-
-Jump to a specific plan by index, change ID, or bookmark name.
-
-**Synopsis:**
-
-```
-jj plan go <N | CHANGE_ID | BOOKMARK>
-```
-
-**Description:**
-
-Moves the working copy (`@`) to a specific plan. The target can be:
-
-- A **1-based index** matching the `NN-CHANGEID.md` file numbering (e.g., `1` for the first plan, `3` for the third).
-- A **change ID** (passed through to `jj edit -r`).
-- A **bookmark name** registered in the PlanRegistry (resolved to the bookmarked change).
-
-**Options:**
-
-| Option | Description |
-|---|---|
-| `N` | 1-based plan index. Must be in range `1` to stack size. |
-| `CHANGE_ID` | A jj change ID (or unique prefix). |
-| `BOOKMARK` | A bookmark name registered in the PlanRegistry. |
-
-**Examples:**
-
-```sh
-# Jump to the third plan in the stack
-jj plan go 3
-
-# Jump to a specific change by ID
-jj plan go kpqxywon
-
-# Jump to the base of a tracked bookmark's stack
-jj plan go auth-refactor
-```
-
-**Notes:**
-
-- Index `0` is an error (1-based, not 0-based).
-- Out-of-range indices produce an error with the valid range.
-- Bookmark names are checked against the PlanRegistry; unregistered bookmarks are not resolved.
-
----
-
-### `jj plan config`
-
-Show resolved configuration and stack info.
-
-**Synopsis:**
-
-```
-jj plan config
-```
-
-**Description:**
-
-Read-only introspection command. Prints all resolved configuration as key-value pairs. No flush, no sync, no side effects.
-
-**Output fields:**
-
-| Field | Description |
-|---|---|
-| `shim path` | Absolute path to the jj-plan binary. |
-| `real jj binary` | Absolute path to the real jj binary being shadowed. |
-| `repo root` | Absolute path to the repository root. |
-| `JJ_PLAN_DIR env` | Value of the `JJ_PLAN_DIR` environment variable, or `(not set)`. |
-| `JJ_PLAN_MAX env` | Maximum stack size (default: 50). |
-| `resolved dir` | Absolute path to the resolved plan directory. |
-| `resolution source` | How the plan directory was resolved: `env var`, `.jj-plan`, or `.jj-plans (legacy)`. |
-| `stack base` | Change ID or `trunk()` with range mode (`inclusive` or `exclusive`), or `(none)`. |
-| `stack size` | Number of changes in the current stack. |
-
-**Examples:**
-
-```sh
-jj plan config
-```
-
-Output:
-
-```
-jj-plan configuration:
-
-  shim path:        /Users/you/.local/bin/jj
-  real jj binary:   /opt/homebrew/bin/jj
-  repo root:        /Users/you/project
-
-  JJ_PLAN_DIR env:  (not set)
-  JJ_PLAN_MAX env:  50
-
-  resolved dir:     /Users/you/project/.jj-plan
-  resolution source: .jj-plan
-
-  stack base:       kpqxywon (inclusive)
-  stack size:       4
-```
-
----
-
-### `jj plan track`
-
-Register a bookmark in the PlanRegistry.
-
-**Synopsis:**
-
-```
-jj plan track <bookmark>
-```
-
-**Description:**
-
-Adds the given bookmark to the PlanRegistry (`.jj/repo/jj-plan/plans.toml`). Once tracked, the bookmark is recognized as a plan stack base during stack resolution. This is useful for adopting existing bookmarks as plan stacks without recreating them.
-
-**Examples:**
-
-```sh
-# Track an existing bookmark
-jj plan track my-feature
-```
-
-**Notes:**
-
-- If the bookmark is already tracked, this is a no-op.
-- The bookmark must exist in the repository.
-
----
-
-### `jj plan untrack`
-
-Remove a bookmark from the PlanRegistry.
-
-**Synopsis:**
-
-```
-jj plan untrack <bookmark>
-```
-
-**Description:**
-
-Removes the given bookmark from the PlanRegistry. The bookmark itself is not deleted — it remains in the repository, but it will no longer be recognized as a plan stack base during stack resolution.
-
-**Examples:**
-
-```sh
-# Stop tracking a bookmark
-jj plan untrack my-feature
-```
-
-**Notes:**
-
-- If the bookmark is not tracked, this is a no-op.
-- The bookmark and its changes are not affected — only the registry entry is removed.
-
----
-
-### `jj plan --help`
-
-Print a compact terminal summary of what jj-plan can do.
-
-**Synopsis:**
-
-```
-jj plan --help
-jj plan -h
-jj plan --help --color <WHEN>
-jj --color <WHEN> plan --help
-```
-
-**Description:**
-
-Use `jj plan --help` when you want quick terminal orientation: the mental model, the happy-path workflow, the available subcommands, and where to go next in the docs.
-
-This help screen is intentionally compact. It is the fast overview, not the exhaustive reference.
-
-**Color behavior:**
-
-`jj plan --help` follows jj-style color behavior:
-
-- `--color always` forces ANSI styling
-- `--color never` disables ANSI styling
-- `--color auto` follows terminal-aware default behavior
-- if no explicit `--color` flag is provided, jj-plan follows the resolved/default jj color mode
-
-**Subcommand help:**
-
-`jj plan new --help`, `jj plan track --help`, and other subcommand variants also show the top-level plan help screen. Per-subcommand documentation lives here in `MANUAL.md`, not in terminal help.
-
-**Notes:**
-
-- Use `jj plan --help` for the compact terminal summary.
-- Use `MANUAL.md` when you want the full command reference, examples, and recipes.
-- Use `README.md` for the project overview, philosophy, and quick start.
-- Use `TECHNICAL.md` for architecture and implementation details.
-
----
-
-## `jj stack` Commands
-
-The `jj stack` namespace provides stubs for stack-level operations. These commands operate on the stack as a whole rather than individual plans.
-
-> **Note:** These commands are stubs in the current release. They are defined for forward compatibility and will print a "not yet implemented" message.
-
-### `jj stack submit`
-
-Submit the current stack for review.
-
-```
-jj stack submit
-```
-
-**Status:** Stub — not yet implemented.
-
----
-
-### `jj stack sync`
-
-Synchronize the current stack with the remote.
-
-```
-jj stack sync
-```
-
-**Status:** Stub — not yet implemented.
-
----
-
-### `jj stack merge`
-
-Merge the current stack into the target branch.
-
-```
-jj stack merge
-```
-
-**Status:** Stub — not yet implemented.
-
----
-
-### `jj stack auth`
-
-Authenticate with the remote hosting provider.
-
-```
-jj stack auth
-```
-
-**Status:** Stub — not yet implemented.
-
----
-
-## Intercepted Commands
-
-jj-plan intercepts certain jj commands to provide plan-aware behavior. All other mutating commands go through the standard wrap lifecycle (flush pending edits → run command → sync plan files → show stack).
-
-### `jj describe`
-
-**Behavior:** When `jj describe -m "..."` is used with the `-m` / `--message` flag, jj-plan writes the message to the corresponding plan file *before* running the command. This ensures the plan file is always the source of truth.
-
-- **`-m` / `--message` mode**: The message is written to the plan file for the target change (default: `@`). Multiple `-m` values are concatenated with newlines (matching jj behavior). The command then proceeds through the standard wrap lifecycle — flush picks up the file write, `jj describe` sets the same content (idempotent), and sync reads it back.
-- **Editor mode** (no `-m`): Passes through to the standard wrap lifecycle without interception. Whatever you write in the editor is picked up by sync afterward.
-- **`-r` / `--revision`**: Respected — the message is written to the plan file for the specified revision, not necessarily `@`.
-
-**Notes:**
-
-- This interception eliminates the old "NEVER call `jj describe` directly" rule from the zsh shim era.
-- All `-m` / `-r` argument forms are supported: `-m VALUE`, `-mVALUE`, `--message VALUE`, `--message=VALUE`, `-r VALUE`, `-rVALUE`, `--revision VALUE`, `--revision=VALUE`.
-
-### `jj abandon`
-
-**Behavior:** jj-plan protects stack bookmarks from accidental loss during abandon operations.
-
-1. **Before abandon**: Snapshots the bookmark state — which change holds it, whether it's the working copy, and its first child.
-2. **Runs `jj abandon`** with all original arguments.
-3. **After abandon**: Checks if the bookmark survived. If lost:
-   - Tries moving the bookmark to the first child of the abandoned change.
-   - If no child but the abandoned change was `@`, moves to the new `@`.
-   - If recovery target found, moves the bookmark and prints a message.
-   - If recovery fails, prints a WARNING with manual instructions: `jj bookmark set NAME -r <change>`.
 
 **Flags:**
 
 | Flag | Description |
 |---|---|
-| `--retain-bookmarks` | Bypasses the recovery handler entirely. |
+| `--stack` | Mark all plans in the stack as done |
+| `--keep-scratch` | Don't strip `[scratch]` sections |
+| `--dry-run` | Show what would change without writing |
+
+**Behavior:**
+
+1. Reads the plan's description.
+2. Strips all `[scratch]` sections (unless `--keep-scratch`).
+3. Appends `plan-status: ✅` if not already present.
+4. Writes the cleaned description back via `jj describe`.
+5. Advances `@` to the next undone plan (if any).
+
+---
+
+### `jj plan next`
+
+Navigate to the next plan in the stack (toward the tip).
+
+```
+jj plan next
+```
+
+Runs `jj edit` on the next plan segment's tip change. Skips WIP (unbookmarked) changes.
+
+---
+
+### `jj plan prev`
+
+Navigate to the previous plan in the stack (toward trunk).
+
+```
+jj plan prev
+```
+
+---
+
+### `jj plan go <target>`
+
+Jump to a specific plan by position number, bookmark name, or change ID.
+
+```
+jj plan go 2                   # jump to plan #2 (1-based index)
+jj plan go feat-auth           # jump to the plan for feat-auth
+jj plan go kpqxywon            # jump by change ID
+```
+
+---
+
+### `jj plan config`
+
+Show resolved configuration and plan state. Useful for debugging.
+
+```
+jj plan config
+```
+
+**Output includes:**
+
+- Plan directory path
+- PlanRegistry contents (tracked bookmarks)
+- Stack state (segments, gaps)
+- Template resolution (which template file is active)
+
+---
+
+### `jj plan --help`
+
+Show the help screen with all plan commands, global options, and a brief mental model explanation.
+
+```
+jj plan --help
+jj plan -h
+```
+
+---
+
+## `jj stack` Commands
+
+### `jj stack`
+
+Show the stack visualization with bookmark structure, sync status, and PR status.
+
+```
+jj stack
+```
+
+**Output:**
+
+```
+  ◉ feat-api (@)
+  │ Add API endpoints
+  │
+  ○ feat-session (synced, PR #43)
+  │ Implement session management
+  │
+  ○ feat-auth (synced, PR #42)
+  │ Extract auth module
+  │
+  ◆ trunk()
+```
+
+**Legend:**
+
+| Symbol | Meaning |
+|---|---|
+| `◉` | Working copy (`@`) |
+| `○` | Other bookmarked change |
+| `◆` | Trunk (base of stack) |
+| `@` | Working copy indicator |
+| `✓` | Plan is done |
+| `synced` | Bookmark is pushed to remote |
+| `PR #N` | PR exists for this bookmark (from PR cache) |
+
+If the stack has gaps (unbookmarked changes between bookmarks), a warning is shown.
+
+---
+
+### `jj stack submit [bookmark]`
+
+Push bookmarks and create or update PRs on GitHub or GitLab.
+
+```
+jj stack submit                # submit up to the tip-most bookmark near @
+jj stack submit feat-auth      # submit up to a specific bookmark
+jj stack submit --dry-run      # preview without making changes
+jj stack submit --draft        # create new PRs as drafts
+jj stack submit --allow-gaps   # allow unbookmarked changes between bookmarks
+jj stack submit --remote upstream  # specify the remote
+```
+
+**What it does:**
+
+1. Builds the stack and analyzes what needs to be submitted.
+2. Checks for gaps (unbookmarked changes between bookmarks).
+3. For each bookmark in the submission chain:
+   - Pushes the bookmark to the remote.
+   - Creates a new PR if none exists, or updates an existing PR's base branch if needed.
+4. PR title and body come from the plan file content:
+   - **Title** = first line of the plan file.
+   - **Body** = remainder of the plan file, with `[scratch]` sections stripped and `plan-status: ✅` lines removed.
+5. Updates the local PR cache (`.jj/repo/jj-plan/pr-cache.toml`).
+
+**Arguments:**
+
+| Argument | Required | Description |
+|---|---|---|
+| `[bookmark]` | No | Submit up to this bookmark. Default: tip-most bookmarked segment near `@`. |
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview what would be done without making changes |
+| `--draft` | Create new PRs as drafts |
+| `--allow-gaps` | Allow unbookmarked changes between bookmarks |
+| `--remote <name>` | Specify the remote to push to (default: `origin`) |
+
+**Gap detection:**
+
+If unbookmarked changes exist between bookmarked plans, submission is refused with an actionable error:
+
+```
+Error: unbookmarked changes detected between bookmarks.
+
+  change xyzw (between feat-auth and feat-session)
+    "wip: debugging auth flow"
+
+Options:
+  - Squash into adjacent bookmark: jj squash --from xyzw --into feat-auth
+  - Give it its own bookmark:      jj bookmark create <name> -r xyzw
+  - Allow gaps explicitly:          jj stack submit --allow-gaps
+```
+
+**Platform detection:**
+
+The platform (GitHub or GitLab) is auto-detected from git remote URLs. Self-hosted instances are supported via `GH_HOST` and `GITLAB_HOST` environment variables.
+
+---
+
+### `jj stack sync`
+
+Fetch from the remote and re-submit the stack. This is the combination of fetch + submit.
+
+```
+jj stack sync                  # fetch and re-submit
+jj stack sync --dry-run        # preview without making changes
+jj stack sync --remote upstream
+```
+
+**What it does:**
+
+1. Fetches from the remote (updates tracking branches).
+2. Reloads the workspace.
+3. Runs the submit pipeline (push + create/update PRs).
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview what would be done |
+| `--remote <name>` | Specify the remote |
+
+---
+
+### `jj stack merge`
+
+Merge approved PRs from the bottom of the stack upward.
+
+```
+jj stack merge                 # merge all approved PRs
+jj stack merge --dry-run       # preview the merge plan
+jj stack merge --remote upstream
+```
+
+**What it does:**
+
+1. Fetches PR details and merge readiness for all bookmarks in the stack.
+2. Creates a merge plan: starting from the bottom, merge each PR that is approved and passing CI. Stop at the first non-mergeable PR.
+3. Executes the merges via the platform API.
+4. Post-merge cleanup:
+   - Removes merged bookmarks from the PR cache.
+   - Deletes merged local bookmarks.
+   - Removes merged plan files from `.jj-plan/`.
+   - Fetches the updated trunk.
+
+**Merge readiness requirements:**
+
+A PR is ready to merge when:
+
+- It is approved (at least one approving review on GitHub, or approved on GitLab).
+- CI is passing (commit statuses + check runs on GitHub, pipeline on GitLab).
+- It is not a draft.
+- It has no merge conflicts.
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview the merge plan without merging |
+| `--remote <name>` | Specify the remote |
+
+---
+
+### `jj stack auth <platform> <action>`
+
+Manage authentication for GitHub and GitLab.
+
+```
+jj stack auth github test      # test GitHub authentication
+jj stack auth github setup     # show GitHub setup instructions
+jj stack auth gitlab test      # test GitLab authentication
+jj stack auth gitlab setup     # show GitLab setup instructions
+```
+
+**Token resolution order:**
+
+| Platform | Priority |
+|---|---|
+| GitHub | `gh auth token` → `GITHUB_TOKEN` → `GH_TOKEN` |
+| GitLab | `glab auth token` → `GITLAB_TOKEN` → `GL_TOKEN` |
+
+---
+
+## Intercepted Commands
+
+The following `jj` commands receive special handling before being delegated to the real `jj` binary.
+
+### `jj describe`
+
+When invoked with `-m` / `--message`, the message is written to the plan file first, then the normal `jj describe` runs. This ensures the plan file remains the source of truth.
+
+```sh
+jj describe -m "Updated approach: use JWT instead of sessions"
+# Writes to the plan file, THEN delegates to jj describe
+```
+
+Without `-m`, the command passes through normally (opens the editor on the raw description).
+
+### `jj abandon`
+
+Delegated to the real `jj` with post-mutation plan sync. If a plan's change is abandoned, the corresponding plan file is removed on the next sync.
 
 ### `jj status` / `jj st`
 
-**Behavior:** `jj status` is not in the read-only passthrough list. It goes through the full wrap lifecycle (flush → command → sync → show), which means:
-
-1. Pending plan file edits are flushed to jj descriptions.
-2. `jj status` runs normally.
-3. Plan files are synced from the current jj state.
-4. The plan stack summary is appended to the output.
-
-This ensures the plan stack display is always up-to-date.
+Runs the real `jj status`, then appends the plan stack summary from `.jj-plan/.stack`.
 
 ### Read-only passthrough commands
 
-The following commands bypass jj-plan entirely via Unix `exec` (zero overhead):
+These commands get zero-overhead passthrough via `exec` (the process is replaced, no plan sync):
 
 `log`, `diff`, `show`, `interdiff`, `evolog`, `file`, `config`, `help`, `version`, `root`, `tag`, `op`, `operation`, `util`, `git`, `gerrit`, `sign`, `unsign`, `workspace`
 
 ### All other mutating commands
 
-Commands not listed above (`new`, `edit`, `rebase`, `squash`, `split`, `move`, `bookmark`, etc.) go through the standard wrap lifecycle:
+Commands like `new`, `edit`, `rebase`, `squash`, `split`, `bookmark`, etc. go through the **wrap lifecycle**:
 
-1. Flush all pending plan file edits to jj descriptions.
-2. Run the command with inherited stdio.
-3. Reload the repository state.
-4. Re-resolve the stack and sync plan files.
-5. Display the plan stack summary.
+1. **Flush** — Write local plan file edits to jj descriptions.
+2. **Run** — Execute the real `jj` command.
+3. **Reload** — Refresh the in-process repo snapshot.
+4. **Sync** — Update `.jj-plan/` files from the repo state.
+5. **Show** — Display the updated stack summary.
 
 ---
 
 ## Plan Templates
 
-New plan changes created by `jj plan new` are seeded with a template.
-
 ### Built-in default template
 
-```markdown
-(plan: jj:{{CHANGE_ID}})
-```
+New plans are seeded with a single self-referencing summary line:
 
-The built-in default is intentionally minimal — just the self-referencing summary line `(plan: jj:CHANGE_ID)`. This signals "this is an unedited plan" while embedding a stable self-reference. The binary does not impose any plan structure; developers who want sections (Background, Tasks, Scratchpad, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
+```
+feat: <brief summary>
+```
 
 ### Template resolution chain
 
-Templates are resolved in order:
-
-1. **`JJ_PLAN_TEMPLATE` environment variable** → read the file at that path.
-2. **`.jj-plan/template.md`** → read the file if it exists.
-3. **Built-in default** (shown above).
-
-If an env var or file is empty or unreadable, the next source in the chain is tried.
+1. `$JJ_PLAN_TEMPLATE` environment variable (path to a file).
+2. `.jj-plan/template.md` in the repository.
+3. Built-in default (single summary line).
 
 ### `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation
 
-All occurrences of `{{CHANGE_ID}}` in the template are replaced with the actual change ID of the new plan. All occurrences of `{{BOOKMARK}}` are replaced with the bookmark name associated with the plan stack. If a custom template contains no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line, ensuring every plan has a self-reference.
+Templates can include `{{CHANGE_ID}}` (replaced with the new change's short ID) and `{{BOOKMARK}}` (replaced with the bookmark name):
+
+```markdown
+feat: {{BOOKMARK}}
+
+## Background
+
+Context: jj:{{CHANGE_ID}}
+
+## Tasks
+
+- [ ] ...
+
+## Notes [scratch]
+```
 
 ### Custom template example
 
 Create `.jj-plan/template.md`:
 
 ```markdown
-{{CHANGE_ID}}: untitled
+feat: {{BOOKMARK}}
 
 ## Goal
 
+What should be true when this is done?
 
 ## Design
 
+How will it work?
 
 ## Checklist
 
-- [ ]
+- [ ] Implementation
+- [ ] Tests
+- [ ] Documentation
 
 ## Notes [scratch]
 
+Working memory goes here.
 ```
 
 ---
@@ -628,167 +564,203 @@ Create `.jj-plan/template.md`:
 
 Override the plan directory path.
 
-| | |
-|---|---|
-| **Default** | Auto-resolved: `.jj-plan/` in repo root, then `.jj-plans/` (legacy fallback) |
-| **Values** | Absolute or relative path to the plan directory |
-
-When set, the env var is used as-is — no existence check, no fallback to `.jj-plan/` or `.jj-plans/`.
-
 ```sh
-# Use a custom directory
-export JJ_PLAN_DIR=/tmp/my-plans
+export JJ_PLAN_DIR=".plans"    # use .plans/ instead of .jj-plan/
 ```
+
+**Resolution:** The binary checks for `.jj-plan/` first, then `.jj-plans/`. `JJ_PLAN_DIR` overrides both.
 
 ### `JJ_PLAN_MAX`
 
-Maximum number of changes in a stack before refusing to sync.
-
-| | |
-|---|---|
-| **Default** | `50` |
-| **Values** | Any positive integer |
-
-When the stack exceeds this limit, an error state is set: `current.md` points to `error.md`, and sync is paused until the stack shrinks.
+Maximum stack size before refusing to sync. Prevents accidental sync of enormous stacks.
 
 ```sh
-# Allow larger stacks
-export JJ_PLAN_MAX=100
-
-# Restrict to small stacks
-export JJ_PLAN_MAX=5
+export JJ_PLAN_MAX=100         # allow up to 100 plans (default: 50)
 ```
 
 ### `JJ_PLAN_TEMPLATE`
 
 Override the plan template file path.
 
-| | |
-|---|---|
-| **Default** | `.jj-plan/template.md` in the plan directory, then the built-in default |
-| **Values** | Path to a markdown file |
+```sh
+export JJ_PLAN_TEMPLATE="$HOME/.config/jj-plan/template.md"
+```
+
+### `GITHUB_TOKEN` / `GH_TOKEN`
+
+GitHub personal access token. Used as a fallback when the `gh` CLI is not available.
+
+Required scope: `repo`
+
+### `GITLAB_TOKEN` / `GL_TOKEN`
+
+GitLab personal access token. Used as a fallback when the `glab` CLI is not available.
+
+Required scope: `api`
+
+### `GH_HOST`
+
+Hostname for GitHub Enterprise instances. Default: `github.com`.
 
 ```sh
-# Use a team-shared template
-export JJ_PLAN_TEMPLATE=~/.config/jj-plan/template.md
+export GH_HOST="github.mycompany.com"
+```
+
+### `GITLAB_HOST`
+
+Hostname for self-hosted GitLab instances. Default: `gitlab.com`.
+
+```sh
+export GITLAB_HOST="gitlab.mycompany.com"
 ```
 
 ---
 
 ## Recipes
 
+### Submit your first stacked PR
+
+```sh
+mkdir .jj-plan                     # activate jj-plan
+jj plan new feat-auth              # create first plan
+$EDITOR .jj-plan/current.md       # write the plan
+# ... implement ...
+jj plan new feat-session           # create second plan
+$EDITOR .jj-plan/current.md       # write the plan
+# ... implement ...
+jj stack auth github test          # verify authentication
+jj stack submit                    # push and create PRs
+```
+
+### Update PRs after making changes
+
+```sh
+# Edit code or plan files...
+jj stack submit                    # re-push and update existing PRs
+# OR
+jj stack sync                      # fetch first, then re-submit
+```
+
+### Merge approved PRs and rebase the stack
+
+```sh
+jj stack merge                     # merges from the bottom of the stack
+# Automatically: deletes merged bookmarks, fetches trunk, cleans plan files
+```
+
+### Work with draft PRs
+
+```sh
+jj stack submit --draft            # create PRs as drafts
+# Later, when ready for review:
+jj stack submit                    # existing PRs are not re-created, just pushed
+```
+
+### Handle gap warnings
+
+When unbookmarked changes exist between bookmarks:
+
+```sh
+# Option 1: squash the WIP into an adjacent plan
+jj squash --from <change> --into feat-auth
+
+# Option 2: give it its own bookmark
+jj bookmark create fix-typo -r <change>
+jj plan track fix-typo
+
+# Option 3: allow gaps (the WIP diff is absorbed into the next bookmark's PR)
+jj stack submit --allow-gaps
+```
+
+### Adopt an existing change as a plan
+
+```sh
+jj bookmark create feat-search -r <change>   # create a bookmark on the change
+jj plan track feat-search                     # register it as a plan
+```
+
+### Authenticate with GitHub Enterprise
+
+```sh
+export GH_HOST="github.mycompany.com"
+gh auth login --hostname github.mycompany.com
+jj stack auth github test          # verify it works
+```
+
+### Preview submission without making changes
+
+```sh
+jj stack submit --dry-run
+```
+
 ### Find all work descended from a plan
 
 ```sh
-jj log -r 'descendants(CHANGE_ID) & ~empty()'
+jj log -r 'descendants(kpqxywon)'
 ```
 
 ### Find plan references in code
 
 ```sh
-grep -roh 'jj:[a-z]\+' src/ | sort -u
+grep -r 'jj:' src/ --include='*.rs'
 ```
 
 ### Resolve a plan reference to its full context
 
 ```sh
-jj show kpqxywon
+jj show kpqxywon                   # full plan description + diff
 ```
 
 ### List all tracked plan bookmarks
 
 ```sh
-jj plan config   # shows tracked bookmarks from the PlanRegistry
+jj plan config                     # shows PlanRegistry contents
 ```
 
 ### Show what scratch content was stripped
 
-After `jj plan done`, the pre-strip content is preserved in the evolution log:
-
 ```sh
-# Show the evolution history of a change
-jj evolog -r CHANGE_ID
-
-# Show the diff between the last two versions of a description
-jj evolog -r CHANGE_ID -p
+jj evolog -r kpqxywon              # see all versions, including pre-done
+jj show kpqxywon@<operation>       # view a specific version
 ```
-
-### Extract the same section from prior plans
-
-Because plans are structured markdown in version history, you can pull the same section from earlier plans to compare decisions, post-implementation reflections, alternatives considered, and patterns.
-
-```sh
-# Pull one named section from an earlier plan
-jj show rtssrkto --git 2>&1 | grep -A5 "Post-implementation Reflections"
-
-# Search for the same heading across multiple plans
-jj log -r '::@' -T 'change_id.shortest() ++ " " ++ description.first_line() ++ "\n"' \
-| grep '^[a-z]'
-```
-
-This is especially useful when your plans share consistent headings such as `## Alternatives Considered`, `## Post-implementation Reflections`, or `## Risks`. Humans and AI can reuse the relevant slice of prior reasoning without rereading the entire plan.
-
-### Cross-reference plans
-
-Reference other plans by change ID in your plan description:
-
-```markdown
-## Background
-
-This continues the work started in jj:kpqxywon. The approach differs
-from jj:mtzrlpvq because we discovered that...
-```
-
-Anyone can follow the link: `jj show kpqxywon`.
 
 ### Navigate the stack by position
 
 ```sh
-jj plan next          # advance to next plan
-jj plan prev          # go to previous plan
-jj plan go 3          # jump to plan #3
-jj plan go kpqxywon   # jump to a specific change
+jj plan go 1                       # jump to the first plan (closest to trunk)
+jj plan go 3                       # jump to the third plan
+jj plan next                       # advance one plan toward tip
+jj plan prev                       # go back one plan toward trunk
 ```
 
 ### Inspect resolved configuration
 
 ```sh
-jj plan config
+jj plan config                     # shows plan dir, registry, stack, template
 ```
-
-Shows the shim path, real jj binary, resolved plan directory, stack base, and stack size.
 
 ### Start a new stack after finishing
 
 ```sh
-# The old stack's bookmark stays — no cleanup needed
-jj plan new next-task
-
-# Or root it off main
-jj plan new -r main next-task
+jj plan done --stack               # mark everything done
+jj new                             # start fresh on trunk
+jj plan new next-feature           # new stack begins
 ```
 
-### Work with multiple concurrent stacks
+### Cross-reference plans
 
-```sh
-# Create named stacks
-jj plan new auth-refactor
-# ... work ...
-jj plan new -r main api-keys
+Plans can reference each other by change ID:
 
-# List all tracked plan bookmarks
-jj plan config
+```markdown
+## Background
 
-# The binary automatically picks the nearest registered ancestor bookmark
+This builds on the auth module from jj:kpqxywon.
+The session store design was validated in jj:mtzrlpvq.
 ```
-
-### Use plans without a tracked bookmark
-
-If your repo has a remote with `trunk()` configured (e.g., `main@origin`), you don't need a tracked bookmark at all. The binary falls back to `trunk()` as an exclusive base — all changes between trunk and `@` form the stack.
 
 ---
 
 ## See Also
 
-- [README.md](README.md) — Project overview, philosophy, and quick start.
-- [TECHNICAL.md](TECHNICAL.md) — Architecture, internals, performance, and testing.
+- [README.md](README.md) — Quick start and overview
+- [TECHNICAL.md](TECHNICAL.md) — Architecture and internals

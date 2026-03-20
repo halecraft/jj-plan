@@ -95,12 +95,7 @@ pub fn build_sync_views(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
     stack_to_sync_changes(&stack_result, workspace, &registry)
 }
 
-/// A lightweight view of a stack change for sync/flush compatibility.
-///
-/// Bridges the new `Stack`/`BookmarkSegment`/`LogEntry` types with sync.rs's
-/// existing `StackChange`-shaped interface. This adapter is temporary — it
-/// will be removed when sync.rs is updated to accept `Stack` directly in a
-/// later plan.
+/// A lightweight view of a stack change for sync and flush.
 ///
 /// Each `SyncChangeView` represents one entry in the `.stack` summary file
 /// and one plan file `NN-{bookmark_name}.md`.

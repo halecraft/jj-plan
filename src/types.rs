@@ -41,8 +41,7 @@ pub struct Bookmark {
 
 /// A commit/change entry from jj log.
 ///
-/// Rich representation of a single commit, combining data from both
-/// jj-plan's `StackChange` and jj-ryu's `LogEntry`.
+/// Rich representation of a single commit/change from jj log.
 ///
 /// `change_id` stores full standard hex (64 chars). Use
 /// `Workspace::short_change_id()` for CLI-facing short reverse-hex.
@@ -78,15 +77,11 @@ pub struct LogEntry {
 
 impl LogEntry {
     /// First line of the description, for display in `.stack` summary.
-    ///
-    /// Migrated from `StackChange::first_line()`.
     pub fn first_line(&self) -> &str {
         self.description.lines().next().unwrap_or("")
     }
 
     /// Whether the description contains `plan-status: ✅`.
-    ///
-    /// Migrated from `StackChange::is_done()`.
     pub fn is_done(&self) -> bool {
         self.description.starts_with("plan-status: ✅")
             || self.description.contains("\nplan-status: ✅")

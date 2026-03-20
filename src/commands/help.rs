@@ -267,7 +267,7 @@ pub fn build_plan_help() -> PlanHelp {
         notes: vec![
             "`jj status` shows the current plan stack.",
             "`.jj-plan/current.md` is the main editing surface.",
-            "`jj stack submit/sync/merge` — PR operations (coming soon).",
+            "`jj stack submit/sync/merge` — stacked PR operations.",
         ],
         docs: vec![
             HelpEntry {

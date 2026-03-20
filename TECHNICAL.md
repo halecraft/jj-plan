@@ -1,599 +1,552 @@
 # jj-plan Technical Reference
 
-> Architecture and internals of the jj-plan Rust binary.
+> Architecture, internals, and implementation details.
+
+For the quick-start guide, see [README.md](README.md). For the command reference, see [MANUAL.md](MANUAL.md).
+
+---
 
 ## Overview
 
-jj-plan is a Rust binary installed as `jj` in `$PATH`, shadowing the real jj binary. It intercepts mutating commands to keep a `.jj-plan/` directory in sync with the current stack's change descriptions. Read-only commands (`log`, `diff`, `show`, etc.) pass through with zero overhead via Unix `exec`.
+jj-plan is a Rust binary (~11,700 lines) that shadows the real `jj` binary. It provides two capabilities:
 
-The binary resolves the real `jj` binary by walking `$PATH` and skipping itself (via `std::fs::canonicalize` comparison). Repository reads (stack resolution, commit metadata, bookmark enumeration) use **jj-lib** for in-process access (~1ms startup, sub-millisecond reads). Mutations (`jj describe`, `jj new`, `jj edit`, `jj abandon`, `jj bookmark set`) use CLI subprocess calls because the CLI handles working copy snapshotting, auto-rebase, and user-facing output. Repo root discovery uses a filesystem walk for `.jj/` (no subprocess).
+1. **Plan management** — Bidirectional sync between `.jj-plan/` markdown files and jj change descriptions, with navigation, templating, and working memory lifecycle.
+2. **Stacked PRs** — Push bookmarks as PRs to GitHub or GitLab, with plan content as PR descriptions, stack-aware base branch targeting, merge readiness checks, and post-merge cleanup.
 
-If jj-lib cannot load the repository (version mismatch, corrupt state), the binary degrades gracefully to exec passthrough — the jj command runs directly without plan sync features.
+Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with zero overhead. Mutating commands go through the wrap lifecycle: flush pending edits → run command → reload → sync plan files → show stack.
+
+---
 
 ## See Also
 
-- [README.md](README.md) — Project overview, philosophy, and quick start.
-- [MANUAL.md](MANUAL.md) — Exhaustive command reference, best practices, and recipes.
+- [README.md](README.md) — Project overview, philosophy, quick start
+- [MANUAL.md](MANUAL.md) — Exhaustive command reference, recipes
+
+---
 
 ## Project Structure
 
-| Module | Lines | Responsibility |
+| Module | Lines | Description |
 |---|---|---|
-| `src/main.rs` | 127 | Argument parsing, top-level dispatch, read-only passthrough, jj-lib repo loading |
-| `src/jj_binary.rs` | 144 | Real jj binary resolution, `exec`/`run_inherit`/`run_silent` helpers |
-| `src/plan_dir.rs` | 208 | Repo root discovery, plan directory resolution (env → `.jj-plan/` → `.jj-plans/`) |
-| `src/repo.rs` | 621 | In-process repository access via jj-lib: workspace loading, revset evaluation, commit reads, bookmark enumeration |
-| `src/stack.rs` | 52 | Shared domain types: `StackBase` enum, `StackChange` struct |
-| `src/sync.rs` | 577 | FC/IS sync: gather → plan → execute, `.stack` generation |
-| `src/flush.rs` | 219 | FC/IS flush: gather (jj-lib) → plan → execute (`jj describe` subprocess) |
-| `src/wrap.rs` | 95 | Unified mutating command lifecycle: flush → command → reload → resolve_and_sync |
-| `src/markdown.rs` | 633 | `[scratch]` section stripping, code fence immunity, heading-level scoping |
-| `src/template.rs` | 297 | Plan template resolution, `{{CHANGE_ID}}` interpolation |
-| `src/plan_file.rs` | 310 | Plan file parsing, I/O helpers with error observability |
-| `src/error.rs` | 37 | `JjPlanError` enum via `thiserror` |
-| `src/commands/mod.rs` | 73 | `jj plan` subcommand dispatch |
-| `src/commands/config.rs` | 68 | `jj plan config` — read-only introspection (jj-lib reads) |
-| `src/commands/help.rs` | 645 | Top-level `plan --help` classification, color-mode resolution, structured help rendering |
-| `src/commands/new.rs` | 189 | `jj plan new <bookmark>` — plan stack/change creation with PlanRegistry |
-| `src/commands/track.rs` | ~60 | `jj plan track <bookmark>` — register bookmark in PlanRegistry |
-| `src/commands/untrack.rs` | ~60 | `jj plan untrack <bookmark>` — remove bookmark from PlanRegistry |
-| `src/registry.rs` | ~120 | PlanRegistry — persistence layer for tracked plan bookmarks |
-| `src/commands/done.rs` | 303 | `jj plan done` — completion marking, scratch stripping, advance |
-| `src/commands/nav.rs` | 159 | `jj plan next`/`prev`/`go` — stack navigation |
-| `src/commands/abandon.rs` | 121 | `jj abandon` — bookmark recovery handler (jj-lib reads, subprocess writes) |
-| `src/commands/describe.rs` | 334 | `jj describe` — interception for `-m` mode |
+| `src/main.rs` | 149 | Entry point, command dispatch |
+| `src/error.rs` | 110 | `JjPlanError` enum (~25 variants) |
+| `src/types.rs` | 575 | All domain types: `Bookmark`, `LogEntry`, `Stack`, `PlanRegistry`, PR/platform types |
+| `src/workspace.rs` | 972 | Unified jj-lib wrapper: reads + git write operations |
+| `src/stack_builder.rs` | 1079 | Stack construction, gap detection, `collect_submission_chain()` |
+| `src/wrap.rs` | 194 | Wrap lifecycle, `resolve_and_sync()`, `SyncChangeView` |
+| `src/flush.rs` | 294 | Plan file → jj description sync (file is authoritative) |
+| `src/sync.rs` | 660 | jj description → plan file sync (jj is authoritative post-flush) |
+| `src/plan_file.rs` | 655 | Plan file parsing, bookmark name encoding, legacy migration |
+| `src/plan_dir.rs` | 208 | Repo root and plan directory resolution |
+| `src/plan_registry.rs` | 229 | PlanRegistry persistence (`.jj/repo/jj-plan/plans.toml`) |
+| `src/pr_cache.rs` | 252 | PR cache persistence (`.jj/repo/jj-plan/pr-cache.toml`) |
+| `src/stack_context.rs` | 94 | Shared context for `jj stack` commands |
+| `src/markdown.rs` | 633 | `strip_scratch_sections()` with code fence awareness |
+| `src/template.rs` | 293 | Plan template resolution and interpolation |
+| `src/jj_binary.rs` | 144 | Real jj binary discovery |
+| `src/platform/mod.rs` | 52 | `PlatformService` async trait |
+| `src/platform/github.rs` | 276 | GitHub implementation (octocrab) |
+| `src/platform/gitlab.rs` | 487 | GitLab implementation (reqwest) |
+| `src/platform/detection.rs` | 137 | URL → platform detection |
+| `src/platform/factory.rs` | 31 | Service construction with auth |
+| `src/auth/mod.rs` | 17 | `AuthSource` enum |
+| `src/auth/github.rs` | 88 | gh CLI + env var token resolution |
+| `src/auth/gitlab.rs` | 110 | glab CLI + env var token resolution |
+| `src/submit/mod.rs` | 13 | Submit engine re-exports |
+| `src/submit/analysis.rs` | 127 | Submission analysis, plan-to-PR content bridge |
+| `src/submit/plan.rs` | 133 | Execution step planning (push/create/retarget) |
+| `src/submit/execute.rs` | 144 | Step execution with progress callbacks |
+| `src/submit/progress.rs` | 85 | `ProgressCallback` trait, `NoopProgress` |
+| `src/merge/mod.rs` | 9 | Merge engine re-exports |
+| `src/merge/plan.rs` | 171 | Pure merge planning (two-pass algorithm) |
+| `src/merge/execute.rs` | 75 | Merge execution via platform API |
+| `src/commands/stack_cmd.rs` | 993 | `jj stack` dispatch, submit/sync/merge/auth CLI |
+| `src/commands/done.rs` | 315 | `jj plan done` with scratch stripping |
+| `src/commands/describe.rs` | 379 | `jj describe -m` interception |
+| `src/commands/new.rs` | 195 | `jj plan new` bookmark creation |
+| `src/commands/nav.rs` | 273 | `jj plan next/prev/go` navigation |
+| `src/commands/help.rs` | 639 | `jj plan --help` rendering |
+| `src/commands/config.rs` | 92 | `jj plan config` introspection |
+| `src/commands/track.rs` | 107 | `jj plan track` |
+| `src/commands/untrack.rs` | 88 | `jj plan untrack` |
+| `src/commands/abandon.rs` | 20 | `jj abandon` delegation |
+| `src/commands/mod.rs` | 126 | `jj plan` subcommand dispatch |
 
-Total: ~4,723 lines of Rust across 21 source files.
+---
 
-## Repo Root and Plan Directory Resolution
+## Workspace (`src/workspace.rs`)
 
-### Repo Root Discovery
+The `Workspace` struct wraps `jj_lib::workspace::Workspace` and `Arc<ReadonlyRepo>`, providing all in-process repository access.
 
-The repo root is discovered by walking up from `std::env::current_dir()` looking for a `.jj/` directory, via `find_repo_root()` in `src/plan_dir.rs`. This mirrors the logic in jj's own CLI (`cli/src/cli_util.rs::find_workspace_dir()`). It replaces the previous approach of shelling out to `jj root` (~15ms subprocess overhead eliminated).
+### Design: "Path A" — jj-lib for reads, CLI for writes
 
-If no `.jj/` directory is found in any ancestor, the command is passed through to the real `jj` binary (which will produce its own "not in a repo" error).
+- **Reads** (revset evaluation, bookmark queries, description reads) use jj-lib's in-process API — no subprocess overhead.
+- **Mutations** (`jj describe`, `jj new`, `jj edit`, `jj abandon`, `jj bookmark set`) use subprocess calls because the CLI handles working copy snapshotting, auto-rebase, and conflict resolution.
+- **Git operations** (fetch, push, rebase, delete-bookmark) use jj-lib's in-process API directly, since they operate on the git backend and don't need working copy interaction.
 
-### Plan Directory Resolution
+### Cached repo snapshot
 
-Fallback chain (after repo root is known):
+Unlike ryu's `JjWorkspace` (which re-loads at head on every call), jj-plan caches the repo and refreshes only via explicit `reload()` calls after CLI mutations.
 
-1. **`JJ_PLAN_DIR` env var** — if set, used as-is (absolute or relative). No further fallback.
-2. **`$repo_root/.jj-plan/`** — preferred default.
-3. **`$repo_root/.jj-plans/`** — legacy fallback (silent, no warning).
-4. **None found** — `exec` to real jj (full passthrough, not activated).
+For git write operations, the pattern is:
+1. `self.reload()` to get fresh state before starting a transaction.
+2. `self.repo.start_transaction()` to begin the write.
+3. `tx.commit(description)` returns the new `Arc<ReadonlyRepo>`.
+4. `self.repo = new_repo` to update the cached snapshot.
 
-When `.jj-plan/` and `.jj-plans/` both exist, `.jj-plan/` wins.
+### Git write operations
 
-Implementation: `src/plan_dir.rs` — `find_repo_root()` returns `Option<PathBuf>`, `resolve_plan_dir()` returns `Option<PlanDir>` with `PlanDirSource` enum.
-
-## PlanRegistry
-
-The PlanRegistry replaces the old `stack` / `stack/*` bookmark naming convention with an explicit registry of tracked plan bookmarks. For user-facing documentation, see [MANUAL.md § Stacks](MANUAL.md#stacks).
-
-### Persistence model
-
-Tracked bookmarks are stored in `.jj/repo/jj-plan/plans.toml`:
-
-```toml
-# .jj/repo/jj-plan/plans.toml
-[plans]
-bookmarks = ["auth-refactor", "api-keys", "phase2"]
-```
-
-The file is created automatically when the first bookmark is registered (via `jj plan new <bookmark>` or `jj plan track <bookmark>`). It lives inside the `.jj/repo/` directory so it is per-repo, not per-working-copy, and is not visible to the working tree.
-
-### API
-
-The `PlanRegistry` struct (`src/registry.rs`) provides:
+Added in jj:zypnnqyt. Adapted from ryu's `JjWorkspace` for jj-lib 0.38:
 
 | Method | Purpose |
 |---|---|
-| `load(repo_root)` | Load the registry from `plans.toml`, returning empty if not found |
-| `save()` | Write the registry back to `plans.toml` |
-| `track(bookmark)` | Add a bookmark to the registry (idempotent) |
-| `untrack(bookmark)` | Remove a bookmark from the registry (idempotent) |
-| `is_tracked(bookmark)` | Check if a bookmark is registered |
-| `bookmarks()` | Return all tracked bookmark names |
+| `git_remotes()` | List all git remotes with URLs (via gix) |
+| `default_branch()` | Detect default branch from remote HEAD, fallback to main/master/trunk |
+| `git_fetch(remote)` | Fetch + import refs + rebase descendants |
+| `git_push(bookmark, remote)` | Export refs + push + update tracking ref |
+| `rebase_bookmark_onto_trunk(bookmark)` | Resolve trunk/bookmark via revset, use `move_commits` |
+| `delete_bookmark(bookmark)` | Set local bookmark target to absent |
 
-### Inclusive model
+### jj-lib 0.37 → 0.38 migration
 
-The bookmark is placed **on the first change in the stack**, not before it. The bookmarked change is a stack member. This is the natural instinct — you mark the work itself:
+Three breaking changes were resolved:
 
-```
-○ landed work
-○ feat: SchemaRef          ← auth-refactor (first member, tracked in PlanRegistry)
-○ feat: typed interpret
-○ refactor: remove casts
-@ docs: update TECHNICAL
-```
+1. **`RemoteCallbacks` → `GitSubprocessCallback`**: A `NoopGitCallback` struct implements the 4-method trait (`needs_progress`, `progress`, `local_sideband`, `remote_sideband`).
+2. **`expand_fetch_refspecs()` takes `GitFetchRefExpression`**: The struct has `bookmark: StringExpression` and `tag: StringExpression` fields instead of a bare `StringExpression`.
+3. **`GitFetch::fetch()` trailing params**: Now typed as `Option<NonZeroU32>` (depth) and `Option<FetchTagsOverride>`.
 
-### Resolution algorithm
+---
 
-Resolution is implemented in `resolve_stack_base_lib()` in `src/repo.rs`. The function now accepts `Option<&PlanRegistry>` for registry-based filtering:
+## Stack Model (`src/stack_builder.rs`)
 
-1. **Registered bookmarks** — reads the PlanRegistry, builds a revset from all tracked bookmark names, evaluates `heads((<registered bookmarks revset>) & ::@)`. If exactly one head: **inclusive** range (`base::@`). The bookmarked change IS the first stack member. If multiple equidistant heads: error (ambiguous siblings).
-2. **`trunk()`** — if it resolves to something other than `root()`: **exclusive** range (`trunk()..@`). The trunk commit is NOT part of the stack.
-3. **No usable base** — no sync occurs.
+### Revset
 
-Both modes also include `descendants(@)` to capture changes ahead of the working copy.
-
-Returns `StackBase` enum: `Inclusive(change_id)`, `Exclusive`, or `Ambiguous(Vec<change_id>)`.
-
-### Nearest-ancestor resolution
-
-When multiple registered bookmarks are ancestors of `@`, the **nearest** one wins automatically. This means you can have multiple stacks in your history and the binary always picks the right one:
+The stack is everything between trunk and the working copy:
 
 ```
-○ phase1 (old, farther from @, tracked in PlanRegistry)
-○ phase 1 work
-○ phase2 (nearer to @, wins, tracked in PlanRegistry)
-○ phase 2 work
-@ current
+trunk()..(@  | descendants(@))
 ```
 
-If two registered bookmarks are equidistant siblings (e.g., a merge of two branches each with their own bookmark), `StackBase::Ambiguous` is returned and an error is produced asking the user to advance or remove one.
+This range is evaluated via jj-lib's in-process revset engine. The result is walked in topological order (parents before children) and partitioned into segments.
 
-### Fallback to `trunk()`
+### Segments and gaps
 
-If no registered bookmark is an ancestor of `@`, the binary falls back to `trunk()` (if it resolves to something other than `root()`). The trunk fallback uses an **exclusive** range — the trunk commit is not part of your stack, since you don't own it.
+A **segment** is a contiguous run of changes ending at a bookmarked commit. The bookmark is at the tip. Segments are ordered trunk (index 0) to tip (last index).
 
-If neither a registered bookmark nor `trunk()` can be resolved, no sync occurs.
+A **gap** is a set of unbookmarked changes between two segments. Gaps are detected during stack construction and flagged at submit time.
 
-### "Done" workflow
+### PlanRegistry filtering
 
-When you finish a stack, you don't need to move or delete any bookmarks. Just start a new stack:
+When `build_stack()` receives a `PlanRegistry`, only bookmarks registered in the registry produce segments. Non-registered bookmarks are treated as if they don't exist — their changes are absorbed into adjacent segments or become gap material.
 
-```sh
-jj plan new next-task                  # atomic: creates change + sets bookmark + registers in PlanRegistry
+### Key functions
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `build_stack` | `(&Workspace, Option<&PlanRegistry>) → StackResult` | Build the full stack |
+| `find_submit_target` | `(&Stack) → Option<&BookmarkSegment>` | Find the segment nearest to `@` |
+| `narrow_segments` | `(&Stack, &PlanRegistry) → Vec<NarrowedBookmarkSegment>` | One bookmark per segment |
+| `collect_submission_chain` | `(&Stack, &str) → Result<SubmissionChain, String>` | Trunk-to-target chain with gaps |
+
+---
+
+## Command Dispatch (`src/main.rs`)
+
+```
+args[0] match:
+  "plan"      → commands::dispatch_plan()
+  "stack"     → commands::stack_cmd::dispatch_stack()
+  "abandon"   → commands::abandon::run_abandon()
+  "describe"  → commands::describe::handle_describe()
+  read-only?  → exec(jj, args)     // zero overhead
+  other       → wrap::wrap()        // flush → run → reload → sync → show
 ```
 
-The old bookmark stays where it is — it's historical and remains in the PlanRegistry. The binary automatically picks the new, nearer bookmark as the active stack base. The old stack's plan files are replaced by the new stack's. Use `jj plan untrack old-task` to clean up if desired.
-
-### `build_stack()` registry filtering
-
-The `build_stack()` function (used internally by sync and display) now accepts `Option<&PlanRegistry>`. When `Some(registry)` is provided, only bookmarks present in the registry are considered as potential stack bases. When `None` is passed, the function falls back to `trunk()` only. This allows callers to control whether registry-based resolution is used.
-
-## Command Dispatch
-
-```
-jj [global options] <subcommand> [args...]
-│
-├─ top-level `plan --help` invocation? ─→ classify help path, resolve color, render help, exit 0
-├─ no subcommand or read-only? ─────────→ exec $REAL_JJ (zero overhead)
-├─ no repo root or no plan dir? ────────→ exec $REAL_JJ (not activated)
-├─ "plan" ──────────────────────────────→ subcommand dispatch:
-│   ├─ "--help" / "-h" as subcommand ───→ print_help(), exit 0
-│   ├─ sub_args contain --help/-h? ─────→ print_help(), exit 0 (no side effects)
-│   ├─ "plan new <bookmark>" ───────────→ plan stack/change creation (templated, PlanRegistry)
-│   ├─ "plan track <bookmark>" ─────────→ register bookmark in PlanRegistry
-│   ├─ "plan untrack <bookmark>" ───────→ remove bookmark from PlanRegistry
-│   ├─ "plan done" ─────────────────────→ mark done, strip [scratch], advance
-│   │     ├─ --stack ───────────────────→ mark all plans done
-│   │     ├─ --keep-scratch ────────────→ skip [scratch] stripping
-│   │     └─ --dry-run ─────────────────→ preview what would change
-│   ├─ "plan next" ─────────────────────→ advance @ to next plan in stack
-│   ├─ "plan prev" ─────────────────────→ move @ to previous plan in stack
-│   ├─ "plan go" ───────────────────────→ jump to plan by index, change ID, or bookmark name
-│   ├─ "plan config" ───────────────────→ read-only introspection
-│   └─ anything else ───────────────────→ usage error (suggests --help)
-├─ "stack" ─────────────────────────────→ jj stack dispatch:
-│   ├─ "stack submit" ──────────────────→ stub (not yet implemented)
-│   ├─ "stack sync" ────────────────────→ stub (not yet implemented)
-│   ├─ "stack merge" ──────────────────→ stub (not yet implemented)
-│   ├─ "stack auth" ───────────────────→ stub (not yet implemented)
-│   └─ anything else ───────────────────→ usage error (suggests --help)
-├─ "abandon" ───────────────────────────→ bookmark recovery handler
-├─ "describe" ──────────────────────────→ -m interception (write to plan file first)
-├─ "status/st/new/edit" ────────────────→ wrap::wrap()
-└─ everything else ─────────────────────→ wrap::wrap() (catch-all)
-```
-
-The `plan --help` path is intentionally handled before repo-root and plan-directory resolution. This makes `jj plan --help` work even outside an activated repo and also fixes invocations where jj-style global options appear before `plan`, such as `jj --color always plan --help`.
-
-Subcommand-level `--help` (e.g. `jj plan new --help`, `jj plan go --help`) is intercepted by a central guard in `dispatch_plan` that scans `&args[2..]` for `--help`/`-h` before any handler is called. This ensures no flush, describe, or sync occurs — the help is pure read-only. The `sub_args_request_help()` helper function handles the check uniformly for all subcommands including those that don't use a `sub_args` slice (like `go`, `next`, `prev`).
-
-Read-only commands are listed in `READONLY_COMMANDS` in `src/main.rs`. Note that `status`/`st` are NOT in that list — they get the flush→sync→show treatment to display the stack. Also note that the new normalization is intentionally narrow in scope: it recognizes the top-level help path cleanly without attempting full generic normalization of all jj global options for every custom subcommand.
+Before dispatch:
+1. Resolve the real jj binary.
+2. Check for `plan --help` early.
+3. Find repo root and plan directory.
+4. Open `Workspace` via jj-lib. If loading fails, degrade to passthrough.
 
 ### `jj stack` dispatch
 
-The `jj stack` namespace is handled in `src/main.rs` alongside the `plan` dispatch. When the first argument is `stack`, dispatch routes to stub handlers:
+```
+args[1] match:
+  None        → show_stack_visualization()
+  "--help"    → print_stack_help()
+  "submit"    → run_submit()         // tokio block_on
+  "sync"      → run_sync()           // tokio block_on
+  "merge"     → run_merge()          // tokio block_on
+  "auth"      → run_auth()           // tokio block_on
+```
 
-- `jj stack submit` — prints "not yet implemented" and exits 0.
-- `jj stack sync` — prints "not yet implemented" and exits 0.
-- `jj stack merge` — prints "not yet implemented" and exits 0.
-- `jj stack auth` — prints "not yet implemented" and exits 0.
-
-Unknown `jj stack` subcommands produce a usage error suggesting `--help`. The `jj stack` namespace is reserved for future stack-level operations (submit for review, sync with remote, merge to target branch, authenticate with hosting provider).
-
-## Plan Help Rendering (`src/commands/help.rs`)
-
-For user-facing documentation, examples, and the role of terminal help vs the manual, see [MANUAL.md § jj plan --help](MANUAL.md#jj-plan---help).
-
-The help implementation now follows a small FC/IS shape:
-
-1. **GATHER** — classify whether the invocation is the top-level `plan --help` path and extract help-relevant global options such as `--color <WHEN>` / `--color=<WHEN>`.
-2. **PLAN** — build a structured `PlanHelp` model containing the title, mental model, happy-path workflow, command list, options, notes, and docs pointers.
-3. **EXECUTE** — render the model as either plain text or ANSI-styled output.
-
-Color mode follows jj-style precedence for the help path:
-
-1. Explicit `--color` flag on the invocation
-2. Resolved/default jj color mode from `ui.color`
-3. Terminal-aware fallback behavior for `auto`
-
-The renderer supports `always`, `never`, `auto`, and `debug`, and uses jj-like styling cues (emphasized section headings and highlighted command labels) while remaining compact enough for terminal scanning. Unit tests focus on the high-risk pure seams: invocation classification, color-mode resolution, and plain-vs-ANSI rendering.
+---
 
 ## Flush/Sync Lifecycle
 
-All mutating commands go through `wrap::wrap()` in `src/wrap.rs`:
+The wrap lifecycle is the core mechanism that keeps plan files and jj descriptions in sync.
 
+### Phase 1: Flush (`src/flush.rs`)
+
+**Direction:** Plan file → jj description.
+
+For each plan file in `.jj-plan/`:
+1. Read the file content.
+2. Resolve the bookmark name from the filename.
+3. Look up the bookmark → change ID mapping via workspace bookmarks.
+4. Read the current jj description for that change.
+5. If the file content differs from the description, run `jj describe` to update.
+
+This makes the plan file authoritative — any local edits to `.jj-plan/*.md` take precedence over the jj description.
+
+### Phase 2: Run the jj command
+
+The real `jj` command runs with inherited stdio. Its exit code is captured.
+
+### Phase 3: Reload
+
+`workspace.reload()` refreshes the cached `Arc<ReadonlyRepo>` to reflect the command's mutations.
+
+### Phase 4: Sync (`src/sync.rs`)
+
+**Direction:** jj description → plan file.
+
+Uses a **gather → plan → execute** architecture:
+
+1. **Gather**: Read `.jj-plan/` to build a `CurrentPlanState` (file list, bookmark-to-filename map).
+2. **Plan** (pure): Compare current state with the stack from jj-lib. Produce a `SyncPlan`:
+   - Files to remove (bookmarks no longer in stack).
+   - Files to rename (same bookmark, different index).
+   - Files to write (description changed in jj).
+   - Symlink target (which file `current.md` points to).
+   - Stack summary content (for `.stack`).
+3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `.stack`.
+
+### Phase 5: Show stack
+
+Print the `.stack` file to stderr.
+
+---
+
+## File Naming (`src/plan_file.rs`)
+
+Plan files are named `NN-BOOKMARKNAME.md`:
+
+- `NN` = zero-padded position in the stack (01 = closest to trunk).
+- `BOOKMARKNAME` = bookmark name with `/` encoded as `--`.
+
+Examples:
+- `feat-auth` → `01-feat-auth.md`
+- `stack/auth` → `02-stack--auth.md`
+- `user/feature/login` → `03-user--feature--login.md`
+
+### Legacy migration
+
+Files matching the old `NN-CHANGEID.md` pattern (8+ chars of `[k-z]` reverse-hex) are automatically renamed to the new format during `resolve_and_sync()`.
+
+---
+
+## PlanRegistry (`src/plan_registry.rs`)
+
+Persistent state stored at `.jj/repo/jj-plan/plans.toml`:
+
+```toml
+version = 1
+
+[[bookmarks]]
+name = "feat-auth"
+change_id = "aabbccddee..."
+planned_at = "2025-01-15T10:30:00Z"
+
+[[bookmarks]]
+name = "feat-session"
+change_id = "ffeeddccbb..."
+planned_at = "2025-01-15T11:00:00Z"
 ```
-flush_all()          ← files → jj (before the command; reads via jj-lib, writes via subprocess)
-jj.run_inherit()     ← the actual jj command (subprocess)
-loaded_repo.reload() ← refresh jj-lib snapshot after the mutation (~0.2ms)
-resolve_and_sync()   ← re-resolve stack via jj-lib, sync files, show summary
-```
 
-**Ordering is critical**: flush before command ensures user edits are written to jj descriptions before the command modifies state. After the subprocess command mutates the repository, `reload()` refreshes the in-process `ReadonlyRepo` snapshot so that `resolve_and_sync()` sees the new state via jj-lib.
+The registry handles jj workspace indirection — in child workspaces (created via `jj workspace add`), `.jj/repo` is a text file pointing to the parent's repo directory. `resolve_repo_path()` reads this pointer transparently.
 
-### resolve_and_sync (`src/wrap.rs`)
+---
 
-`resolve_and_sync()` is the canonical post-mutation sync path. It:
+## Platform Layer (`src/platform/`)
 
-1. Resolves the stack base via jj-lib (`repo::resolve_stack_base_lib`)
-2. Resolves stack changes via jj-lib (`repo::resolve_stack_changes_lib`)
-3. Handles ambiguous bookmarks (sets error state)
-4. Calls `sync()` to update plan files
-5. Calls `show_stack()` to display the summary
+### `PlatformService` trait
 
-All command modules (`nav.rs`, `done.rs`, `new.rs`, `stack.rs`, `abandon.rs`) use this single function instead of maintaining their own sync helpers. All reads are in-process via jj-lib — no subprocess calls.
+An async trait (via `async_trait`) with 12 methods covering the full PR lifecycle:
 
-### Flush (`src/flush.rs`)
-
-Structured as FC/IS (Functional Core / Imperative Shell):
-
-1. **Gather** (`gather_flush_state`): Reads plan file contents from disk via `plan_file::plan_files_by_id()`, batch-reads jj descriptions via jj-lib (`repo::gather_descriptions()`).
-2. **Plan** (`plan_flush`): Pure function — compares file contents against jj descriptions, produces `Vec<FlushAction>` for changes that differ.
-3. **Execute** (`execute_flush`): Shells out to `jj describe -r CHANGEID -m CONTENT` for each action. This is the only subprocess usage in flush — all reads are jj-lib.
-
-Skips flushing when in error state (`current.md` → `error.md`).
-
-### Sync (`src/sync.rs`)
-
-Also FC/IS:
-
-1. **Gather** (`gather_current_state`): Reads the plan directory once, builds a map of existing `NN-CHANGEID.md` files.
-2. **Plan** (`plan_sync`): Pure function — given current files and stack changes from jj, computes:
-   - Files to remove (changes no longer in stack)
-   - Files to rename (reindexing after stack reorder)
-   - Files to write (description content)
-   - Symlink target for `current.md`
-   - `.stack` summary content
-   - Error/warning conditions
-3. **Execute** (`execute_sync`): Applies the plan — removes, renames, writes files, updates symlink.
-
-## Repository Access
-
-All repository reads use **jj-lib** for in-process access (`src/repo.rs`). The workspace and repository are loaded once at startup via `load_repo()` (~1ms), then refreshed after each CLI mutation via `LoadedRepo::reload()` (~0.2ms, calls `ReadonlyRepo::reload_at_head()`).
-
-### LoadedRepo lifecycle
-
-```
-main.rs: load_repo()     → LoadedRepo { workspace, repo }    (~1ms)
-wrap.rs: flush_all()     → reads via jj-lib (repo is fresh)
-         jj command      → subprocess mutation
-         repo.reload()   → refresh ReadonlyRepo snapshot      (~0.2ms)
-         resolve_and_sync() → reads via jj-lib (repo is fresh)
-```
-
-Commands that read stack state after `flush_all()` (which may call `jj describe`) must call `loaded_repo.reload()` before their reads to pick up flush mutations.
-
-### Read functions (`src/repo.rs`)
-
-| Function | Purpose |
+| Method | Purpose |
 |---|---|
-| `resolve_stack_base_lib()` | Find nearest registered bookmark (via `Option<&PlanRegistry>`) or `trunk()` fallback |
-| `resolve_stack_changes_lib()` | Evaluate stack revset, return ordered `Vec<StackChange>` |
-| `batch_read_changes_lib()` | Evaluate arbitrary revset, return `Vec<StackChange>` |
-| `gather_descriptions()` | Read descriptions for plan file comparison (flush) |
-| `read_change_id_at_wc()` | Working copy's shortest change ID |
-| `read_description_at()` | Single change description by revset target |
-| `resolve_change_id()` | Resolve revset to shortest change ID |
-| `snapshot_bookmark_state()` | Pre-abandon bookmark snapshot for recovery |
-| `stack_bookmark_survives()` | Post-abandon bookmark existence check |
-| `commit_exists()` | Check if a revset target resolves |
-| `first_child_change_id()` | First child of a change (for abandon recovery) |
+| `find_existing_pr(head)` | Find open PR for a branch |
+| `create_pr_with_options(head, base, title, body, draft)` | Create a PR |
+| `update_pr_base(number, new_base)` | Retarget a PR |
+| `publish_pr(number)` | Convert draft → ready |
+| `list_pr_comments(number)` | List comments |
+| `create_pr_comment(number, body)` | Post comment |
+| `update_pr_comment(number, comment_id, body)` | Edit comment |
+| `config()` | Get platform config |
+| `get_pr_details(number)` | Extended details for merge |
+| `check_merge_readiness(number)` | Approval + CI + conflict checks |
+| `merge_pr(number, method)` | Perform merge |
 
-All functions use jj-lib's revset engine (`revset::parse()` → `resolve_user_expression()` → `evaluate()`) and commit API (`Commit::description()`, `Commit::change_id()`, `Commit::parent_tree()`).
+### GitHub implementation (`src/platform/github.rs`)
 
-| `build_stack()` | Build stack changes, accepts `Option<&PlanRegistry>` for registry-based filtering |
+Uses `octocrab` (typed GitHub client) for REST and GraphQL operations. The `publish_pr` method uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API doesn't support this. CI status is checked via both the legacy Combined Status API and the modern Check Runs API.
 
-### Domain types (`src/stack.rs`)
+### GitLab implementation (`src/platform/gitlab.rs`)
 
-```rust
-pub struct StackChange {
-    pub change_id: String,      // shortest(8) prefix, reverse hex (k-z alphabet)
-    pub description: String,    // full description text
-    pub is_empty: bool,         // no file changes
-    pub is_working_copy: bool,  // is @
-    pub bookmarks: Vec<String>, // bookmark names
-}
+Uses raw `reqwest` against the GitLab v4 REST API with `PRIVATE-TOKEN` authentication. The project path is URL-encoded for nested groups (e.g., `group%2Fsubgroup%2Frepo`).
+
+### Platform detection (`src/platform/detection.rs`)
+
+Detects GitHub or GitLab from git remote URLs via regex matching on SSH (`git@host:owner/repo.git`) and HTTPS (`https://host/owner/repo.git`) formats. Self-hosted instances are supported via `GH_HOST` and `GITLAB_HOST` environment variables.
+
+---
+
+## Authentication (`src/auth/`)
+
+Token resolution follows a priority chain:
+
+| Platform | Priority |
+|---|---|
+| GitHub | `gh auth token` → `$GITHUB_TOKEN` → `$GH_TOKEN` |
+| GitLab | `glab auth token --hostname <host>` → `$GITLAB_TOKEN` → `$GL_TOKEN` |
+
+CLI tool invocations use `tokio::process::Command` (async subprocess). Token tests validate the token against the platform API (`/user` endpoint for GitLab, octocrab's current user for GitHub).
+
+---
+
+## Submit Engine (`src/submit/`)
+
+Three-phase pipeline:
+
+### Phase 1: Analysis (`analysis.rs`)
+
+- Takes a `Stack` and `PlanRegistry`, narrows to one-bookmark-per-segment via `narrow_segments()`.
+- Identifies the target bookmark (explicit or default to tip-most).
+- Provides `get_base_branch()`: previous bookmark name or default branch.
+- **Plan-to-PR bridge** (`plan_file_to_pr_content()`): reads the plan file, first line = PR title, remainder = PR body with `[scratch]` stripped and `plan-status: ✅` removed.
+
+### Phase 2: Planning (`plan.rs`)
+
+For each segment in the chain:
+1. Push the bookmark (always).
+2. Check for an existing PR via the platform API.
+3. If no PR → `CreatePr` step with plan-derived title/body.
+4. If PR exists with wrong base → `UpdateBase` step.
+
+### Phase 3: Execution (`execute.rs`)
+
+Processes steps sequentially:
+- `Push`: `workspace.git_push(bookmark, remote)`
+- `CreatePr`: `platform.create_pr_with_options(...)`
+- `UpdateBase`: `platform.update_pr_base(number, new_base)`
+
+Supports `dry_run` mode (logs steps without executing). The `ProgressCallback` trait provides hooks for CLI output.
+
+---
+
+## Merge Engine (`src/merge/`)
+
+### Merge planning (`plan.rs`)
+
+Pure function. Two-pass algorithm:
+
+1. **Pass 1**: Walk segments bottom-to-top. For each:
+   - If PR is approved, CI passing, not draft, no conflicts → `Merge` step.
+   - Otherwise → `Skip` step. All subsequent segments are also skipped (can't merge out of order).
+2. **Pass 2**: After each `Merge` step, insert a `RetargetBase` step for the next PR (retarget to trunk, since the merged PR's branch no longer exists).
+
+### Merge execution (`execute.rs`)
+
+Processes steps sequentially, stops on first failure or skip. Retarget failures are non-fatal (warning only).
+
+### Post-merge cleanup (in `stack_cmd.rs`)
+
+After successful merges:
+1. Remove merged bookmarks from PR cache.
+2. Delete merged local bookmarks via `workspace.delete_bookmark()`.
+3. Remove merged plan files from `.jj-plan/`.
+4. Fetch updated trunk via `workspace.git_fetch()`.
+
+---
+
+## PR Cache (`src/pr_cache.rs`)
+
+Stored at `.jj/repo/jj-plan/pr-cache.toml`:
+
+```toml
+version = 1
+
+[[prs]]
+bookmark = "feat-auth"
+number = 42
+url = "https://github.com/owner/repo/pull/42"
+remote = "origin"
+updated_at = "2025-01-15T12:00:00Z"
 ```
 
-Change IDs use jj's **reverse hex encoding** (`zyxwvutsrqponmlk` alphabet, not standard hex `0123456789abcdef`). This is critical: standard hex overlaps with commit ID prefixes and causes revset resolution failures. Use `jj_lib::hex_util::encode_reverse_hex()`.
+- **Populated** by `jj stack submit` after creating or finding PRs.
+- **Consulted** by `jj stack submit` (create vs update decision), `jj stack merge` (PR number lookup), and `jj stack` visualization (PR status display).
+- **Cleaned** by `jj stack merge` (removes entries for merged bookmarks).
+- **Safe to delete** — rebuilt on next submit.
+
+Uses `resolve_repo_path()` from `plan_registry.rs` for workspace indirection.
+
+---
+
+## Async Boundary
+
+The jj-plan binary is fundamentally synchronous. Async code is confined to `jj stack` commands:
+
+```
+dispatch_stack()
+  → run_submit() / run_sync() / run_merge() / run_auth()
+    → tokio::runtime::Builder::new_current_thread().enable_all().build()
+      → rt.block_on(async { ... })
+        → StackContext::new()          // async: auth + platform detection
+        → create_submission_plan()     // async: platform.find_existing_pr()
+        → execute_submission()         // async: platform.create_pr() etc.
+```
+
+A single-threaded tokio runtime is created per `jj stack` command invocation. The runtime is dropped when the command completes. This avoids adding the `rt-multi-thread` feature to tokio (binary size savings).
+
+**Why async?** `octocrab` (the GitHub client library) is async-only. Blocking alternatives would require replacing it with raw HTTP calls, losing the typed API. The tokio overhead is acceptable (~1MB binary size increase).
+
+---
 
 ## Markdown Processing (`src/markdown.rs`)
 
-The `strip_scratch_sections()` function implements a line-oriented state machine:
+The `strip_scratch_sections()` function removes `[scratch]`-annotated heading sections:
 
-- **Heading detection**: ATX headings (`# ` through `###### `) parsed for level (1-6).
-- **`[scratch]` detection**: Case-insensitive match on `[scratch]` anywhere in the heading line.
-- **Scope**: A `[scratch]` heading strips all content until a heading of the **same or higher level** (≤ N `#` marks) or end of document.
-- **Code fence immunity**: Lines inside ``` or ~~~ fences are never treated as headings. Fence closer must match opener character and have ≥ opener count. Backtick info strings are handled correctly.
+1. Track code fence state (backtick and tilde fences).
+2. Detect ATX headings (`#` through `######`).
+3. When a heading contains `[scratch]` (case-insensitive), start stripping.
+4. Stop stripping when a heading of the same or higher level is encountered.
+5. Headings inside code fences are never treated as section boundaries.
 
-20 unit tests cover edge cases including: nested headings, code fences with info strings, mixed-case `[scratch]`, multiple scratch sections, adjacent headings, and fence character mismatch.
+Edge cases handled: multiple scratch sections, nested headings, fence char matching, empty input, entire document as scratch.
+
+---
 
 ## Plan Templates (`src/template.rs`)
 
-Template resolution chain:
+Resolution chain:
+1. `$JJ_PLAN_TEMPLATE` environment variable (path to file).
+2. `.jj-plan/template.md` in the repository.
+3. Built-in default (minimal summary line).
 
-1. **`JJ_PLAN_TEMPLATE` env var** → read file at that path
-2. **`.jj-plan/template.md`** → read file if it exists
-3. **Built-in default** (embedded in binary as `DEFAULT_TEMPLATE`)
+Interpolation: `{{CHANGE_ID}}` → short reverse-hex change ID, `{{BOOKMARK}}` → bookmark name. If no `{{CHANGE_ID}}` in a custom template, a self-referencing HTML comment is injected as the second line.
 
-The built-in default is intentionally minimal — just the self-referencing summary line:
-```
-(plan: jj:{{CHANGE_ID}})
-```
-
-The binary does not impose any plan structure. Developers who want sections (Background, Tasks, Scratchpad, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
-
-`apply_template()` replaces `{{CHANGE_ID}}` with the actual change ID and `{{BOOKMARK}}` with the bookmark name associated with the plan stack. If a custom template has no `{{CHANGE_ID}}` placeholder, a self-referencing HTML comment `<!-- jj:CHANGE_ID -->` is injected as the second line.
-
-12 unit tests cover template resolution, interpolation, fallback chain, and injection.
+---
 
 ## Describe Interception (`src/commands/describe.rs`)
 
-For user-facing documentation, flags, and examples, see [MANUAL.md § jj describe](MANUAL.md#jj-describe).
+When `jj describe -m "..."` is used:
+1. Parse `-m`/`--message` and `-r`/`--revision` from args (supports all jj argument forms).
+2. Write the message to the plan file for the target change.
+3. Delegate to `wrap::wrap()` for the standard lifecycle.
 
-When `jj describe -m "..."` is invoked:
+This ensures the plan file is always the source of truth, even when users type `jj describe -m "..."` directly.
 
-1. Parse args: extract all `-m`/`--message` values and `-r`/`--revision` target.
-2. If no `-m`/`--message` found → editor mode, pass through to `wrap::wrap()`.
-3. Concatenate multiple `-m` values with newlines (matching jj behavior).
-4. Resolve target change ID (defaults to `@`).
-5. Find the matching plan file by change ID prefix match.
-6. Write the message to the plan file.
-7. Pass through to `wrap::wrap()`: flush picks up the file write, jj describe sets the same content (idempotent), sync reads jj back to files.
-
-This eliminates the "NEVER call `jj describe` directly" rule — the binary handles it transparently.
-
-17 unit tests cover arg parsing for all `-m`/`-r` variants.
-
-## Stack Navigation (`src/commands/nav.rs`)
-
-For user-facing documentation and examples, see [MANUAL.md § jj plan next](MANUAL.md#jj-plan-next), [jj plan prev](MANUAL.md#jj-plan-prev), and [jj plan go](MANUAL.md#jj-plan-go).
-
-Three commands, all following the same lifecycle: flush → resolve stack → navigate → sync → show.
-
-- **`jj plan next`**: Find `@` position in stack. If last → print "Already at the last plan" and stay put. Otherwise → `jj edit -r $next_id`.
-- **`jj plan prev`**: Find `@` position in stack. If first → print "Already at the first plan" and stay put. Otherwise → `jj edit -r $prev_id`.
-- **`jj plan go TARGET`**: Parse target as 1-based index (validates range), change ID (pass through), or bookmark name (resolved via PlanRegistry). → `jj edit -r $resolved_id`.
-
-Shared helper `resolve_stack_and_position()` returns `(Vec<StackChange>, current_index)`.
-
-## `jj plan new` (`src/commands/new.rs`)
-
-For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan new](MANUAL.md#jj-plan-new).
-
-Creates a plan stack or adds a change to an existing stack with a templated description:
-
-1. Parse args: extract `<bookmark-name>` (required positional), `-r REV` (optional root revision), detect explicit positioning flags; collect remaining args for `jj new`.
-2. `flush_all()` — flush pending edits.
-3. `jj new [-r REV]` — create the change.
-4. `jj bookmark set $bookmark_name -r @ -B` — set bookmark (allows backwards with `-B`).
-5. On bookmark failure: `jj undo` to roll back.
-6. Register the bookmark in the PlanRegistry via `registry.track(bookmark_name)`.
-7. Set templated description via `create_change_and_describe()`.
-8. `sync()` + `show_stack()`.
-
-The `create_change_and_describe()` helper consolidates the post-`jj new` sequence. It includes a **before/after WC guard**: the working copy change ID is captured before and after the `jj new` call. If the ID is unchanged (meaning `jj new` exited 0 without actually creating a change), the function aborts instead of destructively describing the existing working copy. This guards against any jj flag that exits 0 without mutation (e.g. `--help` passed through to jj).
-
-### Default behavior
-
-When the bookmark already exists and is registered, the new change is inserted after `@` with `jj new --insert-after @`, preserving stack linearity. Suppressed if the user provides explicit positioning flags (`-A`, `-B`).
-
-When the bookmark does not exist, it is created on the new change and registered in the PlanRegistry — this is equivalent to starting a new stack.
-
-### Known limitation
-
-The central `--help` intercept in `dispatch_plan` covers the help case; other 0-exit-without-mutation flags in `jj new` are not currently known.
-
-## `jj plan track` / `jj plan untrack` (`src/commands/track.rs`, `src/commands/untrack.rs`)
-
-For user-facing documentation, see [MANUAL.md § jj plan track](MANUAL.md#jj-plan-track) and [MANUAL.md § jj plan untrack](MANUAL.md#jj-plan-untrack).
-
-- **`jj plan track <bookmark>`**: Loads the PlanRegistry, calls `registry.track(bookmark)`, saves. Verifies the bookmark exists in the repository. Idempotent.
-- **`jj plan untrack <bookmark>`**: Loads the PlanRegistry, calls `registry.untrack(bookmark)`, saves. Idempotent. Does not delete the bookmark itself.
-
-## `jj plan done` (`src/commands/done.rs`)
-
-For user-facing documentation, flags, and examples, see [MANUAL.md § jj plan done](MANUAL.md#jj-plan-done).
-
-Mark one or all plans as done:
-
-1. `flush_all()`.
-2. Resolve stack.
-3. For each target change:
-   - Strip `[scratch]` sections (unless `--keep-scratch`).
-   - Append `plan-status: ✅` (unless already present — idempotent).
-   - `jj describe -r CHANGEID -m $cleaned_description`.
-4. If targeting working copy (default): advance to next undone plan.
-5. `sync()` + `show_stack()`.
-
-Flags: `--stack` (all plans), `--keep-scratch`, `--dry-run`, positional `CHANGE_ID`.
-
-## `jj plan config` (`src/commands/config.rs`)
-
-For user-facing documentation and examples, see [MANUAL.md § jj plan config](MANUAL.md#jj-plan-config).
-
-Read-only introspection — no flush, no sync. Prints:
-- shim path, real jj binary, repo root
-- JJ_PLAN_DIR env, JJ_PLAN_MAX env
-- resolved dir, resolution source
-- stack base (with range mode), stack size
-
-## Abandon Recovery (`src/commands/abandon.rs`)
-
-For user-facing documentation, see [MANUAL.md § jj abandon](MANUAL.md#jj-abandon).
-
-Protects registered plan bookmarks from accidental deletion:
-
-1. **Before abandon**: Snapshot bookmark state — which change holds it, whether it's `@`, its first child.
-2. **Run `jj abandon`** with all original args.
-3. **After abandon**: Check if the bookmark survived via `stack_bookmark_survives()`. If lost:
-   - Try the first child of the old bookmarked change.
-   - If no child but the abandoned change was `@`, use the new `@`.
-   - If recovery target found: `jj bookmark set $name -r $target -B`.
-   - Otherwise: emit WARNING with manual instructions.
-
-`--retain-bookmarks` bypasses this handler entirely.
-
-## File Layout
-
-```
-.jj-plan/
-  01-kpqxywon.md    # Plan file for first stack member
-  02-mtzrlpvq.md    # Plan file for second stack member
-  03-ykvsnxrl.md    # Plan file for third stack member
-  current.md        # Symlink → active change's plan file
-  .stack            # One-line-per-change summary (for display)
-  error.md          # Transient: exists only during error state
-  template.md       # Optional: custom plan template (overrides built-in default)
-
-.jj/repo/jj-plan/
-  plans.toml        # PlanRegistry: tracked plan bookmarks
-```
-
-- **`NN-CHANGEID.md`**: sort index + shortest unique change ID. Index `01` is closest to the stack base.
-- **`current.md`**: always a symlink. Points to `error.md` during error state.
-- **`.stack`**: regenerated on every sync. Status markers: `*` = working copy, `✓` = done, `~` = has file changes.
-- **`error.md`**: created when stack exceeds `JJ_PLAN_MAX` or ambiguous bookmarks. Auto-cleared when condition resolves.
-- **`template.md`**: optional custom template with `{{CHANGE_ID}}` interpolation.
+---
 
 ## Environment Variables
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `JJ_PLAN_DIR` | Override plan directory path | Auto-resolved (see above) |
-| `JJ_PLAN_MAX` | Max changes in stack before refusing to sync | `50` |
-| `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in default |
+| `JJ_PLAN_DIR` | Override plan directory path | `.jj-plan/` → `.jj-plans/` |
+| `JJ_PLAN_MAX` | Max stack size before refusing to sync | `50` |
+| `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in |
+| `GITHUB_TOKEN` / `GH_TOKEN` | GitHub personal access token | — |
+| `GITLAB_TOKEN` / `GL_TOKEN` | GitLab personal access token | — |
+| `GH_HOST` | GitHub Enterprise hostname | `github.com` |
+| `GITLAB_HOST` | Self-hosted GitLab hostname | `gitlab.com` |
+
+---
 
 ## Performance
 
-The shim adds overhead to every mutating command due to the flush→command→reload→sync lifecycle. Key costs:
+### Binary size
 
-| Operation | Cost | Notes |
+The HTTP/TLS dependencies (reqwest, octocrab, rustls) add ~5–10MB to the binary compared to the plan-only version. Users who don't use `jj stack` commands still carry this cost. A future cargo feature could make the PR layer optional.
+
+### Command latency
+
+| Operation | Latency | Bottleneck |
 |---|---|---|
-| Repo root discovery | ~0ms | Filesystem walk for `.jj/` |
-| `load_repo()` (startup) | ~1ms | jj-lib workspace + repo load (once per invocation) |
-| `reload_at_head()` | ~0.2ms | Refresh repo snapshot after CLI mutation |
-| jj-lib revset evaluation | <1ms | Stack resolution, commit reads, bookmark enumeration |
-| `jj describe` (flush write) | ~21ms | Per changed file (subprocess) |
-| `jj edit` / `jj new` | ~60ms | CLI mutation subprocess |
+| Read-only passthrough (`jj log`) | ~0ms overhead | `exec` replaces process |
+| Mutating wrap (`jj new`, `jj edit`) | ~20–50ms overhead | jj-lib repo reload + sync |
+| `jj stack submit --dry-run` | ~100–200ms | Workspace load + stack build + analysis |
+| `jj stack submit` (real) | 2–10s per PR | Network I/O (git push + API calls) |
+| `jj stack merge` | 2–5s per merge | Network I/O (API calls) |
 
-### Subprocess call model
+### Build time
 
-All repository reads are in-process via jj-lib. Only mutations use subprocess calls. The subprocess count depends on the command:
+The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time significantly. Consider `[profile.dev] opt-level = 1` for dependencies if build time becomes painful.
 
-| Command | Subprocess calls | Notes |
-|---|---|---|
-| `wrap` (e.g. `jj status`) | 1 (the command itself) | Flush reads + sync reads are jj-lib |
-| `jj plan next/prev` | 1 (`jj edit`) | Flush reads + stack resolution are jj-lib |
-| `jj plan done` (single) | 1-2 (`jj describe` + optional `jj edit` for advance) | Stack resolution via jj-lib |
-| `jj plan done --stack` | N (`jj describe` × N changes) | One subprocess per change |
-| `jj plan new` | 2-3 (`jj new` + `jj bookmark set` + `jj describe`) | Plus PlanRegistry write |
-
-Flush adds 1 `jj describe` subprocess per changed plan file (only when file content differs from jj description).
-
-### Measured overhead
-
-On a typical repo (this project, ~20 commits in history, warm cache, `/usr/bin/time`, best of 5):
-
-| Metric | Value |
-|---|---|
-| Raw `jj status` | ~10ms |
-| Shimmed `jj status` | ~55ms |
-| **Shim overhead** | **~45ms** |
-| Shimmed `jj plan next` | ~95ms |
-| Shimmed `jj plan done --dry-run` | <10ms |
-
-The ~45ms shim overhead breaks down as:
-- `load_repo()`: ~1ms
-- Flush (jj-lib reads): <1ms
-- `jj status` subprocess: ~45ms (includes process spawn + jj startup)
-- `reload_at_head()`: ~0.2ms
-- `resolve_and_sync` (jj-lib reads): <1ms
-- Binary startup / dynamic linking: ~5ms
-
-The jj-plan read overhead above the single subprocess call is **~2-3ms**.
-
-Previous overhead (before jj-lib, subprocess-only reads): ~115ms. The jj-lib migration reduced shim overhead by **~60%**.
+---
 
 ## Testing
 
-Two complementary test suites:
+### Unit tests (`cargo test`)
 
-### Bats (behavioral/acceptance)
+192 tests covering:
 
-`bats jj-plan.bats` — 142 tests validating the installed binary from the outside:
-- **Template repo**: `setup_file()` pre-creates a jj repo with `stack` bookmark + `.jj-plan/`. Each test gets an isolated copy via `cp -r` (~2ms vs ~100ms for `jj git init`).
-- **Per-test isolation**: `setup()` copies the template and `cd`s into it. `teardown()` removes it. No shared mutable state between tests.
-- **Direct bats style**: Tests run commands inline (no `run_in_repo` wrapper, no `zsh -c` subprocess). Assertions use direct value checks (`[[ "$(cat file)" == "..." ]]`) instead of echo/grep patterns.
-- **Parallel support**: `bats jj-plan.bats --jobs 8` runs in ~31s (vs ~54s sequential, ~64s before this rewrite). Requires GNU `parallel` (`brew install parallel`).
-- `REAL_JJ` (`/opt/homebrew/bin/jj`) bypasses the shim for direct jj calls and repo setup.
-- `$SHIM_DIR` is set once in `setup_file()` and added to `$PATH` globally — no test uses `$HOME/.local/bin`.
+| Module | Tests | Covers |
+|---|---|---|
+| `types.rs` | 10 | `LogEntry` methods, `PlanRegistry` CRUD, TOML roundtrip |
+| `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain` |
+| `plan_file.rs` | 23 | Filename parsing, bookmark encoding/decoding, legacy detection |
+| `sync.rs` | 49 | Gather/plan/execute phases, symlink targeting, edge cases |
+| `flush.rs` | 8 | Description comparison, bookmark-based resolution |
+| `markdown.rs` | 24 | Scratch stripping, code fence immunity, edge cases |
+| `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
+| `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
+| `template.rs` | 8 | Resolution chain, interpolation, fallback |
+| `platform/detection.rs` | 5 | URL parsing, platform detection |
+| Other modules | 26 | Commands, describe interception, navigation |
 
-### Cargo (unit tests)
+### Bats integration tests (`./test.sh`)
 
-`cargo test` — 108 unit tests for pure functions:
-- `markdown`: 20 tests (scratch stripping, code fence immunity, edge cases)
-- `template`: 14 tests (resolve chain, interpolation, default structure)
-- `commands/describe`: 17 tests (arg parsing for -m/-r variants)
-- `commands/help`: 18 tests (invocation classification, color resolution, rendering)
-- `commands/mod`: 5 tests (`sub_args_request_help` detection)
-- `sync`: 11 tests (plan_sync pure logic)
-- `flush`: 4 tests (plan_flush pure logic)
-- `plan_file`: 13 tests (filename parsing, I/O helpers)
-- `plan_dir`: 8 tests (resolution chain, repo root discovery)
+Behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
 
-The FC/IS pattern ensures all business logic is unit-testable without subprocess overhead.
+### PR integration tests
 
-## Migration from zsh shim
+Full integration tests for GitHub/GitLab API calls are deferred — they require either a real account or a mock server. The `--dry-run` flag validates the full local pipeline (stack building → analysis → planning) without network calls.
 
-If you were using the zsh shim (`jj-plan.zsh`):
+---
 
-1. **Prerequisites**: Rust toolchain (1.89+).
-2. **Install**: Use the install script from the jj-plan repo root:
-   ```sh
-   ./install.sh
-   ```
-   Or choose a different destination directory:
-   ```sh
-   ./install.sh --bin-dir /usr/local/bin
-   ```
-3. **If migrating from the old zsh symlink**: Remove the old symlink first, then run the install script:
-   ```sh
-   rm ~/.local/bin/jj          # remove symlink to jj-plan.zsh
-   ./install.sh
-   ```
-4. **Verify**: `jj plan config` — `shim path:` should point to the new binary (not `.zsh`).
-5. **Behavioral changes**:
-   - `jj describe -m "..."` is now intercepted and routed through plan files automatically. The "NEVER call `jj describe` directly" rule is no longer needed.
-   - `jj plan stack` has been removed. Use `jj plan new <bookmark>` to create a new stack. The `<bookmark-name>` argument is now required.
-   - `--first` and `--last` flags on `jj plan new` have been removed.
-   - The `stack`/`stack/*` bookmark naming convention is replaced by the PlanRegistry. Use `jj plan track <bookmark>` to register existing bookmarks.
-   - New commands available: `done`, `next`, `prev`, `go`, `track`, `untrack`.
-   - New namespace: `jj stack` with stubs for `submit`, `sync`, `merge`, `auth`.
-   - `[scratch]` convention: mark any heading with `[scratch]` for working memory that gets cleaned up on `jj plan done`.
-6. The zsh shim (`jj-plan.zsh`) remains in the repo as a reference but is no longer maintained.
+## Dependencies
+
+### Core
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `jj-lib` | 0.38 | In-process jj repository access |
+| `gix` | 0.78 | Git remote HEAD detection for `default_branch()` |
+| `chrono` | 0.4 | Timestamps in `PlannedBookmark`, `CachedPr` |
+| `serde` / `serde_json` | 1 | Serialization for registry, PR cache, API responses |
+| `toml` / `toml_edit` | 0.8 / 0.24 | TOML persistence |
+| `thiserror` | 2 | Error derive macros |
+
+### Platform / networking
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `tokio` | 1 | Async runtime for `jj stack` commands |
+| `octocrab` | 0.47 | Typed GitHub API client |
+| `reqwest` | 0.12 | HTTP client for GitLab API |
+| `async-trait` | 0.1 | Async trait support for `PlatformService` |
+| `url` | 2 | URL parsing for platform detection |
+| `urlencoding` | 2 | GitLab project path encoding |
+| `regex` | 1 | Remote URL pattern matching |
+| `base64` | 0.22 | Stack comment encoding |
+
+### CLI / UX
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `owo-colors` | 4 | Terminal color support |
+| `anstream` | 0.6 | ANSI-aware output streams |
+| `dialoguer` | 0.11 | Interactive prompts |
+| `indicatif` | 0.17 | Progress spinners |

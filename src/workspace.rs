@@ -1,9 +1,9 @@
 //! Unified workspace layer for jj-plan.
 //!
-//! This module merges jj-plan's `LoadedRepo` and jj-ryu's `JjWorkspace` into
-//! a single `Workspace` struct. It provides all read operations needed by the
-//! plan lifecycle (flush, sync, navigation, done, describe interception) via
-//! jj-lib's in-process API.
+//! Provides all repository operations needed by the plan lifecycle
+//! (flush, sync, navigation, done, describe interception) and git write
+//! operations (fetch, push, rebase, delete-bookmark) via jj-lib's
+//! in-process API.
 //!
 //! ## Architecture: "Path A" — jj-lib for reads, CLI for writes
 //!
