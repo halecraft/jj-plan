@@ -37,19 +37,31 @@ pub fn handle_describe(
     // 3. Determine target change: -r/--revision value, or "@" if unspecified
     let target = parsed.revision.as_deref().unwrap_or("@");
 
-    // 4. Resolve the target change ID
+    // 4. Resolve the target change ID, then find which bookmark points to it
     let target_change_id = resolve_target_change_id(workspace, target);
 
-    // 5. Find the matching plan file and write the message to it
+    // 5. Find the matching plan file by bookmark name and write the message to it.
+    //    Resolution chain: target revset → change ID → bookmark name → plan file.
     if let Some(ref change_id) = target_change_id {
         let plan_files = plan_file::collect_plan_files(&plan_dir.path);
 
-        // Find the entry where the change_id matches (prefix match: the
-        // filename contains the shortest unique prefix, so either the
-        // resolved ID starts with the file's ID or vice versa).
-        let entry = plan_files.iter().find(|e| {
-            change_id.starts_with(&e.change_id) || e.change_id.starts_with(change_id.as_str())
-        });
+        // Find which bookmark points to the target change
+        let bookmark_name = resolve_bookmark_for_change(workspace, change_id);
+
+        let entry = if let Some(ref bm_name) = bookmark_name {
+            // Match by bookmark name (the new model)
+            plan_files.iter().find(|e| &e.bookmark_name == bm_name)
+        } else {
+            // Fallback for legacy change-ID-named files: try prefix match
+            // against the raw filename content (everything between NN- and .md).
+            // This handles the migration period where old files still exist.
+            let raw_match = plan_files.iter().find(|e| {
+                // The bookmark_name field may contain a decoded legacy change ID
+                change_id.starts_with(&e.bookmark_name)
+                    || e.bookmark_name.starts_with(change_id.as_str())
+            });
+            raw_match
+        };
 
         if let Some(entry) = entry {
             // Write the message to the plan file — flush will pick this up
@@ -179,12 +191,45 @@ fn parse_describe_args(args: &[String]) -> ParsedDescribeArgs {
 }
 
 // ---------------------------------------------------------------------------
-// Change ID resolution
+// Change ID and bookmark resolution
 // ---------------------------------------------------------------------------
 
 /// Resolve a revision specifier to a change ID using the loaded repo.
 fn resolve_target_change_id(workspace: &Workspace, target: &str) -> Option<String> {
     workspace.resolve_change_id(target)
+}
+
+/// Find the bookmark name that points to a given change ID.
+///
+/// Searches `workspace.local_bookmarks()` for a bookmark whose change_id
+/// matches the given short change ID (prefix match in either direction,
+/// since the workspace stores full hex and we have a short reverse-hex).
+///
+/// Returns `None` if no bookmark points to this change (unbookmarked commit).
+fn resolve_bookmark_for_change(workspace: &Workspace, short_change_id: &str) -> Option<String> {
+    // We need to match the short reverse-hex change_id against the full-hex
+    // change_ids in the bookmark list. The simplest approach: resolve the
+    // short ID to a full commit via the workspace, then match.
+    //
+    // Actually, the workspace's local_bookmarks() returns Bookmark structs
+    // with full hex change_ids. We have a short reverse-hex ID. To compare,
+    // we'd need to convert. Instead, use the workspace to resolve each
+    // bookmark's change_id to short form and compare.
+    //
+    // Simpler: just check if any bookmark resolves to the same short ID
+    // by asking the workspace to resolve the bookmark name as a revset.
+    let bookmarks = workspace.local_bookmarks();
+    for bm in &bookmarks {
+        if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id) {
+            if bm_short == short_change_id
+                || short_change_id.starts_with(&bm_short)
+                || bm_short.starts_with(short_change_id)
+            {
+                return Some(bm.name.clone());
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

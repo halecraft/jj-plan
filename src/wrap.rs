@@ -46,6 +46,44 @@ pub fn wrap(
 pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
     let max_stack_size = crate::plan_dir::plan_max();
 
+    // Migrate any legacy change-ID-based filenames to bookmark-named files.
+    // This must happen before gather_current_state() in sync so the rest of
+    // the pipeline sees only bookmark-named files.
+    let all_bookmarks = workspace.local_bookmarks();
+    crate::plan_file::migrate_legacy_filenames(&plan_dir.path, |legacy_change_id| {
+        // Resolve the short reverse-hex change ID to a bookmark name.
+        // We compare the short ID from the filename against each bookmark's
+        // change_id resolved to short form via the workspace.
+        for bm in &all_bookmarks {
+            if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id) {
+                if bm_short == legacy_change_id
+                    || legacy_change_id.starts_with(&bm_short)
+                    || bm_short.starts_with(legacy_change_id)
+                {
+                    return Some(bm.name.clone());
+                }
+            }
+        }
+        None
+    });
+
+    // Build sync views from the registry-filtered stack
+    let sync_changes = build_sync_views(workspace);
+    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size);
+    sync::show_stack(plan_dir);
+}
+
+/// Build `SyncChangeView`s from the registry-filtered stack.
+///
+/// This is the single shared function for converting the repository's
+/// stack state into the flat list that sync, done, and other modules
+/// consume. It loads the `PlanRegistry`, builds the stack with registry
+/// filtering, and converts each segment's tip commit into a
+/// `SyncChangeView`.
+///
+/// Returns `None` when the stack is empty, contains merge commits, or
+/// has no registry-matching segments.
+pub fn build_sync_views(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
     // Load plan registry for filtered stack building
     let repo_root = workspace.jj_workspace().workspace_root();
     let registry = crate::plan_registry::load_registry(repo_root);
@@ -53,10 +91,8 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
     // Build the stack using the new builder with registry filtering
     let stack_result = crate::stack_builder::build_stack(workspace, Some(&registry));
 
-    // Convert to the adapter type that sync expects
-    let sync_changes = stack_to_sync_changes(&stack_result, workspace);
-    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size);
-    sync::show_stack(plan_dir);
+    // Convert to the adapter type
+    stack_to_sync_changes(&stack_result, workspace, &registry)
 }
 
 /// A lightweight view of a stack change for sync/flush compatibility.
@@ -67,17 +103,20 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
 /// later plan.
 ///
 /// Each `SyncChangeView` represents one entry in the `.stack` summary file
-/// and one plan file `NN-{change_id}.md`.
+/// and one plan file `NN-{bookmark_name}.md`.
 pub struct SyncChangeView {
-    /// Short reverse-hex change ID (for plan filenames and display).
+    /// Short reverse-hex change ID (for `jj describe -r` and display).
     pub change_id: String,
+    /// The registered plan bookmark name for this segment.
+    /// Used for plan filenames (`NN-{bookmark_name}.md`).
+    pub bookmark_name: String,
     /// Full description text.
     pub description: String,
     /// Whether this change is empty.
     pub is_empty: bool,
     /// Whether this is the working copy.
     pub is_working_copy: bool,
-    /// Bookmark names on this change.
+    /// All bookmark names on this change (may include non-plan bookmarks).
     pub bookmarks: Vec<String>,
 }
 
@@ -103,6 +142,7 @@ impl SyncChangeView {
 fn stack_to_sync_changes(
     result: &crate::types::StackResult,
     workspace: &Workspace,
+    registry: &crate::types::PlanRegistry,
 ) -> Option<Vec<SyncChangeView>> {
     use crate::types::StackResult;
 
@@ -117,14 +157,26 @@ fn stack_to_sync_changes(
             for segment in &stack.segments {
                 // The tip commit is changes[0] (newest first)
                 if let Some(tip) = segment.changes.first() {
-                    // We need the short change ID for plan filenames.
-                    // Resolve it from the workspace.
+                    // We need the short change ID for `jj describe -r`.
                     let short_id = workspace
                         .resolve_change_id(&tip.change_id)
                         .unwrap_or_else(|| tip.change_id[..8].to_string());
 
+                    // Find the registered plan bookmark for this segment.
+                    // Since segments are built with registry filtering, at
+                    // least one bookmark should be registered. Use the first
+                    // registered bookmark, falling back to the first bookmark.
+                    let plan_bookmark_name = segment
+                        .bookmarks
+                        .iter()
+                        .find(|b| registry.is_tracked(&b.name))
+                        .or_else(|| segment.bookmarks.first())
+                        .map(|b| b.name.clone())
+                        .unwrap_or_default();
+
                     views.push(SyncChangeView {
                         change_id: short_id,
+                        bookmark_name: plan_bookmark_name,
                         description: tip.description.clone(),
                         is_empty: tip.is_empty,
                         is_working_copy: tip.is_working_copy,

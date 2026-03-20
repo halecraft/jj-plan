@@ -154,16 +154,27 @@ pub fn run_new(
     // ------------------------------------------------------------------
     // 6. Register in PlanRegistry
     // ------------------------------------------------------------------
-    // Read full change ID for the registry entry
+    // Get the full standard hex change ID for the registry entry.
+    // PlannedBookmark.change_id must be full hex (matching LogEntry.change_id
+    // convention from jj:pozrnomw) — NOT short reverse-hex. Look up the
+    // bookmark we just created to get the correct encoding.
     workspace.reload();
     let full_change_id = workspace
-        .read_change_id_at_wc()
-        .unwrap_or_else(|| new_change_id.clone());
+        .local_bookmarks()
+        .iter()
+        .find(|b| b.name == bookmark_name)
+        .map(|b| b.change_id.clone())
+        .unwrap_or_else(|| {
+            // Fallback: should not happen since we just created the bookmark,
+            // but degrade gracefully with the short ID rather than crashing.
+            eprintln!("jj plan new: warning: could not resolve full change ID for bookmark '{}'", bookmark_name);
+            new_change_id.clone()
+        });
 
     let mut registry = plan_registry::load_registry(&repo_root);
     registry.track(PlannedBookmark::new(
         bookmark_name.clone(),
-        full_change_id.clone(),
+        full_change_id,
     ));
     plan_registry::save_registry(&repo_root, &registry);
 

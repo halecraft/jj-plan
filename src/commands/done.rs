@@ -176,14 +176,16 @@ fn run_done_single(
         &final_desc,
     ]);
 
-    // If we targeted the working copy (default), advance to the next undone plan
+    // If we targeted the working copy (default), advance to the next undone plan.
+    // advance_to_next_undone() does its own workspace.reload() + resolve_and_sync(),
+    // so skip the outer one to avoid a redundant second stack build + sync cycle.
     if is_default_target {
         advance_to_next_undone(jj, plan_dir, workspace);
+    } else {
+        // Explicit target or no advance needed — reload + sync once.
+        workspace.reload();
+        crate::wrap::resolve_and_sync(plan_dir, workspace);
     }
-
-    // Reload after describe, then sync and show stack
-    workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
     Ok(0)
 }
 
@@ -222,32 +224,11 @@ fn append_done_marker(desc: &str, already_done: bool) -> String {
 }
 
 /// Build SyncChangeView list from the stack for done's consumption.
+///
+/// Delegates to the shared `wrap::build_sync_views()` so there is a single
+/// place to maintain the `StackResult` → `Vec<SyncChangeView>` conversion.
 fn build_sync_views_for_done(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
-    // Load registry for filtered stack building
-    let repo_root = workspace.jj_workspace().workspace_root();
-    let registry = crate::plan_registry::load_registry(repo_root);
-    let stack_result = crate::stack_builder::build_stack(workspace, Some(&registry));
-    match stack_result {
-        crate::types::StackResult::Ok(stack) => {
-            let mut views = Vec::new();
-            for segment in &stack.segments {
-                if let Some(tip) = segment.changes.first() {
-                    let short_id = workspace
-                        .resolve_change_id(&tip.change_id)
-                        .unwrap_or_else(|| tip.change_id[..8.min(tip.change_id.len())].to_string());
-                    views.push(SyncChangeView {
-                        change_id: short_id,
-                        description: tip.description.clone(),
-                        is_empty: tip.is_empty,
-                        is_working_copy: tip.is_working_copy,
-                        bookmarks: tip.local_bookmarks.clone(),
-                    });
-                }
-            }
-            if views.is_empty() { None } else { Some(views) }
-        }
-        _ => None,
-    }
+    crate::wrap::build_sync_views(workspace)
 }
 
 /// After marking the current working copy done, re-resolve the stack and
@@ -263,13 +244,21 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
 
     let changes = match changes {
         Some(c) => c,
-        None => return,
+        None => {
+            // No stack resolved — still sync to pick up the done marker.
+            crate::wrap::resolve_and_sync(plan_dir, workspace);
+            return;
+        }
     };
 
     // Find the current working copy index
     let current_idx = match changes.iter().position(|c| c.is_working_copy) {
         Some(idx) => idx,
-        None => return,
+        None => {
+            // Can't determine position — sync what we have.
+            crate::wrap::resolve_and_sync(plan_dir, workspace);
+            return;
+        }
     };
 
     // Search forward then wraparound for the next undone change
@@ -284,6 +273,8 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
             crate::wrap::resolve_and_sync(plan_dir, workspace);
         }
         None => {
+            // All done — still sync to pick up the done marker we just wrote.
+            crate::wrap::resolve_and_sync(plan_dir, workspace);
             eprintln!("All plans in stack are done 🎉");
         }
     }
