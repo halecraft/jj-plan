@@ -2,19 +2,13 @@ use std::path::Path;
 
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::repo::LoadedRepo;
-use crate::stack::StackBase;
+use crate::workspace::Workspace;
 
 /// Run `jj plan config` — print resolved configuration and stack info.
 ///
 /// This is a read-only introspection command with no flush, no sync, and
-/// no side effects. It prints all resolved configuration as key: value pairs,
-/// matching the zsh shim's output format.
-///
-/// Stack resolution is delegated to `crate::repo::resolve_stack_base_lib()` and
-/// `crate::repo::resolve_stack_changes_lib()` — the same code path used by wrap/sync.
-/// No duplicate resolution logic.
-pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, loaded_repo: &LoadedRepo) {
+/// no side effects.
+pub fn run_config(_jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, workspace: &Workspace) {
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::canonicalize(p).ok())
@@ -24,7 +18,6 @@ pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, loaded_re
     println!("jj-plan configuration:");
     println!();
     println!("  shim path:        {}", self_exe);
-    println!("  real jj binary:   {}", jj.path().display());
     println!("  repo root:        {}", repo_root.display());
     println!();
 
@@ -45,25 +38,21 @@ pub fn run_config(jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, loaded_re
     println!("  resolution source: {}", plan_dir.source);
     println!();
 
-    // Stack info — uses the shared stack resolution from repo.rs
-    let base = crate::repo::resolve_stack_base_lib(loaded_repo);
-    match &base {
-        Some(StackBase::Ambiguous(_)) | None => {
-            println!("  stack base:       (none)");
-            println!("  stack size:       0");
-        }
-        Some(stack_base) => {
-            if let Some((base_str, mode_str)) = stack_base.display_pair() {
-                println!("  stack base:       {} ({})", base_str, mode_str);
-
-                let size = crate::repo::resolve_stack_changes_lib(loaded_repo, stack_base)
-                    .map(|c| c.len())
-                    .unwrap_or(0);
-                println!("  stack size:       {}", size);
-            } else {
-                println!("  stack base:       (none)");
-                println!("  stack size:       0");
+    // Stack info using the new stack builder
+    let stack_result = crate::stack_builder::build_stack(workspace);
+    match stack_result {
+        crate::types::StackResult::Ok(stack) => {
+            println!("  stack model:      trunk()..(@  | descendants(@))");
+            println!("  stack segments:   {}", stack.segments.len());
+            if !stack.gaps.is_empty() {
+                println!("  stack gaps:       {} (unbookmarked commits between bookmarks)", stack.gaps.len());
             }
+        }
+        crate::types::StackResult::MergeCommits => {
+            println!("  stack:            (merge commits detected — not supported)");
+        }
+        crate::types::StackResult::Empty => {
+            println!("  stack:            (empty — @ is at trunk)");
         }
     }
 }

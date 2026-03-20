@@ -6,7 +6,7 @@ use crate::plan_dir::PlanDir;
 use crate::plan_file::{
     self, PlanFileEntry, remove_or_warn, rename_or_warn, write_or_warn,
 };
-use crate::stack::StackChange;
+use crate::wrap::SyncChangeView;
 
 // ---------------------------------------------------------------------------
 // Public API — same external signatures as before, internal FC/IS split
@@ -22,7 +22,7 @@ use crate::stack::StackChange;
 /// plan files exist, a stack was lost — emit a warning.
 pub fn sync(
     plan_dir: &PlanDir,
-    stack_changes: Option<&[StackChange]>,
+    stack_changes: Option<&[SyncChangeView]>,
     max_stack_size: usize,
 ) {
     let dir = &plan_dir.path;
@@ -167,7 +167,7 @@ struct SyncPlan {
 /// a `SyncPlan` describing what `execute_sync()` should do.
 fn plan_sync(
     current_state: &CurrentPlanState,
-    stack_changes: Option<&[StackChange]>,
+    stack_changes: Option<&[SyncChangeView]>,
     max_stack_size: usize,
 ) -> SyncPlan {
     let mut plan = SyncPlan {
@@ -338,7 +338,7 @@ fn execute_sync(plan_dir: &Path, plan: &SyncPlan) {
 /// - `status`: `✓` if done, `~` if has file changes, space otherwise
 /// - Two columns are independent (a change can be both `*` and `✓`)
 pub fn generate_stack_summary(
-    changes: &[StackChange],
+    changes: &[SyncChangeView],
     current_file: Option<&str>,
 ) -> String {
     let mut lines = Vec::with_capacity(changes.len());
@@ -385,9 +385,9 @@ pub fn generate_stack_summary(
 mod tests {
     use super::*;
 
-    /// Helper to build a minimal StackChange for tests.
-    fn change(id: &str, desc: &str, is_empty: bool, is_wc: bool) -> StackChange {
-        StackChange {
+    /// Helper to build a minimal SyncChangeView for tests.
+    fn change(id: &str, desc: &str, is_empty: bool, is_wc: bool) -> SyncChangeView {
+        SyncChangeView {
             change_id: id.to_string(),
             description: desc.to_string(),
             is_empty,
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_generate_stack_summary_done_marker() {
-        let changes = vec![StackChange {
+        let changes = vec![SyncChangeView {
             change_id: "abcdefgh".to_string(),
             description: "Done task\n\nplan-status: ✅".to_string(),
             is_empty: true,
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_generate_stack_summary_empty() {
-        let changes: Vec<StackChange> = vec![];
+        let changes: Vec<SyncChangeView> = vec![];
         let summary = generate_stack_summary(&changes, None);
         assert!(summary.is_empty());
     }

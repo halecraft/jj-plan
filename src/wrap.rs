@@ -1,16 +1,11 @@
-use std::path::Path;
-
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::repo::LoadedRepo;
-use crate::stack::{StackBase, StackChange};
+use crate::workspace::Workspace;
 use crate::sync;
 
 /// Unified handler for mutating commands: flush → command → reload → sync → show.
 ///
-/// This is the Rust equivalent of `__jj_plan_wrap` from the zsh shim.
-/// All mutating jj commands (status, st, new, edit, describe, abandon,
-/// and the general catch-all) go through this lifecycle:
+/// All mutating jj commands go through this lifecycle:
 ///
 /// 1. Flush all local plan file edits to jj descriptions
 /// 2. Run the actual jj command with inherited stdio
@@ -24,73 +19,121 @@ pub fn wrap(
     plan_dir: &PlanDir,
     jj: &JjBinary,
     args: &[String],
-    loaded_repo: &mut LoadedRepo,
+    workspace: &mut Workspace,
 ) -> crate::error::Result<i32> {
     // 1. Flush all local plan file edits to jj descriptions
-    crate::flush::flush_all(&plan_dir.path, jj, &loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
     // 2. Run the actual jj command with inherited stdio
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
     // 3-6. Reload repo, re-resolve stack, sync plan files, show stack
-    loaded_repo.reload();
-    resolve_and_sync(plan_dir, jj, &loaded_repo);
+    workspace.reload();
+    resolve_and_sync(plan_dir, workspace);
 
     Ok(exit_code)
 }
 
-/// Canonical post-mutation sync: resolve stack → sync plan files → show stack.
+/// Canonical post-mutation sync: build stack → sync plan files → show stack.
 ///
 /// This is the single entry point for "re-read jj state and update plan files
 /// after a mutation". All command modules should call this instead of
-/// maintaining their own `sync_and_show()` helpers.
+/// maintaining their own sync helpers.
 ///
-/// Handles:
-/// - Normal stack resolution (inclusive bookmark or exclusive trunk)
-/// - Ambiguous sibling bookmarks → sets error state
-/// - No usable base → passes None to sync (bookmark-loss detection)
-///
-/// Callers must call `loaded_repo.reload()` after CLI mutations before
+/// Callers must call `workspace.reload()` after CLI mutations before
 /// calling this.
-pub fn resolve_and_sync(plan_dir: &PlanDir, _jj: &JjBinary, loaded_repo: &LoadedRepo) {
+pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
     let max_stack_size = crate::plan_dir::plan_max();
-    let (_stack_base, stack_changes) = resolve_fresh_stack(_jj, &plan_dir.path, loaded_repo);
-    sync::sync(plan_dir, stack_changes.as_deref(), max_stack_size);
+
+    // Build the stack using the new builder
+    let stack_result = crate::stack_builder::build_stack(workspace);
+
+    // Convert to the adapter type that sync expects
+    let sync_changes = stack_to_sync_changes(&stack_result, workspace);
+    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size);
     sync::show_stack(plan_dir);
 }
 
-/// Re-resolve the stack base and changes via jj-lib.
+/// A lightweight view of a stack change for sync/flush compatibility.
 ///
-/// Returns (Option<StackBase>, Option<Vec<StackChange>>).
-/// The StackBase is used for error reporting; the Vec<StackChange>
-/// is passed to sync().
-pub fn resolve_fresh_stack(
-    _jj: &JjBinary,
-    plan_dir: &Path,
-    loaded_repo: &LoadedRepo,
-) -> (Option<StackBase>, Option<Vec<StackChange>>) {
-    let base = crate::repo::resolve_stack_base_lib(loaded_repo);
+/// Bridges the new `Stack`/`BookmarkSegment`/`LogEntry` types with sync.rs's
+/// existing `StackChange`-shaped interface. This adapter is temporary — it
+/// will be removed when sync.rs is updated to accept `Stack` directly in a
+/// later plan.
+///
+/// Each `SyncChangeView` represents one entry in the `.stack` summary file
+/// and one plan file `NN-{change_id}.md`.
+pub struct SyncChangeView {
+    /// Short reverse-hex change ID (for plan filenames and display).
+    pub change_id: String,
+    /// Full description text.
+    pub description: String,
+    /// Whether this change is empty.
+    pub is_empty: bool,
+    /// Whether this is the working copy.
+    pub is_working_copy: bool,
+    /// Bookmark names on this change.
+    pub bookmarks: Vec<String>,
+}
 
-    match &base {
-        None => {
-            // No usable stack base. Bookmark-loss detection happens in sync().
-            (None, None)
-        }
-        Some(StackBase::Ambiguous(ids)) => {
-            sync::set_error(
-                plan_dir,
-                &format!(
-                    "Ambiguous stack: multiple stack/* bookmarks are equidistant ancestors of @. Conflicting change IDs: {}. Advance or remove one so a single nearest ancestor remains.",
-                    ids.join(" ")
-                ),
-            );
-            (base, None)
-        }
-        Some(StackBase::Inclusive(_) | StackBase::Exclusive) => {
-            let changes =
-                crate::repo::resolve_stack_changes_lib(loaded_repo, base.as_ref().unwrap());
-            (base, changes)
+impl SyncChangeView {
+    /// First line of the description, for display in `.stack` summary.
+    pub fn first_line(&self) -> &str {
+        self.description.lines().next().unwrap_or("")
+    }
+
+    /// Whether the description contains `plan-status: ✅`.
+    pub fn is_done(&self) -> bool {
+        self.description.starts_with("plan-status: ✅")
+            || self.description.contains("\nplan-status: ✅")
+    }
+}
+
+/// Convert a `StackResult` to a flat list of `SyncChangeView`s for sync.
+///
+/// In the new model, only bookmarked commits get plan files. Each segment's
+/// tip commit (the bookmarked commit) produces one `SyncChangeView`.
+///
+/// Returns `None` for `StackResult::Empty` or `StackResult::MergeCommits`.
+fn stack_to_sync_changes(
+    result: &crate::types::StackResult,
+    workspace: &Workspace,
+) -> Option<Vec<SyncChangeView>> {
+    use crate::types::StackResult;
+
+    match result {
+        StackResult::Empty | StackResult::MergeCommits => None,
+        StackResult::Ok(stack) => {
+            if stack.segments.is_empty() {
+                return None;
+            }
+
+            let mut views = Vec::new();
+            for segment in &stack.segments {
+                // The tip commit is changes[0] (newest first)
+                if let Some(tip) = segment.changes.first() {
+                    // We need the short change ID for plan filenames.
+                    // Resolve it from the workspace.
+                    let short_id = workspace
+                        .resolve_change_id(&tip.change_id)
+                        .unwrap_or_else(|| tip.change_id[..8].to_string());
+
+                    views.push(SyncChangeView {
+                        change_id: short_id,
+                        description: tip.description.clone(),
+                        is_empty: tip.is_empty,
+                        is_working_copy: tip.is_working_copy,
+                        bookmarks: tip.local_bookmarks.clone(),
+                    });
+                }
+            }
+
+            if views.is_empty() {
+                None
+            } else {
+                Some(views)
+            }
         }
     }
 }

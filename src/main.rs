@@ -6,9 +6,10 @@ mod template;
 mod jj_binary;
 mod plan_dir;
 mod plan_file;
-mod repo;
-mod stack;
+mod stack_builder;
 mod sync;
+mod types;
+mod workspace;
 mod wrap;
 
 use error::JjPlanError;
@@ -108,8 +109,8 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
     // Load jj-lib repo for in-process reads.
     // If loading fails, degrade to passthrough — the jj command runs directly
     // without plan sync. This only happens on version mismatch or corrupt repo.
-    let mut loaded_repo = match repo::load_repo(&repo_root) {
-        Some(r) => r,
+    let mut workspace = match workspace::Workspace::open(&repo_root) {
+        Some(w) => w,
         None => {
             eprintln!("jj-plan: warning: could not load repository via jj-lib, running without plan sync");
             jj.exec_strings(args)?;
@@ -119,19 +120,19 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
 
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut loaded_repo);
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace);
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut loaded_repo);
+        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace);
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args, &mut loaded_repo);
+        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace);
     }
 
     // All other commands: wrap lifecycle (flush → command → reload → sync → show)
-    wrap::wrap(&plan_dir, jj, args, &mut loaded_repo)
+    wrap::wrap(&plan_dir, jj, args, &mut workspace)
 }

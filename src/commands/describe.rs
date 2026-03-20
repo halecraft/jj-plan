@@ -1,7 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_file;
-use crate::repo::LoadedRepo;
+use crate::workspace::Workspace;
 
 /// Intercept `jj describe -m "..."` to write the message to the plan file first.
 ///
@@ -21,14 +21,14 @@ pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    loaded_repo: &mut LoadedRepo,
+    workspace: &mut Workspace,
 ) -> crate::error::Result<i32> {
     // 1. Parse describe args to find -m/--message values and -r/--revision target
     let parsed = parse_describe_args(args);
 
     // If no -m/--message found, this is editor-mode → pass through to wrap
     if parsed.messages.is_empty() {
-        return crate::wrap::wrap(plan_dir, jj, args, loaded_repo);
+        return crate::wrap::wrap(plan_dir, jj, args, workspace);
     }
 
     // 2. Build the concatenated message (jj concatenates multiple -m with newlines)
@@ -38,7 +38,7 @@ pub fn handle_describe(
     let target = parsed.revision.as_deref().unwrap_or("@");
 
     // 4. Resolve the target change ID
-    let target_change_id = resolve_target_change_id(&*loaded_repo, target);
+    let target_change_id = resolve_target_change_id(workspace, target);
 
     // 5. Find the matching plan file and write the message to it
     if let Some(ref change_id) = target_change_id {
@@ -65,7 +65,7 @@ pub fn handle_describe(
     // After flush, jj description matches the file. Then `jj describe -m "..."`
     // sets the same content again (idempotent). Then sync reads jj and writes
     // back to files. All consistent.
-    crate::wrap::wrap(plan_dir, jj, args, loaded_repo)
+    crate::wrap::wrap(plan_dir, jj, args, workspace)
 }
 
 // ---------------------------------------------------------------------------
@@ -183,8 +183,8 @@ fn parse_describe_args(args: &[String]) -> ParsedDescribeArgs {
 // ---------------------------------------------------------------------------
 
 /// Resolve a revision specifier to a change ID using the loaded repo.
-fn resolve_target_change_id(loaded_repo: &LoadedRepo, target: &str) -> Option<String> {
-    crate::repo::resolve_change_id(loaded_repo, target)
+fn resolve_target_change_id(workspace: &Workspace, target: &str) -> Option<String> {
+    workspace.resolve_change_id(target)
 }
 
 // ---------------------------------------------------------------------------

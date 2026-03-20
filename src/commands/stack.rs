@@ -1,6 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::repo::LoadedRepo;
+use crate::workspace::Workspace;
 use crate::template;
 
 /// Run `jj plan stack` — create a new stack with a single plan (jj change).
@@ -31,7 +31,7 @@ pub fn run_stack(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
-    loaded_repo: &mut LoadedRepo,
+    workspace: &mut Workspace,
 ) -> crate::error::Result<i32> {
     // -----------------------------------------------------------------------
     // 1. Parse args: `-r <rev>` and positional stack name
@@ -65,7 +65,7 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 3. Flush local plan edits to jj descriptions
     // -----------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, &*loaded_repo);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace);
 
     // -----------------------------------------------------------------------
     // 4. Create new change
@@ -103,8 +103,8 @@ pub fn run_stack(
     // -----------------------------------------------------------------------
     // 6. Read back the change ID of the new change
     // -----------------------------------------------------------------------
-    loaded_repo.reload();
-    let change_id = match crate::repo::read_change_id_at_wc(&*loaded_repo) {
+    workspace.reload();
+    let change_id = match workspace.read_change_id_at_wc() {
         Some(id) => id,
         None => {
             eprintln!("jj plan stack: could not read new change ID");
@@ -122,8 +122,8 @@ pub fn run_stack(
     // 8. Print summary and sync
     // -----------------------------------------------------------------------
     eprintln!("Started new stack: {} ({})", bookmark_name, change_id);
-    loaded_repo.reload();
-    crate::wrap::resolve_and_sync(plan_dir, jj, &loaded_repo);
+    workspace.reload();
+    crate::wrap::resolve_and_sync(plan_dir, workspace);
 
     Ok(0)
 }
