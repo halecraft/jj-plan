@@ -1,6 +1,7 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::types::PlanRegistry;
 
 /// Encode a bookmark name for use in a plan filename.
 ///
@@ -16,20 +17,15 @@ pub fn encode_bookmark_for_filename(name: &str) -> String {
     name.replace('/', "--")
 }
 
-/// Decode a bookmark name from its filename-encoded form.
+/// Parse a plan filename like `01-feat-auth.md` and return the encoded
+/// bookmark portion.
 ///
-/// Reverses the encoding applied by `encode_bookmark_for_filename`:
-/// `--` is replaced with `/`.
-pub fn decode_bookmark_from_filename(encoded: &str) -> String {
-    encoded.replace("--", "/")
-}
-
-/// Parse a plan filename like `01-feat-auth.md` and return the bookmark name.
 /// Returns `None` if the filename doesn't match the expected pattern.
 ///
-/// Pattern: `NN-BOOKMARKNAME.md` where NN is two digits and BOOKMARKNAME
-/// is a non-empty string. The bookmark name is decoded from the filename
-/// encoding (e.g. `feat--auth` → `feat/auth`).
+/// Pattern: `NN-ENCODED.md` where NN is two digits and ENCODED is a
+/// non-empty string. The returned value is the raw encoded portion —
+/// callers use `PlanRegistry::resolve_encoded()` to map it back to the
+/// canonical bookmark name.
 ///
 /// Excluded filenames: `error.md`, `current.md`, `.stack`, `template.md`,
 /// `problem.md`, and any file that doesn't start with two digits + dash
@@ -54,7 +50,8 @@ pub fn parse_plan_filename(name: &str) -> Option<&str> {
 pub struct PlanFileEntry {
     /// The full filename, e.g. `01-feat-auth.md`.
     pub filename: String,
-    /// The bookmark name extracted from the filename (with slashes restored).
+    /// The canonical bookmark name from the PlanRegistry, or the raw
+    /// encoded string for orphan files (no matching registry entry).
     pub bookmark_name: String,
     /// The full path to the file.
     pub path: PathBuf,
@@ -65,9 +62,11 @@ pub struct PlanFileEntry {
 /// This is the single point of directory scanning — used by both flush
 /// and sync gather phases. Reads the directory exactly once.
 ///
-/// The returned entries have `bookmark_name` decoded from the filename
-/// encoding (e.g. `feat--auth` in the filename → `feat/auth` in the field).
-pub fn collect_plan_files(plan_dir: &Path) -> Vec<PlanFileEntry> {
+/// Resolution is registry-authoritative: for each `NN-ENCODED.md` file,
+/// the `PlanRegistry` is consulted to find the canonical bookmark name.
+/// Files with no matching registry entry get `bookmark_name` set to the
+/// raw encoded string (orphan/legacy files).
+pub fn collect_plan_files(plan_dir: &Path, registry: &PlanRegistry) -> Vec<PlanFileEntry> {
     let mut result = Vec::new();
 
     let entries = match fs::read_dir(plan_dir) {
@@ -80,7 +79,12 @@ pub fn collect_plan_files(plan_dir: &Path) -> Vec<PlanFileEntry> {
         let name_str = name.to_string_lossy().into_owned();
 
         if let Some(encoded_name) = parse_plan_filename(&name_str) {
-            let bookmark_name = decode_bookmark_from_filename(encoded_name);
+            // Registry-authoritative: look up the canonical bookmark name
+            // from the registry instead of guessing via string replacement.
+            let bookmark_name = registry
+                .resolve_encoded(encoded_name)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| encoded_name.to_string());
             result.push(PlanFileEntry {
                 filename: name_str,
                 bookmark_name,
@@ -90,16 +94,6 @@ pub fn collect_plan_files(plan_dir: &Path) -> Vec<PlanFileEntry> {
     }
 
     result
-}
-
-/// Build a map of bookmark_name → file_path from collected plan files.
-///
-/// Convenience wrapper for flush, which needs to look up paths by bookmark name.
-pub fn plan_files_by_bookmark(plan_dir: &Path) -> HashMap<String, PathBuf> {
-    collect_plan_files(plan_dir)
-        .into_iter()
-        .map(|e| (e.bookmark_name, e.path))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +294,7 @@ pub fn copy_or_warn(src: &Path, dst: &Path) {
 mod tests {
     use super::*;
 
-    // -- encode/decode bookmark tests --
+    // -- encode bookmark tests --
 
     #[test]
     fn test_encode_bookmark_no_slashes() {
@@ -320,44 +314,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_decode_bookmark_no_double_hyphens() {
-        assert_eq!(decode_bookmark_from_filename("feat-auth"), "feat-auth");
-    }
+    // -- helper: build a registry with given bookmark names --
 
-    #[test]
-    fn test_decode_bookmark_with_double_hyphens() {
-        assert_eq!(decode_bookmark_from_filename("feat--auth"), "feat/auth");
-    }
-
-    #[test]
-    fn test_decode_bookmark_multiple_double_hyphens() {
-        assert_eq!(
-            decode_bookmark_from_filename("user--duane--experiment"),
-            "user/duane/experiment"
-        );
-    }
-
-    #[test]
-    fn test_encode_decode_roundtrip() {
-        let names = [
-            "feat-auth",
-            "feat/auth",
-            "fix/typo",
-            "user/duane/experiment",
-            "simple",
-            "with.dots",
-            "under_score",
-        ];
-        for name in &names {
-            let encoded = encode_bookmark_for_filename(name);
-            let decoded = decode_bookmark_from_filename(&encoded);
-            assert_eq!(
-                &decoded, name,
-                "Round-trip failed for bookmark name '{}'",
-                name
-            );
+    fn make_registry(names: &[&str]) -> PlanRegistry {
+        let mut reg = PlanRegistry::new();
+        for name in names {
+            reg.track(crate::types::PlannedBookmark::new(
+                name.to_string(),
+                "placeholder".to_string(),
+            ));
         }
+        reg
     }
 
     // -- parse_plan_filename tests --
@@ -440,7 +407,8 @@ mod tests {
         fs::write(tmp.path().join("current.md"), "link").unwrap();
         fs::write(tmp.path().join(".stack"), "stack").unwrap();
 
-        let files = collect_plan_files(tmp.path());
+        let registry = make_registry(&["feat-auth", "fix-login"]);
+        let files = collect_plan_files(tmp.path(), &registry);
         assert_eq!(files.len(), 2);
 
         let names: Vec<&str> = files.iter().map(|f| f.bookmark_name.as_str()).collect();
@@ -449,14 +417,40 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_plan_files_with_slash_encoding() {
+    fn test_collect_plan_files_slash_via_registry() {
+        // File `01-feat--auth.md` with registry entry `feat/auth` → resolves to `feat/auth`
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("01-feat--auth.md"), "a").unwrap();
 
-        let files = collect_plan_files(tmp.path());
+        let registry = make_registry(&["feat/auth"]);
+        let files = collect_plan_files(tmp.path(), &registry);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].bookmark_name, "feat/auth");
         assert_eq!(files[0].filename, "01-feat--auth.md");
+    }
+
+    #[test]
+    fn test_collect_plan_files_double_dash_literal() {
+        // File `01-feat--auth.md` with registry entry `feat--auth` → resolves to `feat--auth`
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("01-feat--auth.md"), "a").unwrap();
+
+        let registry = make_registry(&["feat--auth"]);
+        let files = collect_plan_files(tmp.path(), &registry);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bookmark_name, "feat--auth");
+    }
+
+    #[test]
+    fn test_collect_plan_files_orphan() {
+        // File with no matching registry entry → raw encoded string as bookmark_name
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("01-orphan-file.md"), "a").unwrap();
+
+        let registry = make_registry(&["something-else"]);
+        let files = collect_plan_files(tmp.path(), &registry);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bookmark_name, "orphan-file");
     }
 
     // -- error state tests --
@@ -628,29 +622,5 @@ mod tests {
         assert!(tmp.path().join("01-feat--auth.md").exists());
     }
 
-    // -- plan_files_by_bookmark tests --
 
-    #[test]
-    fn test_plan_files_by_bookmark() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat-auth.md"), "x").unwrap();
-        fs::write(tmp.path().join("02-fix-login.md"), "y").unwrap();
-
-        let map = plan_files_by_bookmark(tmp.path());
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("feat-auth"));
-        assert!(map.contains_key("fix-login"));
-    }
-
-    #[test]
-    fn test_plan_files_by_bookmark_with_slashes() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat--auth.md"), "x").unwrap();
-        fs::write(tmp.path().join("02-user--duane--exp.md"), "y").unwrap();
-
-        let map = plan_files_by_bookmark(tmp.path());
-        assert_eq!(map.len(), 2);
-        assert!(map.contains_key("feat/auth"));
-        assert!(map.contains_key("user/duane/exp"));
-    }
 }

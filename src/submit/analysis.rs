@@ -87,8 +87,8 @@ pub fn get_base_branch(analysis: &SubmissionAnalysis, index: usize) -> String {
 /// The title is the first line of the plan file.
 /// The body is the remainder with `[scratch]` sections stripped and
 /// `plan-status: ✅` lines removed.
-pub fn plan_file_to_pr_content(plan_dir: &Path, bookmark_name: &str) -> Option<(String, String)> {
-    let plan_files = collect_plan_files(plan_dir);
+pub fn plan_file_to_pr_content(plan_dir: &Path, bookmark_name: &str, registry: &PlanRegistry) -> Option<(String, String)> {
+    let plan_files = collect_plan_files(plan_dir, registry);
 
     // Find the plan file for this bookmark
     let entry = plan_files

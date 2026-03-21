@@ -3,7 +3,7 @@
 //! Extracts common setup code shared by submit, sync, and merge commands.
 
 use crate::error::{JjPlanError, Result};
-use crate::plan_registry::load_registry;
+
 use crate::platform::{create_platform_service, parse_repo_info, PlatformService};
 use crate::pr_cache::{load_pr_cache, PrCache};
 use crate::types::PlanRegistry;
@@ -50,9 +50,10 @@ impl StackContext {
         workspace: &Workspace,
         workspace_root: &Path,
         remote: Option<&str>,
+        registry: &PlanRegistry,
     ) -> Result<Self> {
-        // Load plan registry and PR cache
-        let plan_registry = load_registry(workspace_root);
+        // Use caller-provided registry; load PR cache
+        let plan_registry = registry.clone();
         let pr_cache = load_pr_cache(workspace_root)?;
 
         // Get remotes and select one

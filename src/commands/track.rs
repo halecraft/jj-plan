@@ -1,7 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_registry;
-use crate::types::PlannedBookmark;
+use crate::types::{PlanRegistry, PlannedBookmark};
 use crate::workspace::Workspace;
 
 /// Run `jj plan track <bookmark-name>` — adopt an existing bookmark as a plan.
@@ -28,6 +28,7 @@ pub fn run_track(
     plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args: bookmark name (required positional)
@@ -73,7 +74,6 @@ pub fn run_track(
     // 3. Validate bookmark is not already registered
     // ------------------------------------------------------------------
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let mut registry = plan_registry::load_registry(&repo_root);
 
     if registry.is_tracked(&bookmark_name) {
         eprintln!(
@@ -83,26 +83,38 @@ pub fn run_track(
         return Ok(0); // Not an error — idempotent
     }
 
+    // Check for encoded-name collision (e.g. feat--auth vs feat/auth)
+    if let Some(existing) = registry.would_collide(&bookmark_name) {
+        let encoded = crate::plan_file::encode_bookmark_for_filename(&bookmark_name);
+        eprintln!(
+            "jj plan track: bookmark '{}' would collide with existing plan '{}' (both encode to filename '{}'). Rename one of them.",
+            bookmark_name, existing, encoded
+        );
+        return Ok(1);
+    }
+
     // ------------------------------------------------------------------
     // 4. Flush pending plan edits before mutation
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
     // ------------------------------------------------------------------
     // 5. Register in PlanRegistry
     // ------------------------------------------------------------------
-    registry.track(PlannedBookmark::new(
+    let mut registry_mut = plan_registry::load_registry(&repo_root);
+    registry_mut.track(PlannedBookmark::new(
         bookmark_name.clone(),
         bookmark.change_id.clone(),
     ));
-    plan_registry::save_registry(&repo_root, &registry);
+    plan_registry::save_registry(&repo_root, &registry_mut);
 
     // ------------------------------------------------------------------
     // 6. Reload, sync, and show
     // ------------------------------------------------------------------
     eprintln!("Tracking plan: {} (jj:{})", bookmark_name, bookmark.change_id);
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
+    let post_registry = plan_registry::load_registry(&repo_root);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
 
     Ok(0)
 }

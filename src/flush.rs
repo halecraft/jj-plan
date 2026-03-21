@@ -4,6 +4,7 @@ use std::path::Path;
 
 use crate::jj_binary::JjBinary;
 use crate::plan_file;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
 /// Flush ALL local plan file edits to jj descriptions.
@@ -17,14 +18,14 @@ use crate::workspace::Workspace;
 /// - Gather: collect plan files, resolve bookmark→change_id, batch-read descriptions (I/O)
 /// - Plan: diff file contents against descriptions → `Vec<FlushAction>` (pure)
 /// - Execute: shell out `jj describe` for each FlushAction (I/O)
-pub fn flush_all(plan_dir: &Path, jj: &JjBinary, workspace: &Workspace) {
+pub fn flush_all(plan_dir: &Path, jj: &JjBinary, workspace: &Workspace, registry: &PlanRegistry) {
     // Don't flush if current.md points to error.md (error state)
     if plan_file::is_error_state(plan_dir) {
         return;
     }
 
     // GATHER — collect plan files and their contents + jj descriptions
-    let gathered = gather_flush_state(plan_dir, workspace);
+    let gathered = gather_flush_state(plan_dir, workspace, registry);
 
     // PLAN — pure diff logic, no I/O
     let actions = plan_flush(&gathered);
@@ -49,9 +50,12 @@ struct FlushGatherState {
 
 /// Collect plan file contents and corresponding jj descriptions.
 ///
-/// Resolution chain: plan filename → bookmark name → change ID → description.
-fn gather_flush_state(plan_dir: &Path, workspace: &Workspace) -> FlushGatherState {
-    let plan_files = plan_file::plan_files_by_bookmark(plan_dir);
+/// Resolution chain: plan filename → (registry) → bookmark name → change ID → description.
+fn gather_flush_state(plan_dir: &Path, workspace: &Workspace, registry: &PlanRegistry) -> FlushGatherState {
+    let plan_files: HashMap<String, std::path::PathBuf> = plan_file::collect_plan_files(plan_dir, registry)
+        .into_iter()
+        .map(|e| (e.bookmark_name, e.path))
+        .collect();
 
     if plan_files.is_empty() {
         return FlushGatherState {
@@ -79,7 +83,7 @@ fn gather_flush_state(plan_dir: &Path, workspace: &Workspace) -> FlushGatherStat
             // Use the short change ID (reverse-hex) since that's what
             // `jj describe -r` expects and what gather_descriptions keys on.
             let short_id = workspace
-                .resolve_change_id(&bm.change_id)
+                .short_change_id_from_hex(&bm.change_id)
                 .unwrap_or_else(|| bm.change_id[..8.min(bm.change_id.len())].to_string());
             bookmark_to_change_id.insert(bookmark_name.clone(), short_id);
         }

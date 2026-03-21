@@ -2,15 +2,14 @@ use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
 use crate::merge::{create_merge_plan, execute_merge, MergeStep, PrInfo};
 use crate::plan_dir::PlanDir;
-use crate::plan_registry::load_registry;
 use crate::pr_cache::{load_pr_cache, save_pr_cache};
 use crate::stack_builder::{build_stack, collect_submission_chain, find_submit_target, narrow_segments};
 use crate::stack_context::StackContext;
 use crate::submit::{
-    analyze_submission, create_submission_plan, execute_submission, get_base_branch,
-    plan_file_to_pr_content, Phase, ProgressCallback, PushStatus, SubmissionResult,
+    analyze_submission, create_submission_plan, execute_submission,
+    Phase, ProgressCallback, PushStatus,
 };
-use crate::types::{MergeMethod, StackResult};
+use crate::types::{MergeMethod, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 
 use async_trait::async_trait;
@@ -24,6 +23,7 @@ pub fn dispatch_stack(
     _plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> Result<i32> {
     let subcommand = args.get(1).map(|s| s.as_str());
 
@@ -36,12 +36,12 @@ pub fn dispatch_stack(
     match subcommand {
         None => {
             // Bare `jj stack` — show stack visualization
-            show_stack_visualization(workspace);
+            show_stack_visualization(workspace, registry);
             Ok(0)
         }
-        Some("submit") => run_submit(workspace, &args[1..]),
-        Some("sync") => run_sync(workspace, &args[1..]),
-        Some("merge") => run_merge(workspace, &args[1..]),
+        Some("submit") => run_submit(workspace, &args[1..], registry),
+        Some("sync") => run_sync(workspace, &args[1..], registry),
+        Some("merge") => run_merge(workspace, &args[1..], registry),
         Some("auth") => run_auth(&args[1..]),
         Some(unknown) => {
             eprintln!("jj stack: unknown subcommand '{}'", unknown);
@@ -162,10 +162,59 @@ impl ProgressCallback for CliProgress {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract PR title and body from pre-collected plan file entries.
+///
+/// This avoids rescanning the plan directory per-segment — the caller
+/// collects plan files once and passes them in.
+fn plan_file_to_pr_content_from_entries(
+    plan_files: &[crate::plan_file::PlanFileEntry],
+    plan_dir: &std::path::Path,
+    bookmark_name: &str,
+) -> Option<(String, String)> {
+    let entry = plan_files
+        .iter()
+        .find(|f| f.bookmark_name == bookmark_name)?;
+
+    let content = std::fs::read_to_string(plan_dir.join(&entry.filename)).ok()?;
+
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    // First line = PR title
+    let mut lines = content.lines();
+    let title = lines.next()?.to_string();
+
+    if title.trim().is_empty() {
+        return None;
+    }
+
+    // Remainder = PR body
+    let body_raw: String = lines.collect::<Vec<_>>().join("\n");
+
+    // Strip [scratch] sections
+    let body_stripped = crate::markdown::strip_scratch_sections(&body_raw);
+
+    // Strip plan-status: ✅ lines
+    let body = body_stripped
+        .lines()
+        .filter(|line| !line.starts_with("plan-status: ✅"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    Some((title, body))
+}
+
+// ---------------------------------------------------------------------------
 // jj stack submit
 // ---------------------------------------------------------------------------
 
-fn run_submit(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
+fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         print_submit_help();
         return Ok(0);
@@ -178,10 +227,9 @@ fn run_submit(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
     let target_bookmark = first_positional(args);
 
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = load_registry(&repo_root);
 
     // Build stack
-    let stack_result = build_stack(workspace, Some(&registry));
+    let stack_result = build_stack(workspace, Some(registry));
     let stack = match stack_result {
         StackResult::Ok(stack) => stack,
         StackResult::Empty => {
@@ -263,13 +311,13 @@ fn run_submit(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
 async fn run_submit_async(
     workspace: &mut Workspace,
     repo_root: &std::path::Path,
-    registry: &crate::types::PlanRegistry,
+    registry: &PlanRegistry,
     target: &str,
     remote_override: Option<&str>,
     dry_run: bool,
     draft: bool,
 ) -> Result<i32> {
-    let ctx = StackContext::new(workspace, repo_root, remote_override).await?;
+    let ctx = StackContext::new(workspace, repo_root, remote_override, registry).await?;
 
     let stack_result = build_stack(workspace, Some(registry));
     let stack = match stack_result {
@@ -285,12 +333,13 @@ async fn run_submit_async(
 
     // Gather PR content from plan files
     let plan_dir = repo_root.join(".jj-plan");
+    let plan_files = crate::plan_file::collect_plan_files(&plan_dir, registry);
     let pr_content: Vec<(String, String, String)> = analysis
         .segments
         .iter()
         .map(|seg| {
             let bookmark = &seg.bookmark.name;
-            let (title, body) = plan_file_to_pr_content(&plan_dir, bookmark)
+            let (title, body) = plan_file_to_pr_content_from_entries(&plan_files, &plan_dir, bookmark)
                 .unwrap_or_else(|| {
                     let desc = seg
                         .changes
@@ -379,7 +428,7 @@ async fn run_submit_async(
 // jj stack sync
 // ---------------------------------------------------------------------------
 
-fn run_sync(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
+fn run_sync(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         print_sync_help();
         return Ok(0);
@@ -399,7 +448,7 @@ fn run_sync(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
         })?;
 
     rt.block_on(async {
-        run_sync_async(workspace, &repo_root, remote_override, dry_run).await
+        run_sync_async(workspace, &repo_root, remote_override, dry_run, registry).await
     })
 }
 
@@ -408,6 +457,7 @@ async fn run_sync_async(
     repo_root: &std::path::Path,
     remote_override: Option<&str>,
     dry_run: bool,
+    registry: &PlanRegistry,
 ) -> Result<i32> {
     // Determine remote for fetch
     let remotes = workspace.git_remotes()?;
@@ -424,8 +474,7 @@ async fn run_sync_async(
     }
 
     // Now do a submit (sync = fetch + submit)
-    let registry = load_registry(repo_root);
-    let stack_result = build_stack(workspace, Some(&registry));
+    let stack_result = build_stack(workspace, Some(registry));
     let stack = match stack_result {
         StackResult::Ok(stack) => stack,
         StackResult::Empty => {
@@ -438,7 +487,7 @@ async fn run_sync_async(
         }
     };
 
-    let narrowed = narrow_segments(&stack, &registry);
+    let narrowed = narrow_segments(&stack, registry);
     if narrowed.is_empty() {
         eprintln!("No plan-registered bookmarks in stack after fetch.");
         return Ok(0);
@@ -446,14 +495,14 @@ async fn run_sync_async(
 
     let target = narrowed.last().unwrap().bookmark.name.clone();
 
-    run_submit_async(workspace, repo_root, &registry, &target, remote_override, dry_run, false).await
+    run_submit_async(workspace, repo_root, registry, &target, remote_override, dry_run, false).await
 }
 
 // ---------------------------------------------------------------------------
 // jj stack merge
 // ---------------------------------------------------------------------------
 
-fn run_merge(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
+fn run_merge(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         print_merge_help();
         return Ok(0);
@@ -472,7 +521,7 @@ fn run_merge(workspace: &mut Workspace, args: &[String]) -> Result<i32> {
         })?;
 
     rt.block_on(async {
-        run_merge_async(workspace, &repo_root, remote_override, dry_run).await
+        run_merge_async(workspace, &repo_root, remote_override, dry_run, registry).await
     })
 }
 
@@ -481,11 +530,11 @@ async fn run_merge_async(
     repo_root: &std::path::Path,
     remote_override: Option<&str>,
     dry_run: bool,
+    registry: &PlanRegistry,
 ) -> Result<i32> {
-    let ctx = StackContext::new(workspace, repo_root, remote_override).await?;
+    let ctx = StackContext::new(workspace, repo_root, remote_override, registry).await?;
 
-    let registry = load_registry(repo_root);
-    let stack_result = build_stack(workspace, Some(&registry));
+    let stack_result = build_stack(workspace, Some(registry));
     let stack = match stack_result {
         StackResult::Ok(stack) => stack,
         StackResult::Empty => {
@@ -498,7 +547,7 @@ async fn run_merge_async(
         }
     };
 
-    let narrowed = narrow_segments(&stack, &registry);
+    let narrowed = narrow_segments(&stack, registry);
     if narrowed.is_empty() {
         eprintln!("No plan-registered bookmarks in stack.");
         return Ok(0);
@@ -637,8 +686,11 @@ async fn run_merge_async(
 
         // Post-merge cleanup
         let mut pr_cache = ctx.pr_cache;
+        // Untrack merged bookmarks from the registry (fixes orphan entries in plans.toml)
+        let mut registry_mut = crate::plan_registry::load_registry(repo_root);
         for bookmark in &merge_result.merged_bookmarks {
             pr_cache.remove(bookmark);
+            registry_mut.untrack(bookmark);
 
             // Delete local bookmark
             if let Err(e) = workspace.delete_bookmark(bookmark) {
@@ -647,11 +699,12 @@ async fn run_merge_async(
 
             // Remove plan file
             let plan_dir = repo_root.join(".jj-plan");
-            let plan_files = crate::plan_file::collect_plan_files(&plan_dir);
+            let plan_files = crate::plan_file::collect_plan_files(&plan_dir, &registry_mut);
             if let Some(entry) = plan_files.iter().find(|f| f.bookmark_name == *bookmark) {
                 let _ = std::fs::remove_file(plan_dir.join(&entry.filename));
             }
         }
+        crate::plan_registry::save_registry(repo_root, &registry_mut);
 
         // Save updated PR cache
         if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
@@ -802,11 +855,8 @@ fn run_auth(args: &[String]) -> Result<i32> {
 // ---------------------------------------------------------------------------
 
 /// Show stack visualization with bookmark structure and PR status.
-fn show_stack_visualization(workspace: &Workspace) {
-    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = load_registry(&repo_root);
-
-    let stack_result = build_stack(workspace, Some(&registry));
+fn show_stack_visualization(workspace: &Workspace, registry: &PlanRegistry) {
+    let stack_result = build_stack(workspace, Some(registry));
 
     match stack_result {
         StackResult::Empty => {
@@ -819,9 +869,10 @@ fn show_stack_visualization(workspace: &Workspace) {
         }
         StackResult::Ok(stack) => {
             // Load PR cache for status display
+            let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
             let pr_cache = load_pr_cache(&repo_root).ok();
 
-            let narrowed = narrow_segments(&stack, &registry);
+            let narrowed = narrow_segments(&stack, registry);
 
             // Display leaf-first (reverse of trunk-to-tip order)
             if narrowed.is_empty() && stack.segments.is_empty() {
@@ -835,9 +886,17 @@ fn show_stack_visualization(workspace: &Workspace) {
             // Show segments from tip to trunk
             for (i, seg) in narrowed.iter().enumerate().rev() {
                 let bookmark_name = &seg.bookmark.name;
-                let is_wc = seg.changes.first().is_some_and(|c| c.is_working_copy);
+                let tip = seg.changes.first();
+                let is_wc = tip.is_some_and(|c| c.is_working_copy);
                 let is_synced = seg.bookmark.is_synced;
-                let is_done = seg.changes.first().is_some_and(|c| c.is_done());
+                let is_done = tip.is_some_and(|c| c.is_done());
+
+                // Resolve short change ID for display.
+                // LogEntry.change_id stores standard hex; we need the short
+                // reverse-hex form that jj uses for display and revsets.
+                let short_change_id = tip
+                    .and_then(|c| workspace.short_change_id_from_hex(&c.change_id))
+                    .unwrap_or_default();
 
                 // Build status indicators
                 let mut indicators = Vec::new();
@@ -871,14 +930,15 @@ fn show_stack_visualization(workspace: &Workspace) {
                 };
 
                 eprintln!(
-                    "  {} {} {}",
+                    "  {} {} {} {}",
                     if is_wc { "◉" } else { "○" },
                     bookmark_name,
+                    short_change_id,
                     indicator_str,
                 );
 
                 // Show first line of description
-                if let Some(change) = seg.changes.first() {
+                if let Some(change) = tip {
                     eprintln!("  │ {}", change.first_line());
                 }
 

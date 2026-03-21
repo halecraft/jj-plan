@@ -1,6 +1,5 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
-use crate::plan_registry;
 use crate::types::{PlanRegistry, Stack, StackResult};
 use crate::workspace::Workspace;
 
@@ -23,16 +22,15 @@ pub fn plan_next(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
-    // 2. Load registry and build stack
+    // 2. Build stack
     workspace.reload();
-    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = plan_registry::load_registry(&repo_root);
 
-    let (targets, current_idx) = match resolve_targets_and_position(workspace, &registry) {
+    let (targets, current_idx) = match resolve_targets_and_position(workspace, registry) {
         Some(result) => result,
         None => {
             eprintln!("No plans in stack");
@@ -44,7 +42,7 @@ pub fn plan_next(
     if current_idx >= targets.len() - 1 {
         eprintln!("Already at the last plan");
         workspace.reload();
-        crate::wrap::resolve_and_sync(plan_dir, workspace);
+        crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
         return Ok(0);
     }
 
@@ -57,7 +55,7 @@ pub fn plan_next(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
     Ok(0)
 }
 
@@ -66,16 +64,15 @@ pub fn plan_prev(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
-    // 2. Load registry and build stack
+    // 2. Build stack
     workspace.reload();
-    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = plan_registry::load_registry(&repo_root);
 
-    let (targets, current_idx) = match resolve_targets_and_position(workspace, &registry) {
+    let (targets, current_idx) = match resolve_targets_and_position(workspace, registry) {
         Some(result) => result,
         None => {
             eprintln!("No plans in stack");
@@ -87,7 +84,7 @@ pub fn plan_prev(
     if current_idx == 0 {
         eprintln!("Already at the first plan");
         workspace.reload();
-        crate::wrap::resolve_and_sync(plan_dir, workspace);
+        crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
         return Ok(0);
     }
 
@@ -100,7 +97,7 @@ pub fn plan_prev(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
     Ok(0)
 }
 
@@ -116,16 +113,15 @@ pub fn plan_go(
     plan_dir: &PlanDir,
     target: &str,
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
-    // 2. Load registry and build stack
+    // 2. Build stack
     workspace.reload();
-    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = plan_registry::load_registry(&repo_root);
 
-    let targets = match build_nav_targets(workspace, &registry) {
+    let targets = match build_nav_targets(workspace, registry) {
         Some(t) if !t.is_empty() => t,
         _ => {
             eprintln!("No plans in stack");
@@ -182,7 +178,7 @@ pub fn plan_go(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
     Ok(0)
 }
 
@@ -215,7 +211,7 @@ fn stack_to_nav_targets(stack: &Stack, workspace: &Workspace) -> Vec<NavTarget> 
     for segment in &stack.segments {
         if let Some(tip) = segment.changes.first() {
             let short_id = workspace
-                .resolve_change_id(&tip.change_id)
+                .short_change_id_from_hex(&tip.change_id)
                 .unwrap_or_else(|| {
                     tip.change_id[..8.min(tip.change_id.len())].to_string()
                 });

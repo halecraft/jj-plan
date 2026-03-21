@@ -22,6 +22,7 @@ mod wrap;
 use error::JjPlanError;
 use jj_binary::JjBinary;
 use plan_dir::{find_repo_root, resolve_plan_dir};
+use plan_registry::load_registry;
 
 
 /// Read-only commands that get zero-overhead passthrough via exec.
@@ -125,26 +126,29 @@ fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
         }
     };
 
+    // Load plan registry once — all command paths receive this reference.
+    let registry = load_registry(&repo_root);
+
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace);
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace, &registry);
     }
 
     // Special handling for "stack" subcommand (PR operations)
     if subcommand == "stack" {
-        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace);
+        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace, &registry);
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace);
+        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace, &registry);
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace);
+        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace, &registry);
     }
 
     // All other commands: wrap lifecycle (flush → command → reload → sync → show)
-    wrap::wrap(&plan_dir, jj, args, &mut workspace)
+    wrap::wrap(&plan_dir, jj, args, &mut workspace, &registry)
 }

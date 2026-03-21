@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_file;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
 /// Intercept `jj describe -m "..."` to write the message to the plan file first.
@@ -22,13 +23,14 @@ pub fn handle_describe(
     plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // 1. Parse describe args to find -m/--message values and -r/--revision target
     let parsed = parse_describe_args(args);
 
     // If no -m/--message found, this is editor-mode → pass through to wrap
     if parsed.messages.is_empty() {
-        return crate::wrap::wrap(plan_dir, jj, args, workspace);
+        return crate::wrap::wrap(plan_dir, jj, args, workspace, registry);
     }
 
     // 2. Build the concatenated message (jj concatenates multiple -m with newlines)
@@ -43,7 +45,7 @@ pub fn handle_describe(
     // 5. Find the matching plan file by bookmark name and write the message to it.
     //    Resolution chain: target revset → change ID → bookmark name → plan file.
     if let Some(ref change_id) = target_change_id {
-        let plan_files = plan_file::collect_plan_files(&plan_dir.path);
+        let plan_files = plan_file::collect_plan_files(&plan_dir.path, registry);
 
         // Find which bookmark points to the target change
         let bookmark_name = resolve_bookmark_for_change(workspace, change_id);
@@ -77,7 +79,7 @@ pub fn handle_describe(
     // After flush, jj description matches the file. Then `jj describe -m "..."`
     // sets the same content again (idempotent). Then sync reads jj and writes
     // back to files. All consistent.
-    crate::wrap::wrap(plan_dir, jj, args, workspace)
+    crate::wrap::wrap(plan_dir, jj, args, workspace, registry)
 }
 
 // ---------------------------------------------------------------------------

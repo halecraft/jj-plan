@@ -266,6 +266,34 @@ impl PlanRegistry {
     pub fn tracked_names(&self) -> Vec<&str> {
         self.bookmarks.iter().map(|b| b.name.as_str()).collect()
     }
+
+    /// Resolve an encoded filename portion to the canonical bookmark name.
+    ///
+    /// For each file `NN-ENCODED.md` on disk, this finds the registry entry
+    /// whose `encode_bookmark_for_filename(entry.name)` matches `encoded`.
+    /// Returns the canonical bookmark name, or `None` if no entry matches.
+    ///
+    /// This is the core of registry-authoritative resolution: filenames are
+    /// never decoded — they are matched against the registry instead.
+    pub fn resolve_encoded(&self, encoded: &str) -> Option<&str> {
+        self.bookmarks
+            .iter()
+            .find(|b| crate::plan_file::encode_bookmark_for_filename(&b.name) == encoded)
+            .map(|b| b.name.as_str())
+    }
+
+    /// Check whether registering `new_name` would collide with an existing
+    /// registry entry at the encoded-filename level.
+    ///
+    /// Returns the colliding entry's canonical bookmark name, or `None` if
+    /// no collision exists. For example, `feat--auth` collides with
+    /// `feat/auth` because both encode to filename portion `feat--auth`.
+    ///
+    /// This should be called **before** the new bookmark is registered.
+    /// If it returns `Some(existing)`, the registration should be rejected.
+    pub fn would_collide(&self, new_name: &str) -> Option<&str> {
+        self.resolve_encoded(&crate::plan_file::encode_bookmark_for_filename(new_name))
+    }
 }
 
 /// A narrowed bookmark segment for downstream submit/merge operations.
@@ -544,6 +572,92 @@ mod tests {
         // Should still have exactly one entry with the original change_id
         assert_eq!(reg.bookmarks.len(), 1);
         assert_eq!(reg.get("feat-auth").unwrap().change_id, "aabb");
+    }
+
+    #[test]
+    fn test_resolve_encoded_simple() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        assert_eq!(reg.resolve_encoded("feat-auth"), Some("feat-auth"));
+    }
+
+    #[test]
+    fn test_resolve_encoded_slash() {
+        // `feat/auth` encodes to `feat--auth` in filenames
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat/auth", "aabb"));
+        assert_eq!(reg.resolve_encoded("feat--auth"), Some("feat/auth"));
+    }
+
+    #[test]
+    fn test_resolve_encoded_literal_double_dash() {
+        // A bookmark literally named `feat--auth` also encodes to `feat--auth`
+        // (encode only replaces `/` → `--`, not `--` → anything).
+        // This IS the collision scenario: `feat--auth` and `feat/auth` both
+        // encode to `feat--auth`. Phase 4 adds collision detection at
+        // registration time to prevent this.
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat--auth", "aabb"));
+        assert_eq!(reg.resolve_encoded("feat--auth"), Some("feat--auth"));
+    }
+
+    #[test]
+    fn test_resolve_encoded_miss() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        assert_eq!(reg.resolve_encoded("fix-login"), None);
+    }
+
+    #[test]
+    fn test_would_collide_slash_vs_double_dash() {
+        // feat/auth encodes to feat--auth; registering feat--auth should collide
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat/auth", "aabb"));
+        assert_eq!(reg.would_collide("feat--auth"), Some("feat/auth"));
+    }
+
+    #[test]
+    fn test_would_collide_double_dash_vs_slash() {
+        // Reverse direction: feat--auth registered first, feat/auth collides
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat--auth", "aabb"));
+        assert_eq!(reg.would_collide("feat/auth"), Some("feat--auth"));
+    }
+
+    #[test]
+    fn test_would_collide_no_collision() {
+        // feat-auth (single dash) does NOT collide with feat/auth (encodes to feat--auth)
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat/auth", "aabb"));
+        assert_eq!(reg.would_collide("feat-auth"), None);
+    }
+
+    #[test]
+    fn test_would_collide_self_match() {
+        // A name that is already registered "collides" with itself.
+        // Callers should check is_tracked() first to distinguish
+        // self-match from a genuine collision with a different name.
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        assert_eq!(reg.would_collide("feat-auth"), Some("feat-auth"));
+    }
+
+    #[test]
+    fn test_would_collide_empty_registry() {
+        let reg = PlanRegistry::new();
+        assert_eq!(reg.would_collide("anything"), None);
+    }
+
+    #[test]
+    fn test_resolve_encoded_collision_returns_first_match() {
+        // Both `feat/auth` and `feat--auth` encode to `feat--auth`.
+        // resolve_encoded returns the first registered match (feat/auth was
+        // registered first). In practice, Phase 4 prevents this state by
+        // rejecting colliding registrations.
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat/auth", "aabb"));
+        reg.track(PlannedBookmark::new("feat--auth", "ccdd"));
+        assert_eq!(reg.resolve_encoded("feat--auth"), Some("feat/auth"));
     }
 
     #[test]

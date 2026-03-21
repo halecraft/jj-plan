@@ -6,6 +6,7 @@ use crate::plan_dir::PlanDir;
 use crate::plan_file::{
     self, PlanFileEntry, remove_or_warn, rename_or_warn, write_or_warn,
 };
+use crate::types::PlanRegistry;
 use crate::wrap::SyncChangeView;
 
 // ---------------------------------------------------------------------------
@@ -24,11 +25,12 @@ pub fn sync(
     plan_dir: &PlanDir,
     stack_changes: Option<&[SyncChangeView]>,
     max_stack_size: usize,
+    registry: &PlanRegistry,
 ) {
     let dir = &plan_dir.path;
 
     // GATHER — read directory once
-    let current_state = gather_current_state(dir);
+    let current_state = gather_current_state(dir, registry);
 
     // PLAN — pure decision logic, no I/O
     let plan = plan_sync(&current_state, stack_changes, max_stack_size);
@@ -94,8 +96,8 @@ struct CurrentPlanState {
 }
 
 /// Read the plan directory once and build the current state snapshot.
-fn gather_current_state(plan_dir: &Path) -> CurrentPlanState {
-    let entries = plan_file::collect_plan_files(plan_dir);
+fn gather_current_state(plan_dir: &Path, registry: &PlanRegistry) -> CurrentPlanState {
+    let entries = plan_file::collect_plan_files(plan_dir, registry);
     let bookmark_to_filename = entries
         .iter()
         .map(|e| (e.bookmark_name.clone(), e.filename.clone()))
@@ -379,8 +381,8 @@ pub fn generate_stack_summary(
         let first_line = change.first_line();
 
         lines.push(format!(
-            "{} {} {}-{} :: {}",
-            here, status, padded, change.bookmark_name, first_line
+            "{} {} {}-{} {} :: {}",
+            here, status, padded, change.bookmark_name, change.change_id, first_line
         ));
     }
 
@@ -464,9 +466,9 @@ mod tests {
 
         let summary = generate_stack_summary(&changes, Some("03-feat-jwt.md"));
 
-        assert!(summary.contains("    01-feat-auth :: Refactor auth middleware"));
-        assert!(summary.contains("  ~ 02-feat-extract :: Extract auth module"));
-        assert!(summary.contains("*   03-feat-jwt :: Implement JWT strategy"));
+        assert!(summary.contains("    01-feat-auth kpqxywon :: Refactor auth middleware"));
+        assert!(summary.contains("  ~ 02-feat-extract mtzrlpvq :: Extract auth module"));
+        assert!(summary.contains("*   03-feat-jwt ykvsnxrl :: Implement JWT strategy"));
     }
 
     #[test]
@@ -481,7 +483,7 @@ mod tests {
         }];
 
         let summary = generate_stack_summary(&changes, Some("01-feat-done.md"));
-        assert!(summary.contains("* ✓ 01-feat-done :: Done task"));
+        assert!(summary.contains("* ✓ 01-feat-done abcdefgh :: Done task"));
     }
 
     #[test]
@@ -603,8 +605,8 @@ mod tests {
         let plan = plan_sync(&state, Some(&changes), 50);
 
         let summary = plan.stack_summary.as_ref().unwrap();
-        assert!(summary.contains("*   01-feat-auth :: First plan"));
-        assert!(summary.contains("  ~ 02-feat-session :: Second plan"));
+        assert!(summary.contains("*   01-feat-auth aaa :: First plan"));
+        assert!(summary.contains("  ~ 02-feat-session bbb :: Second plan"));
     }
 
     #[test]

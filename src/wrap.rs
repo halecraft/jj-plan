@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 use crate::sync;
 
@@ -20,9 +21,10 @@ pub fn wrap(
     jj: &JjBinary,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // 1. Flush all local plan file edits to jj descriptions
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
     // 2. Run the actual jj command with inherited stdio
     let status = jj.run_inherit_strings(args)?;
@@ -30,7 +32,7 @@ pub fn wrap(
 
     // 3-6. Reload repo, re-resolve stack, sync plan files, show stack
     workspace.reload();
-    resolve_and_sync(plan_dir, workspace);
+    resolve_and_sync(plan_dir, workspace, registry);
 
     Ok(exit_code)
 }
@@ -43,7 +45,7 @@ pub fn wrap(
 ///
 /// Callers must call `workspace.reload()` after CLI mutations before
 /// calling this.
-pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
+pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
     let max_stack_size = crate::plan_dir::plan_max();
 
     // Migrate any legacy change-ID-based filenames to bookmark-named files.
@@ -68,8 +70,8 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
     });
 
     // Build sync views from the registry-filtered stack
-    let sync_changes = build_sync_views(workspace);
-    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size);
+    let sync_changes = build_sync_views(workspace, registry);
+    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
     sync::show_stack(plan_dir);
 }
 
@@ -77,22 +79,18 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace) {
 ///
 /// This is the single shared function for converting the repository's
 /// stack state into the flat list that sync, done, and other modules
-/// consume. It loads the `PlanRegistry`, builds the stack with registry
-/// filtering, and converts each segment's tip commit into a
-/// `SyncChangeView`.
+/// consume. It accepts a `&PlanRegistry` (loaded once per command),
+/// builds the stack with registry filtering, and converts each segment's
+/// tip commit into a `SyncChangeView`.
 ///
 /// Returns `None` when the stack is empty, contains merge commits, or
 /// has no registry-matching segments.
-pub fn build_sync_views(workspace: &Workspace) -> Option<Vec<SyncChangeView>> {
-    // Load plan registry for filtered stack building
-    let repo_root = workspace.jj_workspace().workspace_root();
-    let registry = crate::plan_registry::load_registry(repo_root);
-
+pub fn build_sync_views(workspace: &Workspace, registry: &PlanRegistry) -> Option<Vec<SyncChangeView>> {
     // Build the stack using the new builder with registry filtering
-    let stack_result = crate::stack_builder::build_stack(workspace, Some(&registry));
+    let stack_result = crate::stack_builder::build_stack(workspace, Some(registry));
 
     // Convert to the adapter type
-    stack_to_sync_changes(&stack_result, workspace, &registry)
+    stack_to_sync_changes(&stack_result, workspace, registry)
 }
 
 /// A lightweight view of a stack change for sync and flush.
@@ -153,8 +151,10 @@ fn stack_to_sync_changes(
                 // The tip commit is changes[0] (newest first)
                 if let Some(tip) = segment.changes.first() {
                     // We need the short change ID for `jj describe -r`.
+                    // LogEntry.change_id stores standard hex; convert to the
+                    // short reverse-hex form that jj uses for display and revsets.
                     let short_id = workspace
-                        .resolve_change_id(&tip.change_id)
+                        .short_change_id_from_hex(&tip.change_id)
                         .unwrap_or_else(|| tip.change_id[..8].to_string());
 
                     // Find the registered plan bookmark for this segment.

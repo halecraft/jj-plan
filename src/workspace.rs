@@ -33,6 +33,7 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use jj_lib::backend::ChangeId;
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{
@@ -254,6 +255,26 @@ impl Workspace {
     /// display and revset resolution.
     pub fn short_change_id(&self, commit: &Commit) -> String {
         short_change_id(&self.repo, commit)
+    }
+
+    /// Convert a standard-hex change ID string to its short reverse-hex form.
+    ///
+    /// `LogEntry.change_id` stores `commit.change_id().hex()` (standard hex).
+    /// This method decodes that back to bytes, computes the shortest unique
+    /// prefix via the repo index, and returns the reverse-hex encoding that
+    /// jj uses for display and revset resolution.
+    ///
+    /// Returns `None` if the hex string is invalid.
+    pub fn short_change_id_from_hex(&self, hex_change_id: &str) -> Option<String> {
+        let change_id = ChangeId::try_from_hex(hex_change_id)?;
+        let prefix_len = self
+            .repo
+            .shortest_unique_change_id_prefix_len(&change_id)
+            .unwrap_or(8)
+            .max(8);
+        let reverse_hex = encode_reverse_hex(change_id.as_bytes());
+        let len = prefix_len.min(reverse_hex.len());
+        Some(reverse_hex[..len].to_string())
     }
 
     // -----------------------------------------------------------------------

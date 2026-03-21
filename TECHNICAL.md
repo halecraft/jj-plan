@@ -224,7 +224,26 @@ Uses a **gather → plan → execute** architecture:
 
 ### Phase 5: Show stack
 
-Print the `.stack` file to stderr.
+Print the `.stack` file to stderr. Each line has the format:
+
+```
+{here} {status} {NN}-{bookmark_name} {change_id} :: {first_line}
+```
+
+- `{here}` = `*` if this is the working copy, blank otherwise.
+- `{status}` = `✓` (done), `~` (has file changes), or blank (empty/not started).
+- `{NN}` = zero-padded position (01 = closest to trunk).
+- `{bookmark_name}` = the plan bookmark name.
+- `{change_id}` = short reverse-hex change ID (the same form used in `jj log`, usable with `jj show`, `jj edit`, and `jj:` references in code comments).
+- `{first_line}` = first line of the change description.
+
+Example `.stack` output:
+
+```
+  ✓ 01-feat-auth kpqxywon :: Extract auth module
+  ~ 02-feat-session mtzrlpvq :: Implement session management
+*   03-feat-api ykvsnxrl :: Add API endpoints
+```
 
 ---
 
@@ -239,6 +258,21 @@ Examples:
 - `feat-auth` → `01-feat-auth.md`
 - `stack/auth` → `02-stack--auth.md`
 - `user/feature/login` → `03-user--feature--login.md`
+
+### Registry-authoritative resolution
+
+Filenames are **never decoded** back to bookmark names via string replacement. Instead, when reading the plan directory, each `NN-ENCODED.md` file is matched against the `PlanRegistry` to find the canonical bookmark name:
+
+1. Parse `NN-ENCODED.md` to extract the encoded portion.
+2. Call `registry.resolve_encoded(ENCODED)` — this finds the registry entry whose `encode_bookmark_for_filename(entry.name)` matches.
+3. If found → the bookmark name comes from the registry (the source of truth).
+4. If not found → the raw encoded string is used (orphan/legacy file).
+
+This eliminates the old `decode_bookmark_from_filename()` function, which was a lossy inverse of a non-injective encoding (`--` → `/` was ambiguous: a bookmark literally named `feat--auth` and one named `feat/auth` both encode to the same filename).
+
+### Collision detection
+
+At registration time (`jj plan new`, `jj plan track`), the `PlanRegistry::would_collide()` method checks whether the new bookmark's encoded filename would collide with any existing registry entry. For example, `feat--auth` and `feat/auth` both encode to filename portion `feat--auth` — registering one when the other already exists is rejected with an error message identifying both names and the shared encoding.
 
 ### Legacy migration
 
@@ -265,6 +299,15 @@ planned_at = "2025-01-15T11:00:00Z"
 ```
 
 The registry handles jj workspace indirection — in child workspaces (created via `jj workspace add`), `.jj/repo` is a text file pointing to the parent's repo directory. `resolve_repo_path()` reads this pointer transparently.
+
+### Expanded role in filename resolution
+
+Beyond tracking which bookmarks are plans, the registry is the **authoritative source** for mapping filenames back to bookmark names. Key methods:
+
+- **`resolve_encoded(encoded) → Option<&str>`** — Given the encoded portion of a filename, finds the registry entry whose encoded name matches and returns its canonical bookmark name. Used by `collect_plan_files()` in the flush and sync gather phases.
+- **`would_collide(new_name) → Option<&str>`** — Checks whether registering `new_name` would produce a filename that collides with an existing entry. Returns the colliding entry's name, or `None`. Used by `run_new()` and `run_track()` before registration.
+
+This design means the registry is loaded once per command and threaded through all call sites. Commands that mutate the registry (`new`, `track`, `untrack`, `merge`) use a pre-mutation registry for flush (resolving existing files) and a post-mutation registry for sync (generating files for newly tracked bookmarks).
 
 ---
 
@@ -490,21 +533,22 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 ### Unit tests (`cargo test`)
 
-192 tests covering:
+198 tests covering:
 
 | Module | Tests | Covers |
 |---|---|---|
-| `types.rs` | 10 | `LogEntry` methods, `PlanRegistry` CRUD, TOML roundtrip |
+| `types.rs` | 20 | `LogEntry` methods, `PlanRegistry` CRUD, `resolve_encoded`, `would_collide`, TOML roundtrip |
+| `commands/` | 40 | Dispatch, describe interception, navigation, new/track/untrack, stack commands |
+| `plan_file.rs` | 30 | Filename parsing, bookmark encoding, registry-based resolution, legacy detection |
 | `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain` |
-| `plan_file.rs` | 23 | Filename parsing, bookmark encoding/decoding, legacy detection |
-| `sync.rs` | 49 | Gather/plan/execute phases, symlink targeting, edge cases |
-| `flush.rs` | 8 | Description comparison, bookmark-based resolution |
-| `markdown.rs` | 24 | Scratch stripping, code fence immunity, edge cases |
-| `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
+| `markdown.rs` | 20 | Scratch stripping, code fence immunity, edge cases |
+| `template.rs` | 16 | Resolution chain, interpolation, bookmark placeholders, fallback |
+| `sync.rs` | 14 | Gather/plan/execute phases, symlink targeting, edge cases |
+| `plan_dir.rs` | 8 | Directory resolution, plan max |
 | `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
-| `template.rs` | 8 | Resolution chain, interpolation, fallback |
+| `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
+| `flush.rs` | 6 | Description comparison, bookmark-based resolution |
 | `platform/detection.rs` | 5 | URL parsing, platform detection |
-| Other modules | 26 | Commands, describe interception, navigation |
 
 ### Bats integration tests (`./test.sh`)
 

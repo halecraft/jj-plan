@@ -5,10 +5,10 @@
 **jj-plan** stores implementation plans as [Jujutsu](https://github.com/jj-vcs/jj) change descriptions and syncs them to markdown files in your editor. Plans are drafted, reviewed, and validated *before* code is written. When you're ready, `jj stack submit` pushes your stack as PRs — with the plan as the PR description.
 
 ```
-  ◉ feat-session (@)
+  ◉ feat-session mtzrlpvq (@)
   │ Implement session management
   │
-  ○ feat-auth (synced, PR #42)
+  ○ feat-auth kpqxywon (synced, PR #42)
   │ Extract auth module
   │
   ◆ trunk()
@@ -78,21 +78,21 @@ Working copy  (@) : ykvsnxrl 3a7b2c1d Implement session management
 Parent commit (@-): mtzrlpvq 8f2e4a6b Extract auth module
 
 Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
-  ✓ 01-feat-auth    :: Extract auth module
-  ~ 02-feat-session  :: Implement session management
-*   03-feat-api      :: Add API endpoints
+  ✓ 01-feat-auth kpqxywon :: Extract auth module
+  ~ 02-feat-session mtzrlpvq :: Implement session management
+*   03-feat-api ykvsnxrl :: Add API endpoints
 ```
 
 `jj stack` shows the PR-aware visualization:
 
 ```
-  ◉ feat-api (@)
+  ◉ feat-api ykvsnxrl (@)
   │ Add API endpoints
   │
-  ○ feat-session (synced, PR #43)
+  ○ feat-session mtzrlpvq (synced, PR #43)
   │ Implement session management
   │
-  ○ feat-auth (synced, PR #42)
+  ○ feat-auth kpqxywon (synced, PR #42)
   │ Extract auth module
   │
   ◆ trunk()
@@ -280,6 +280,7 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Plans have status tracking | `plan-status: ✅` in description; inferred from empty/non-empty |
 | Plans have working memory | `[scratch]` sections for drafts; `jj plan done` strips them |
 | `jj describe` works naturally | `-m` mode intercepted and routed through plan files |
+| Change IDs visible in stack | `.stack` and `jj stack` show short reverse-hex IDs — copy-paste into `jj show`, `jj edit`, or `jj:` references |
 | Stack is always visible | `jj status` appends the plan stack summary |
 | Stack is navigable | `jj plan next`/`prev`/`go` for index, change ID, or bookmark-based movement |
 | New plans are structured | Configurable templates with `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation |
@@ -333,7 +334,7 @@ bats jj-plan.bats              # sequential
 - **Template repo**: A jj repo with `.jj-plan/` is created once per run. Each test gets an isolated `cp -r` copy (~2ms).
 - **Direct bats style**: Tests run commands inline — no wrapper functions, no subshells.
 - **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
-- **Unit tests**: 192 tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
+- **Unit tests**: 198 tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
 
 ## Documentation
 

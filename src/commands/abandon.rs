@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
 /// Run `jj abandon` with the standard wrap lifecycle.
@@ -15,7 +16,8 @@ pub fn run_abandon(
     plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // Standard lifecycle: flush → command → reload → sync → show
-    crate::wrap::wrap(plan_dir, jj, args, workspace)
+    crate::wrap::wrap(plan_dir, jj, args, workspace, registry)
 }

@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_registry;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
 /// Run `jj plan untrack <bookmark-name>` — remove a bookmark from plan tracking.
@@ -26,6 +27,7 @@ pub fn run_untrack(
     plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
+    registry: &PlanRegistry,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args: bookmark name (required positional)
@@ -47,7 +49,6 @@ pub fn run_untrack(
     // 2. Validate bookmark is currently registered
     // ------------------------------------------------------------------
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let mut registry = plan_registry::load_registry(&repo_root);
 
     if !registry.is_tracked(&bookmark_name) {
         eprintln!(
@@ -70,20 +71,22 @@ pub fn run_untrack(
     // ------------------------------------------------------------------
     // 3. Flush pending plan edits before mutation
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, workspace);
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
 
     // ------------------------------------------------------------------
     // 4. Remove from PlanRegistry
     // ------------------------------------------------------------------
-    registry.untrack(&bookmark_name);
-    plan_registry::save_registry(&repo_root, &registry);
+    let mut registry_mut = plan_registry::load_registry(&repo_root);
+    registry_mut.untrack(&bookmark_name);
+    plan_registry::save_registry(&repo_root, &registry_mut);
 
     // ------------------------------------------------------------------
     // 5. Reload, sync, and show
     // ------------------------------------------------------------------
     eprintln!("Untracked plan: {}", bookmark_name);
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace);
+    let post_registry = plan_registry::load_registry(&repo_root);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
 
     Ok(0)
 }
