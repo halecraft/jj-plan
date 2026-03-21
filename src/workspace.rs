@@ -111,34 +111,48 @@ impl Workspace {
     /// snapshot the working copy, resolve operation conflicts, or import git
     /// refs — we just need a read-only view.
     pub fn open(repo_root: &Path) -> Option<Self> {
-        let config = build_minimal_config(repo_root)?;
-        let settings = UserSettings::from_config(config).ok()?;
+        debug_log!("Workspace::open({:?})", repo_root);
+
+        let config = match build_minimal_config(repo_root) {
+            Some(c) => { debug_log!("  config: OK"); c }
+            None => { debug_log!("  FAIL: build_minimal_config returned None"); return None; }
+        };
+        let settings = match UserSettings::from_config(config) {
+            Ok(s) => { debug_log!("  settings: OK"); s }
+            Err(e) => { debug_log!("  FAIL: UserSettings::from_config: {e}"); return None; }
+        };
 
         let store_factories = StoreFactories::default();
         let working_copy_factories = default_working_copy_factories();
 
-        let workspace =
-            jj_lib::workspace::Workspace::load(
+        let workspace = match jj_lib::workspace::Workspace::load(
                 &settings,
                 repo_root,
                 &store_factories,
                 &working_copy_factories,
-            )
-            .ok()?;
+            ) {
+            Ok(w) => { debug_log!("  workspace load: OK"); w }
+            Err(e) => { debug_log!("  FAIL: Workspace::load: {e}"); return None; }
+        };
 
         // Load at the latest operation (resolve concurrent op heads by picking
         // the first one — we only need a read-only snapshot, not perfect merging).
         let loader = workspace.repo_loader();
-        let op = op_heads_store::resolve_op_heads(
+        let op = match op_heads_store::resolve_op_heads(
             loader.op_heads_store().as_ref(),
             loader.op_store(),
             |mut op_heads: Vec<jj_lib::operation::Operation>| -> Result<_, OpResolveError> {
                 Ok(op_heads.pop().unwrap())
             },
-        )
-        .ok()?;
+        ) {
+            Ok(o) => { debug_log!("  op heads resolve: OK"); o }
+            Err(e) => { debug_log!("  FAIL: resolve_op_heads: {e:?}"); return None; }
+        };
 
-        let repo = loader.load_at(&op).ok()?;
+        let repo = match loader.load_at(&op) {
+            Ok(r) => { debug_log!("  repo load: OK"); r }
+            Err(e) => { debug_log!("  FAIL: loader.load_at: {e}"); return None; }
+        };
 
         Some(Self { workspace, repo })
     }
@@ -878,10 +892,18 @@ fn evaluate_revset(
     workspace: &jj_lib::workspace::Workspace,
     revset_str: &str,
 ) -> Option<Vec<Commit>> {
+    debug_log!("evaluate_revset({:?})", revset_str);
+    debug_log!("  workspace_root = {:?}", workspace.workspace_root());
+    debug_log!("  workspace_name = {:?}", workspace.workspace_name());
+
     let aliases_map = load_revset_aliases(repo);
     let extensions = RevsetExtensions::default();
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => { debug_log!("  FAIL: current_dir: {e}"); return None; }
+    };
     let path_converter = jj_lib::repo_path::RepoPathUiConverter::Fs {
-        cwd: std::env::current_dir().ok()?,
+        cwd,
         base: workspace.workspace_root().to_owned(),
     };
     let workspace_ctx = RevsetWorkspaceContext {
@@ -901,20 +923,30 @@ fn evaluate_revset(
         workspace: Some(workspace_ctx),
     };
 
-    let expression = revset::parse(&mut diagnostics, revset_str, &context).ok()?;
+    let expression = match revset::parse(&mut diagnostics, revset_str, &context) {
+        Ok(e) => { debug_log!("  parse: OK"); e }
+        Err(e) => { debug_log!("  FAIL: parse error: {e}"); return None; }
+    };
     let no_extensions: Vec<Box<dyn SymbolResolverExtension>> = vec![];
     let symbol_resolver = SymbolResolver::new(repo.as_ref(), &no_extensions);
-    let resolved = expression
-        .resolve_user_expression(repo.as_ref(), &symbol_resolver)
-        .ok()?;
-    let revset_result = resolved.evaluate(repo.as_ref()).ok()?;
+    let resolved = match expression.resolve_user_expression(repo.as_ref(), &symbol_resolver) {
+        Ok(r) => { debug_log!("  resolve: OK"); r }
+        Err(e) => { debug_log!("  FAIL: resolve error: {e}"); return None; }
+    };
+    let revset_result = match resolved.evaluate(repo.as_ref()) {
+        Ok(r) => { debug_log!("  evaluate: OK"); r }
+        Err(e) => { debug_log!("  FAIL: evaluate error: {e}"); return None; }
+    };
 
     let mut commits = Vec::new();
     for commit_or_err in revset_result.iter().commits(repo.store()) {
-        let commit = commit_or_err.ok()?;
-        commits.push(commit);
+        match commit_or_err {
+            Ok(commit) => commits.push(commit),
+            Err(e) => { debug_log!("  FAIL: commit iteration error: {e}"); return None; }
+        }
     }
 
+    debug_log!("  result: {} commit(s)", commits.len());
     Some(commits)
 }
 

@@ -237,10 +237,7 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
             eprintln!("Create one with: jj plan new <bookmark-name>");
             return Ok(1);
         }
-        StackResult::MergeCommits => {
-            eprintln!("Stack contains merge commits — rebase to create a linear history first.");
-            return Ok(1);
-        }
+
     };
 
     // Determine target
@@ -481,10 +478,7 @@ async fn run_sync_async(
             eprintln!("No plans between trunk and working copy after fetch.");
             return Ok(0);
         }
-        StackResult::MergeCommits => {
-            eprintln!("Stack contains merge commits after fetch — rebase first.");
-            return Ok(1);
-        }
+
     };
 
     let narrowed = narrow_segments(&stack, registry);
@@ -541,10 +535,7 @@ async fn run_merge_async(
             eprintln!("No plans between trunk and working copy.");
             return Ok(0);
         }
-        StackResult::MergeCommits => {
-            eprintln!("Stack contains merge commits — rebase first.");
-            return Ok(1);
-        }
+
     };
 
     let narrowed = narrow_segments(&stack, registry);
@@ -863,10 +854,7 @@ fn show_stack_visualization(workspace: &Workspace, registry: &PlanRegistry) {
             eprintln!("No plans between trunk and working copy.");
             eprintln!("Create one with: jj plan new <bookmark-name>");
         }
-        StackResult::MergeCommits => {
-            eprintln!("Stack contains merge commits — cannot display as a linear stack.");
-            eprintln!("Rebase to create a linear history first.");
-        }
+
         StackResult::Ok(stack) => {
             // Load PR cache for status display
             let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();

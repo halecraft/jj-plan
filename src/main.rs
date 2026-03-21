@@ -1,5 +1,7 @@
 mod auth;
 mod commands;
+#[macro_use]
+mod debug;
 mod error;
 mod flush;
 mod markdown;

@@ -83,9 +83,7 @@ pub fn run_config(_jj: &JjBinary, plan_dir: &PlanDir, repo_root: &Path, workspac
                 }
             }
         }
-        crate::types::StackResult::MergeCommits => {
-            println!("  stack:            (merge commits detected — not supported)");
-        }
+
         crate::types::StackResult::Empty => {
             println!("  stack:            (empty — @ is at trunk)");
         }

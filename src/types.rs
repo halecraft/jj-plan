@@ -111,13 +111,11 @@ pub struct BookmarkSegment {
 /// Result of building a stack from the repository state.
 ///
 /// Makes illegal states unrepresentable: a `Stack` is only produced when
-/// the revset range is non-empty and contains no merge commits.
+/// the revset range is non-empty.
 #[derive(Debug)]
 pub enum StackResult {
     /// Successfully built stack with segments and gap detection.
     Ok(Stack),
-    /// The revset range contains merge commits — stack building refused.
-    MergeCommits,
     /// The revset range is empty (working copy is at trunk).
     Empty,
 }

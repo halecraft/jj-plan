@@ -135,6 +135,10 @@ A **segment** is a contiguous run of changes ending at a bookmarked commit. The 
 
 A **gap** is a set of unbookmarked changes between two segments. Gaps are detected during stack construction and flagged at submit time.
 
+### Merge commits
+
+Merge commits (commits with two or more parents) in the `trunk()..@` range are handled gracefully. They are treated as ordinary unbookmarked entries and folded into the nearest segment or reported as gaps. The segment builder never inspects parent links — it walks a flat topologically-sorted array and groups by bookmarks, so linearity is not required.
+
 ### PlanRegistry filtering
 
 When `build_stack()` receives a `PlanRegistry`, only bookmarks registered in the registry produce segments. Non-registered bookmarks are treated as if they don't exist — their changes are absorbed into adjacent segments or become gap material.
@@ -497,6 +501,7 @@ This ensures the plan file is always the source of truth, even when users type `
 
 | Variable | Purpose | Default |
 |---|---|---|
+| `JJ_PLAN_DEBUG` | Enable diagnostic logging to stderr (any value) | unset |
 | `JJ_PLAN_DIR` | Override plan directory path | `.jj-plan/` → `.jj-plans/` |
 | `JJ_PLAN_MAX` | Max stack size before refusing to sync | `50` |
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in |

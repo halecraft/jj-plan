@@ -349,6 +349,7 @@ Use `jj plan --help` for the compact terminal summary. Use the docs below when y
 
 | Variable | Purpose | Default |
 |---|---|---|
+| `JJ_PLAN_DEBUG` | Enable diagnostic logging to stderr (any value) | unset |
 | `JJ_PLAN_DIR` | Override plan directory path (absolute or relative) | Auto-resolved: `.jj-plan/` → `.jj-plans/` |
 | `JJ_PLAN_MAX` | Maximum stack size before refusing to sync | `50` |
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in default |

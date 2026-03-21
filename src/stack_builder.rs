@@ -2,7 +2,8 @@
 //!
 //! Builds a `Stack` from the repository state by evaluating
 //! `trunk()..(@  | descendants(@))`, identifying bookmarked segments,
-//! detecting gaps, and rejecting merge commits.
+//! and detecting gaps. Merge commits in the range are treated as ordinary
+//! unbookmarked entries and folded into the nearest segment.
 //!
 //! ## Design
 //!
@@ -43,13 +44,22 @@ const STACK_REVSET: &str = "trunk()..(@  | descendants(@))";
 ///
 /// Returns:
 /// - `StackResult::Empty` if the revset range is empty
-/// - `StackResult::MergeCommits` if any commit has multiple parents
-/// - `StackResult::Ok(stack)` on success
+/// - `StackResult::Ok(stack)` on success (merge commits in the range are
+///   treated as ordinary unbookmarked entries)
 pub fn build_stack(workspace: &Workspace, registry: Option<&PlanRegistry>) -> StackResult {
+    debug_log!("build_stack(revset={:?}, registry={})", STACK_REVSET,
+        if registry.is_some() { "Some" } else { "None" });
+
     // 1. Evaluate the stack revset (parents before children = trunk toward tip)
     let commits = match workspace.evaluate_revset_reversed(STACK_REVSET) {
-        Some(c) if !c.is_empty() => c,
-        _ => return StackResult::Empty,
+        Some(c) if !c.is_empty() => {
+            debug_log!("  revset returned {} commit(s)", c.len());
+            c
+        }
+        _ => {
+            debug_log!("  revset returned empty → StackResult::Empty");
+            return StackResult::Empty;
+        }
     };
 
     // 2. Convert all commits to LogEntry
@@ -58,12 +68,10 @@ pub fn build_stack(workspace: &Workspace, registry: Option<&PlanRegistry>) -> St
         .map(|c| workspace.commit_to_log_entry(c))
         .collect();
 
-    // 3. Check for merge commits (any commit with >1 parent)
-    for entry in &entries {
-        if entry.parents.len() > 1 {
-            return StackResult::MergeCommits;
-        }
-    }
+    // 3. (Merge check removed — merges deep in history should not prevent
+    // plan sync. The segment builder walks a topologically-sorted array
+    // and groups by bookmarks; merge commits are just unbookmarked entries
+    // that get folded into the nearest segment or reported as gaps.)
 
     // 4. Also compute short change IDs for gap reporting
     let short_ids: Vec<String> = commits
@@ -72,7 +80,22 @@ pub fn build_stack(workspace: &Workspace, registry: Option<&PlanRegistry>) -> St
         .collect();
 
     // 5. Build segments and detect gaps
-    build_segments_and_gaps(&entries, &short_ids, registry)
+    let result = build_segments_and_gaps(&entries, &short_ids, registry);
+
+    match &result {
+        StackResult::Ok(stack) => {
+            let bookmark_names: Vec<String> = stack.segments.iter().flat_map(|seg|
+                seg.bookmarks.iter().map(|b| b.name.clone())
+            ).collect();
+            debug_log!("  result: {} segment(s), {} gap(s), bookmarks={:?}",
+                stack.segments.len(), stack.gaps.len(), bookmark_names);
+        }
+        StackResult::Empty => {
+            debug_log!("  result: Empty (no bookmarked segments)");
+        }
+    }
+
+    result
 }
 
 /// Internal: group entries into bookmark segments and detect gaps.
@@ -497,22 +520,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_stack_merge_commit() {
-        // A commit with 2 parents → merge commit
-        let entries = vec![make_entry_with_parents(
-            "ch1",
-            "c1",
-            &["parent1", "parent2"],
-            &["feat-a"],
-        )];
-        // We check for merge commits in build_stack() before calling
-        // build_segments_and_gaps(). Test the check directly:
-        assert!(entries[0].parents.len() > 1);
-
-        // build_segments_and_gaps doesn't check for merges — that's build_stack's job.
-        // But we can verify the detection logic would trigger:
-        let has_merge = entries.iter().any(|e| e.parents.len() > 1);
-        assert!(has_merge);
+    fn test_build_stack_merge_commit_is_handled() {
+        // A merge commit (2 parents) in the range should NOT prevent
+        // segment building. The merge is treated as an ordinary entry
+        // and folded into the nearest segment.
+        let entries = vec![
+            make_entry("ch1", "c1", &[], false),                                   // unbookmarked
+            make_entry_with_parents("ch2", "c2", &["c1", "other"], &[]),            // merge, unbookmarked
+            make_entry("ch3", "c3", &["feat-a"], false),                            // bookmarked
+        ];
+        let ids = short_ids(entries.len());
+        let result = build_segments_and_gaps(&entries, &ids, None);
+        match result {
+            StackResult::Ok(stack) => {
+                // All 3 commits (including the merge) belong to the single segment
+                assert_eq!(stack.segments.len(), 1);
+                assert_eq!(stack.segments[0].changes.len(), 3);
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
     }
 
     #[test]

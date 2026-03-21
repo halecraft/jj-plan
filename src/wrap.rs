@@ -46,6 +46,8 @@ pub fn wrap(
 /// Callers must call `workspace.reload()` after CLI mutations before
 /// calling this.
 pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+    debug_log!("resolve_and_sync(plan_dir={:?})", plan_dir.path);
+
     let max_stack_size = crate::plan_dir::plan_max();
 
     // Migrate any legacy change-ID-based filenames to bookmark-named files.
@@ -71,6 +73,17 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
 
     // Build sync views from the registry-filtered stack
     let sync_changes = build_sync_views(workspace, registry);
+    match &sync_changes {
+        Some(views) => {
+            debug_log!("  sync views: {} bookmark(s)", views.len());
+        }
+        None => {
+            let tracked: Vec<&str> = registry.tracked_names();
+            debug_log!("  sync views: None (empty/failed stack)");
+            debug_log!("  registry: {} tracked bookmark(s): {:?}", tracked.len(), tracked);
+            debug_log!("  plan_dir: {:?}", plan_dir.path);
+        }
+    }
     sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
     sync::show_stack(plan_dir);
 }
@@ -131,7 +144,7 @@ impl SyncChangeView {
 /// In the new model, only bookmarked commits get plan files. Each segment's
 /// tip commit (the bookmarked commit) produces one `SyncChangeView`.
 ///
-/// Returns `None` for `StackResult::Empty` or `StackResult::MergeCommits`.
+/// Returns `None` for `StackResult::Empty`.
 fn stack_to_sync_changes(
     result: &crate::types::StackResult,
     workspace: &Workspace,
@@ -140,7 +153,7 @@ fn stack_to_sync_changes(
     use crate::types::StackResult;
 
     match result {
-        StackResult::Empty | StackResult::MergeCommits => None,
+        StackResult::Empty => None,
         StackResult::Ok(stack) => {
             if stack.segments.is_empty() {
                 return None;
