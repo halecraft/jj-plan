@@ -334,7 +334,8 @@ bats jj-plan.bats              # sequential
 - **Template repo**: A jj repo with `.jj-plan/` is created once per run. Each test gets an isolated `cp -r` copy (~2ms).
 - **Direct bats style**: Tests run commands inline — no wrapper functions, no subshells.
 - **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
-- **Unit tests**: 198 tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
+- **Unit tests**: 198 Rust tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
+- **Integration tests**: 125 bats tests covering end-to-end CLI behavior, plan file sync, stack display, navigation, abandon recovery, config, templates, and encoded bookmark names.
 
 ## Documentation
 

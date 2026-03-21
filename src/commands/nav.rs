@@ -146,26 +146,16 @@ pub fn plan_go(
         match targets.iter().find(|t| t.bookmarks.iter().any(|b| b == target)) {
             Some(t) => t.change_id.clone(),
             None => {
-                // Not a known bookmark — suggest similar names
-                let bookmark_names: Vec<&str> = targets
-                    .iter()
-                    .flat_map(|t| t.bookmarks.iter().map(|b| b.as_str()))
-                    .collect();
-
-                if !bookmark_names.is_empty() {
-                    eprintln!("jj plan go: '{}' is not a plan bookmark", target);
-                    eprintln!();
-                    eprintln!("Available plan bookmarks:");
-                    for (i, t) in targets.iter().enumerate() {
-                        for bm in &t.bookmarks {
-                            eprintln!("  {}. {}", i + 1, bm);
-                        }
+                // Not a bookmark — try as a change ID or revset.
+                // If the target matches a change ID in the stack, use it directly.
+                match targets.iter().find(|t| t.change_id == target || t.change_id.starts_with(target)) {
+                    Some(t) => t.change_id.clone(),
+                    None => {
+                        // Fall through to raw `jj edit -r` which handles
+                        // arbitrary change IDs and revsets.
+                        target.to_string()
                     }
-                    return Ok(1);
                 }
-
-                // Fall through to raw change ID / revset
-                target.to_string()
             }
         }
     };

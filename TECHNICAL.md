@@ -557,7 +557,7 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 ### Bats integration tests (`./test.sh`)
 
-Behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
+125 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
 
 ### PR integration tests
 
