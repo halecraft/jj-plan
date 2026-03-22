@@ -1,10 +1,10 @@
-use crate::commands::help::ColorWhen;
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::load_pr_cache;
-use crate::stack_builder::{build_multi_stack, narrow_segments};
-use crate::types::{PlanRegistry, Stack};
+use crate::stack_builder::build_multi_stack;
+use crate::stack_render;
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 use crate::sync;
 
@@ -223,50 +223,20 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             debug_log!("  plan_dir: {:?}", plan_dir.path);
         }
     }
-    let _terminal_view = sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
-}
-
-// ---------------------------------------------------------------------------
-// ANSI color helpers
-// ---------------------------------------------------------------------------
-
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const GREEN: &str = "\x1b[32m";
-const CYAN: &str = "\x1b[36m";
-const DIM: &str = "\x1b[2m";
-// 256-color codes matching jj's change ID rendering:
-const BRIGHT_MAGENTA: &str = "\x1b[1m\x1b[38;5;5m"; // bold + 256-color magenta (unique prefix)
-const GRAY: &str = "\x1b[38;5;8m";                   // 256-color dark gray (rest of ID)
-
-/// Resolve whether to use color for plan stack output.
-///
-/// Checks stderr (not stdout) since all plan stack output goes to stderr.
-/// Respects jj's `ui.color` config via `configured_color_mode()`, which
-/// calls `jj config get ui.color`.
-fn should_color() -> bool {
-    configured_color_mode().should_color_stderr()
-}
-
-/// Read jj's configured color mode, falling back to Auto.
-fn configured_color_mode() -> ColorWhen {
-    let Ok(jj) = crate::jj_binary::JjBinary::resolve() else {
-        return ColorWhen::Auto;
-    };
-    let Ok((status, stdout, _)) = jj.run_silent(&["config", "get", "ui.color"]) else {
-        return ColorWhen::Auto;
-    };
-    if !status.success() {
-        return ColorWhen::Auto;
-    }
-    ColorWhen::parse(stdout.trim()).unwrap_or(ColorWhen::Auto)
+    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
 }
 
 /// Display the plan stack using the multi-stack visualization with color.
 ///
 /// This is the single rendering entry point for all command paths.
 /// Call after `resolve_and_sync()` to show the current state.
+///
+/// Pipeline: GATHER → PLAN → EXECUTE
+/// - GATHER: `build_multi_stack()`, `load_pr_cache()`, `stack_render::build_columns()`
+/// - PLAN:   `stack_render::render_stack()` → `Vec<Vec<Span>>`
+/// - EXECUTE: `format_ansi()` or `format_plain()` → `eprintln!`
 pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+    // GATHER
     let multi = build_multi_stack(workspace, registry);
 
     if multi.stacks.is_empty() {
@@ -275,9 +245,21 @@ pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pla
         return;
     }
 
-    let color = should_color();
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
     let pr_cache = load_pr_cache(&repo_root).ok();
+    let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
+
+    // PLAN
+    let rendered = stack_render::render_stack(&columns);
+
+    // EXECUTE
+    let color = stack_render::should_color();
+    let formatted = if color {
+        stack_render::format_ansi(&rendered)
+    } else {
+        stack_render::format_plain(&rendered)
+    };
+
     let num_stacks = multi.stacks.len();
     let is_multi = num_stacks > 1;
 
@@ -289,128 +271,9 @@ pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pla
     }
     eprintln!("):");
 
-    for (stack_idx, group) in multi.stacks.iter().enumerate() {
-        if is_multi {
-            eprintln!("  stack: {}", group.name);
-        }
-
-        let narrowed = narrow_segments(
-            &Stack {
-                segments: group.segments.clone(),
-                gaps: group.gaps.clone(),
-            },
-            registry,
-        );
-
-        // Show segments from tip to trunk (narrowed is trunk-to-tip, so reverse)
-        for (i, seg) in narrowed.iter().enumerate().rev() {
-            let bookmark_name = &seg.bookmark.name;
-            let tip = seg.changes.first();
-            let is_wc = tip.is_some_and(|c| c.is_working_copy);
-            let is_done = tip.is_some_and(|c| c.is_done());
-
-            let short_change_id = tip
-                .and_then(|c| workspace.short_change_id_from_hex(&c.change_id))
-                .unwrap_or_default();
-
-            // Split change ID into unique prefix + rest for colored rendering
-            let change_id_split = tip
-                .and_then(|c| workspace.change_id_with_prefix_split(&c.change_id));
-
-            let mut indicators = Vec::new();
-            if is_wc { indicators.push("@".to_string()); }
-            if is_done { indicators.push("✓".to_string()); }
-            if seg.bookmark.is_synced { indicators.push("synced".to_string()); }
-            if let Some(ref cache) = pr_cache {
-                if let Some(cached_pr) = cache.get(bookmark_name) {
-                    indicators.push(format!("PR #{}", cached_pr.number));
-                }
-            }
-
-            // Build the display line with optional color
-            let marker = if is_wc { "◉" } else { "○" };
-            let first_line = tip
-                .map(|c| c.first_line().to_string())
-                .unwrap_or_default();
-
-            if color {
-                let indicator_str = if indicators.is_empty() {
-                    String::new()
-                } else {
-                    // Color: green for ✓ and @, dim for the parens
-                    let colored_parts: Vec<String> = indicators.iter().map(|ind| {
-                        if ind == "✓" { format!("{GREEN}✓{RESET}") }
-                        else if ind == "@" { format!("{BOLD}{GREEN}@{RESET}") }
-                        else { ind.clone() }
-                    }).collect();
-                    format!("({})", colored_parts.join(", "))
-                };
-
-                let marker_colored = if is_wc {
-                    format!("{BOLD}{GREEN}{marker}{RESET}")
-                } else {
-                    format!("{DIM}{marker}{RESET}")
-                };
-
-                let change_id_colored = match &change_id_split {
-                    Some((prefix, rest)) => format!("{BRIGHT_MAGENTA}{prefix}{RESET}{GRAY}{rest}{RESET}"),
-                    None => short_change_id.clone(),
-                };
-
-                eprintln!(
-                    "  {} {BOLD}{}{RESET} {} {}",
-                    marker_colored, bookmark_name, change_id_colored, indicator_str,
-                );
-                if !first_line.is_empty() {
-                    eprintln!("  {DIM}│{RESET} {}", first_line);
-                }
-            } else {
-                let indicator_str = if indicators.is_empty() {
-                    String::new()
-                } else {
-                    format!("({})", indicators.join(", "))
-                };
-                eprintln!("  {} {} {} {}", marker, bookmark_name, short_change_id, indicator_str);
-                if !first_line.is_empty() {
-                    eprintln!("  │ {}", first_line);
-                }
-            }
-
-            if i > 0 {
-                if color {
-                    eprintln!("  {DIM}│{RESET}");
-                } else {
-                    eprintln!("  │");
-                }
-            }
-        }
-
-        // Show gaps if any
-        if !group.gaps.is_empty() {
-            let total: usize = group.gaps.iter().map(|g| g.unbookmarked.len()).sum();
-            eprintln!();
-            eprintln!("  ⚠ {} unbookmarked change(s) between plans", total);
-            for gap in &group.gaps {
-                for change in &gap.unbookmarked {
-                    eprintln!("    {} {}", change.short_id, change.description_first_line);
-                }
-            }
-        }
-
-        if is_multi && stack_idx < num_stacks - 1 {
-            eprintln!();
-        }
+    for line in &formatted {
+        eprintln!("{}", line);
     }
-
-    // Trunk
-    if color {
-        eprintln!("  {DIM}│{RESET}");
-        eprintln!("  {CYAN}◆{RESET} trunk()");
-    } else {
-        eprintln!("  │");
-        eprintln!("  ◆ trunk()");
-    }
-    eprintln!();
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.

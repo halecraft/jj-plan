@@ -15,6 +15,7 @@ mod plan_registry;
 mod pr_cache;
 mod stack_builder;
 mod stack_context;
+mod stack_render;
 mod submit;
 mod sync;
 mod types;
