@@ -75,16 +75,26 @@ pub struct LogEntry {
     pub committed_at: DateTime<Utc>,
 }
 
+/// First line of a description string, for display in stack summary.
+pub fn description_first_line(desc: &str) -> &str {
+    desc.lines().next().unwrap_or("")
+}
+
+/// Whether a description contains `plan-status: ✅`.
+pub fn description_is_done(desc: &str) -> bool {
+    desc.starts_with("plan-status: ✅")
+        || desc.contains("\nplan-status: ✅")
+}
+
 impl LogEntry {
     /// First line of the description, for display in stack summary.
     pub fn first_line(&self) -> &str {
-        self.description.lines().next().unwrap_or("")
+        description_first_line(&self.description)
     }
 
     /// Whether the description contains `plan-status: ✅`.
     pub fn is_done(&self) -> bool {
-        self.description.starts_with("plan-status: ✅")
-            || self.description.contains("\nplan-status: ✅")
+        description_is_done(&self.description)
     }
 }
 

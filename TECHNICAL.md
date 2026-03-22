@@ -30,12 +30,13 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 |---|---|---|
 | `src/main.rs` | 149 | Entry point, command dispatch |
 | `src/error.rs` | 110 | `JjPlanError` enum (~25 variants) |
-| `src/types.rs` | 575 | All domain types: `Bookmark`, `LogEntry`, `Stack`, `PlanRegistry`, PR/platform types |
+| `src/types.rs` | 850 | All domain types: `Bookmark`, `LogEntry`, `Stack`, `PlanRegistry`, PR/platform types, `description_first_line`/`description_is_done` free functions |
 | `src/workspace.rs` | 972 | Unified jj-lib wrapper: reads + git write operations |
+| `src/stack_render.rs` | 1083 | Pure stack rendering: Span/Style model, multi-column layout, ANSI/plain/markdown formatting |
 | `src/stack_builder.rs` | 1079 | Stack construction, gap detection, `collect_submission_chain()` |
-| `src/wrap.rs` | 194 | Wrap lifecycle, `resolve_and_sync()`, `SyncChangeView` |
+| `src/wrap.rs` | 418 | Wrap lifecycle, `resolve_and_sync()`, `resolve_sync_and_show()`, `StackDisplayData`, `SyncChangeView` |
 | `src/flush.rs` | 294 | Plan file → jj description sync (file is authoritative) |
-| `src/sync.rs` | 660 | jj description → plan file sync (jj is authoritative post-flush) |
+| `src/sync.rs` | 599 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
 | `src/plan_file.rs` | 655 | Plan file parsing, bookmark name encoding, legacy migration |
 | `src/plan_dir.rs` | 208 | Repo root and plan directory resolution |
 | `src/plan_registry.rs` | 229 | PlanRegistry persistence (`.jj/repo/jj-plan/plans.toml`) |
@@ -276,59 +277,60 @@ Uses a **gather → plan → execute** architecture:
    - Files to rename (same bookmark, different index).
    - Files to write (description changed in jj).
    - Symlink target (which file `current.md` points to).
-   - Stack summaries: both a file view (`stack.md`) and a terminal view (in-memory).
-3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`. The `.stack` dotfile is no longer written.
+   - File summary for `stack.md` (received as opaque `Option<&str>` from the caller — sync writes but does not generate this content).
+3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`.
+
+Note: `resolve_and_sync` in `wrap.rs` performs a single GATHER that serves both the sync pipeline (plan file I/O) and the rendering pipeline (terminal + markdown output). It builds the multi-stack, generates `stack.md` content via `format_markdown_with_header`, and passes it to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second GATHER traversal is needed.
 
 ### Phase 5: Show stack
 
-Print the terminal view to stdout. The terminal view is passed in-memory from `sync()` — no file round-trip. `show_stack()` accepts `Option<&str>` instead of reading from disk.
+Display the plan stack using pre-gathered `StackDisplayData` from `resolve_and_sync`. `show_plan_stack` accepts `Option<&StackDisplayData>` — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
 
-Two formats are generated from the same `&[SyncChangeView]` data:
+Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack` in `stack_render.rs`:
 
-#### Terminal view (in-memory, printed to stdout)
+#### Terminal view (printed to stderr)
 
-Compact 1-line-per-plan format, same as the legacy `.stack` content:
-
-```
-{here} {status} {NN}-{bookmark_name} {change_id} :: {first_line}
-```
-
-- `{here}` = `*` if this is the working copy, blank otherwise.
-- `{status}` = `✓` (done), `~` (has file changes), or blank (empty/not started).
-- `{NN}` = zero-padded position (01 = closest to trunk).
-- `{bookmark_name}` = the plan bookmark name.
-- `{change_id}` = short reverse-hex change ID (the same form used in `jj log`, usable with `jj show`, `jj edit`, and `jj:` references in code comments).
-- `{first_line}` = first line of the change description.
-
-Example terminal output:
+Graph visualization with semantic indicators:
 
 ```
-  ✓ 01-feat-auth kpqxywon :: Extract auth module
-  ~ 02-feat-session mtzrlpvq :: Implement session management
-*   03-feat-api ykvsnxrl :: Add API endpoints
+  ◉ feat-api kpqxywon (@, ~)
+  │ Add API endpoints
+  │
+  ○ feat-session mtzrlpvq (~)
+  │ Implement session management
+  │
+  ○ feat-auth lonpswlw (✓)
+  │ Extract auth module
+  │
+  ◆ trunk()
 ```
+
+- `◉` = working copy, `○` = other node, `◆` = trunk.
+- Indicators: `@` (working copy), `✓` (done), `~` (has file changes), `synced`, `PR #N`.
+- `✓` supersedes `~` — a done change does not show `~`.
+- Multi-stack mode adds column gutters and `stack:` headers.
 
 #### File view (`stack.md`, written to disk)
 
-2-line-per-plan markdown format with clickable links, visible in file browsers:
+Graph visualization with markdown links on bookmark names, generated by `format_markdown` in `stack_render.rs`:
 
 ```
-<!-- *=here ✓=done ~=changes -->
-{here} {status} {NN} {change_id} [{bookmark_name}]({NN}-{encoded_name}.md)
-        {first_line}
+<!-- generated by jj-plan — do not edit -->
+
+  ◉ [feat-api](./03-feat-api.md) kpqxywon (@, ~)
+  │ Add API endpoints
+  │
+  ○ [feat-session](./02-feat-session.md) mtzrlpvq (~)
+  │ Implement session management
+  │
+  ○ [feat-auth](./01-feat-auth.md) lonpswlw (✓)
+  │ Extract auth module
+  │
+  ◆ trunk()
+
 ```
 
-Example `stack.md`:
-
-```
-<!-- *=here ✓=done ~=changes -->
-  ✓ 01 kpqxywon [feat-auth](01-feat-auth.md)
-        Extract auth module
-  ~ 02 mtzrlpvq [feat-session](02-feat-session.md)
-        Implement session management
-*   03 ykvsnxrl [feat-api](03-feat-api.md)
-        Add API endpoints
-```
+The file view uses the same Span model as the terminal view but applies `format_markdown` instead of `format_ansi`/`format_plain`. Spans with a `link_target` are wrapped in markdown link syntax `[text](target)`. In multi-stack mode, `plan_filename` is cleared (links are absent) because per-group indices don't match global plan file indices.
 
 ---
 

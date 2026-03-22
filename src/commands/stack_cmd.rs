@@ -39,8 +39,7 @@ pub fn dispatch_stack(
             // Bare `jj stack` — flush pending edits, sync plan files, then show visualization.
             crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
             workspace.reload();
-            crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
             Ok(0)
         }
         Some("submit") => run_submit(workspace, &args[1..], registry),
@@ -149,8 +148,7 @@ fn run_stack_untrack(
     // 8. Sync and show updated state
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
-    crate::wrap::show_plan_stack(plan_dir, workspace, &post_registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry);
 
     Ok(0)
 }

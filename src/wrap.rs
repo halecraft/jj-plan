@@ -3,10 +3,17 @@ use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::load_pr_cache;
 use crate::stack_builder::build_multi_stack;
-use crate::stack_render;
-use crate::types::PlanRegistry;
+use crate::stack_render::{self, StackColumn};
+use crate::types::{self, PlanRegistry};
 use crate::workspace::Workspace;
 use crate::sync;
+
+/// Pre-gathered display data returned by `resolve_and_sync` for reuse by
+/// `show_plan_stack`. Avoids a second GATHER traversal of the repository.
+pub struct StackDisplayData {
+    pub columns: Vec<StackColumn>,
+    pub num_stacks: usize,
+}
 
 /// Unified handler for mutating commands: flush → command → reload → sync → show.
 ///
@@ -36,10 +43,10 @@ pub fn wrap(
 
     // 3-5. Reload repo, re-resolve stack, sync plan files
     workspace.reload();
-    resolve_and_sync(plan_dir, workspace, registry);
+    let gathered = resolve_and_sync(plan_dir, workspace, registry);
 
     // 6. Display the plan stack
-    show_plan_stack(plan_dir, workspace, registry);
+    show_plan_stack(plan_dir, gathered.as_ref());
 
     // 7. Auto-cleanup merged stacks (registry + base bookmarks behind trunk)
     auto_cleanup_merged_stacks(workspace, plan_dir);
@@ -147,14 +154,16 @@ pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir)
     }
 
     if cleaned_any {
-        // Re-sync after cleanup so plan files reflect the updated registry
+        // Re-sync after cleanup so plan files reflect the updated registry.
+        // The return value (display data) is intentionally discarded — this
+        // is a background cleanup, not a user-facing display path.
         workspace.reload();
         let post_registry = plan_registry::load_registry(&repo_root);
-        resolve_and_sync(plan_dir, workspace, &post_registry);
+        let _ = resolve_and_sync(plan_dir, workspace, &post_registry);
     }
 }
 
-pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) -> Option<StackDisplayData> {
     debug_log!("resolve_and_sync(plan_dir={:?})", plan_dir.path);
 
     let max_stack_size = crate::plan_dir::plan_max();
@@ -223,34 +232,45 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             debug_log!("  plan_dir: {:?}", plan_dir.path);
         }
     }
-    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
+    // Build multi-stack for the rendering pipeline (markdown content for stack.md)
+    let multi = build_multi_stack(workspace, registry);
+    let (stack_md_content, display_data) = if multi.stacks.is_empty() {
+        (None, None)
+    } else {
+        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+        let pr_cache = load_pr_cache(&repo_root).ok();
+        let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
+        let rendered = stack_render::render_stack(&columns);
+        let md_content = stack_render::format_markdown_with_header(&rendered);
+        let num_stacks = multi.stacks.len();
+        (Some(md_content), Some(StackDisplayData { columns, num_stacks }))
+    };
+
+    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry, stack_md_content.as_deref());
+
+    display_data
 }
 
-/// Display the plan stack using the multi-stack visualization with color.
+/// Display the plan stack using pre-gathered display data.
 ///
 /// This is the single rendering entry point for all command paths.
-/// Call after `resolve_and_sync()` to show the current state.
+/// Call after `resolve_and_sync()` with the returned `StackDisplayData`.
 ///
-/// Pipeline: GATHER → PLAN → EXECUTE
-/// - GATHER: `build_multi_stack()`, `load_pr_cache()`, `stack_render::build_columns()`
+/// Pipeline: PLAN → EXECUTE (GATHER already done by `resolve_and_sync`)
 /// - PLAN:   `stack_render::render_stack()` → `Vec<Vec<Span>>`
 /// - EXECUTE: `format_ansi()` or `format_plain()` → `eprintln!`
-pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
-    // GATHER
-    let multi = build_multi_stack(workspace, registry);
-
-    if multi.stacks.is_empty() {
-        eprintln!("No plans between trunk and working copy.");
-        eprintln!("Create one with: jj plan new <bookmark-name>");
-        return;
-    }
-
-    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let pr_cache = load_pr_cache(&repo_root).ok();
-    let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
+pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>) {
+    let data = match data {
+        Some(d) => d,
+        None => {
+            eprintln!("No plans between trunk and working copy.");
+            eprintln!("Create one with: jj plan new <bookmark-name>");
+            return;
+        }
+    };
 
     // PLAN
-    let rendered = stack_render::render_stack(&columns);
+    let rendered = stack_render::render_stack(&data.columns);
 
     // EXECUTE
     let color = stack_render::should_color();
@@ -260,20 +280,29 @@ pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pla
         stack_render::format_plain(&rendered)
     };
 
-    let num_stacks = multi.stacks.len();
-    let is_multi = num_stacks > 1;
+    let is_multi = data.num_stacks > 1;
 
     // Header
     eprintln!();
     eprint!("Plan stack ({}/", plan_dir.dir_name());
     if is_multi {
-        eprint!(" {} stacks", num_stacks);
+        eprint!(" {} stacks", data.num_stacks);
     }
     eprintln!("):");
 
     for line in &formatted {
         eprintln!("{}", line);
     }
+}
+
+/// Convenience: resolve + sync + show in one call.
+///
+/// Most command sites just need to do all three steps. Sites that need
+/// the intermediate `StackDisplayData` can call `resolve_and_sync` and
+/// `show_plan_stack` separately.
+pub fn resolve_sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+    let gathered = resolve_and_sync(plan_dir, workspace, registry);
+    show_plan_stack(plan_dir, gathered.as_ref());
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.
@@ -317,13 +346,12 @@ pub struct SyncChangeView {
 impl SyncChangeView {
     /// First line of the description, for display in stack summary.
     pub fn first_line(&self) -> &str {
-        self.description.lines().next().unwrap_or("")
+        types::description_first_line(&self.description)
     }
 
     /// Whether the description contains `plan-status: ✅`.
     pub fn is_done(&self) -> bool {
-        self.description.starts_with("plan-status: ✅")
-            || self.description.contains("\nplan-status: ✅")
+        types::description_is_done(&self.description)
     }
 }
 

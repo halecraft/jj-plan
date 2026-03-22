@@ -42,8 +42,7 @@ pub fn plan_next(
     if current_idx >= targets.len() - 1 {
         eprintln!("Already at the last plan");
         workspace.reload();
-        crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-        crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
         return Ok(0);
     }
 
@@ -56,8 +55,7 @@ pub fn plan_next(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-    crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
     Ok(0)
 }
 
@@ -86,8 +84,7 @@ pub fn plan_prev(
     if current_idx == 0 {
         eprintln!("Already at the first plan");
         workspace.reload();
-        crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-        crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
         return Ok(0);
     }
 
@@ -100,8 +97,7 @@ pub fn plan_prev(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-    crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
     Ok(0)
 }
 
@@ -172,8 +168,7 @@ pub fn plan_go(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-    crate::wrap::show_plan_stack(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
     Ok(0)
 }
 

@@ -86,8 +86,7 @@ pub fn run_untrack(
     eprintln!("Untracked plan: {}", bookmark_name);
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
-    crate::wrap::show_plan_stack(plan_dir, workspace, &post_registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry);
 
     Ok(0)
 }
