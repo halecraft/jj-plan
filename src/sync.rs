@@ -13,7 +13,7 @@ use crate::wrap::SyncChangeView;
 // Public API — same external signatures as before, internal FC/IS split
 // ---------------------------------------------------------------------------
 
-/// Sync jj stack state to plan files, symlink, and `.stack` summary.
+/// Sync jj stack state to plan files, symlink, and `stack.md` summary.
 ///
 /// After this runs, `.jj-plan/` exactly reflects the current jj stack.
 /// Assumes `flush_all()` has already been called (jj descriptions are
@@ -21,12 +21,14 @@ use crate::wrap::SyncChangeView;
 ///
 /// Also handles bookmark-loss detection: if `stack_changes` is `None` but
 /// plan files exist, a stack was lost — emit a warning.
+/// Returns the terminal view string if a stack was synced, or `None` if
+/// there was no stack (bookmark loss, error, etc.).
 pub fn sync(
     plan_dir: &PlanDir,
     stack_changes: Option<&[SyncChangeView]>,
     max_stack_size: usize,
     registry: &PlanRegistry,
-) {
+) -> Option<String> {
     let dir = &plan_dir.path;
 
     // GATHER — read directory once
@@ -35,8 +37,16 @@ pub fn sync(
     // PLAN — pure decision logic, no I/O
     let plan = plan_sync(&current_state, stack_changes, max_stack_size);
 
+    // Extract terminal view before execute consumes the plan
+    let terminal_view = plan
+        .stack_summaries
+        .as_ref()
+        .map(|s| s.terminal_view.clone());
+
     // EXECUTE — thin imperative shell
     execute_sync(dir, &plan);
+
+    terminal_view
 }
 
 /// Set error state: write `error.md`, update `current.md` symlink, emit warning.
@@ -65,11 +75,11 @@ pub fn clear_error(plan_dir: &Path) {
 
 /// Display the plan stack summary to stdout.
 ///
-/// Pure display function — reads the `.stack` file and prints it.
-/// Call after `sync()` has run so `.stack` is up to date.
-pub fn show_stack(plan_dir: &PlanDir) {
-    let stack_path = plan_dir.path.join(".stack");
-    if let Ok(content) = fs::read_to_string(&stack_path)
+/// Prints the terminal view passed in-memory from `sync()`.
+/// No file round-trip — the terminal view is generated alongside
+/// `stack.md` but never written to disk.
+pub fn show_stack(plan_dir: &PlanDir, terminal_view: Option<&str>) {
+    if let Some(content) = terminal_view
         && !content.is_empty() {
             println!();
             println!(
@@ -139,6 +149,15 @@ enum SyncWarning {
     StackTooLarge { size: usize, max: usize },
 }
 
+/// Both projections of the stack summary, generated from the same data.
+#[derive(Debug, Clone)]
+struct StackSummaries {
+    /// Markdown file content for `stack.md` (2-line format with links).
+    file_view: String,
+    /// Compact terminal content (1-line format, passed in-memory, never written to disk).
+    terminal_view: String,
+}
+
 /// The complete plan for a sync operation. Computed by `plan_sync()` with
 /// no I/O. Applied by `execute_sync()`.
 #[derive(Debug)]
@@ -151,8 +170,10 @@ struct SyncPlan {
     files_to_write: Vec<FileWrite>,
     /// Target filename for the `current.md` symlink, or None to remove it.
     symlink_target: Option<String>,
-    /// Content for the `.stack` summary file, or None to skip writing.
-    stack_summary: Option<String>,
+    /// Both stack summaries (file view + terminal view), or None to skip.
+    stack_summaries: Option<StackSummaries>,
+    /// Whether to remove `stack.md` (stale state cleanup in error/None paths).
+    remove_stack_md: bool,
     /// Whether to clear a previous error state.
     clear_error: bool,
     /// Whether to set error state (with message). Mutually exclusive with
@@ -177,7 +198,8 @@ fn plan_sync(
         files_to_rename: Vec::new(),
         files_to_write: Vec::new(),
         symlink_target: None,
-        stack_summary: None,
+        stack_summaries: None,
+        remove_stack_md: false,
         clear_error: false,
         error: None,
         warnings: Vec::new(),
@@ -190,6 +212,8 @@ fn plan_sync(
             if !current_state.entries.is_empty() {
                 plan.warnings.push(SyncWarning::BookmarkLost);
             }
+            // Clean up stale stack.md when stack is gone
+            plan.remove_stack_md = true;
         }
         Some(changes) => {
             // Check stack size against max
@@ -200,6 +224,8 @@ fn plan_sync(
                     changes.len(),
                     max_stack_size
                 ));
+                // Clean up stale stack.md when entering error state
+                plan.remove_stack_md = true;
                 return plan;
             }
 
@@ -262,9 +288,9 @@ fn plan_sync(
             }
             plan.symlink_target = current_file.clone();
 
-            // 4. Generate .stack summary (pure)
-            plan.stack_summary =
-                Some(generate_stack_summary(changes, current_file.as_deref()));
+            // 4. Generate stack summaries (file view + terminal view)
+            plan.stack_summaries =
+                Some(generate_stack_summaries(changes, current_file.as_deref()));
         }
     }
 
@@ -293,6 +319,14 @@ fn execute_sync(plan_dir: &Path, plan: &SyncPlan) {
                     size, max
                 );
             }
+        }
+    }
+
+    // Remove stale stack.md if requested (error or None paths)
+    if plan.remove_stack_md {
+        let stack_md = plan_dir.join("stack.md");
+        if stack_md.exists() {
+            remove_or_warn(&stack_md);
         }
     }
 
@@ -335,9 +369,9 @@ fn execute_sync(plan_dir: &Path, plan: &SyncPlan) {
         }
     }
 
-    // Write .stack summary
-    if let Some(summary) = &plan.stack_summary {
-        write_or_warn(&plan_dir.join(".stack"), summary);
+    // Write stack.md (file view) and return terminal view via SyncPlan
+    if let Some(summaries) = &plan.stack_summaries {
+        write_or_warn(&plan_dir.join("stack.md"), &summaries.file_view);
     }
 }
 
@@ -345,14 +379,80 @@ fn execute_sync(plan_dir: &Path, plan: &SyncPlan) {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/// Generate the `.stack` summary content.
+/// Generate both stack summary projections from the same data.
+fn generate_stack_summaries(
+    changes: &[SyncChangeView],
+    current_file: Option<&str>,
+) -> StackSummaries {
+    StackSummaries {
+        file_view: generate_file_summary(changes, current_file),
+        terminal_view: generate_terminal_summary(changes, current_file),
+    }
+}
+
+/// Generate the `stack.md` file content (2-line-per-plan markdown format).
 ///
-/// Format per line: `{here} {status} {NN}-{bookmark_name} :: {first_line}`
+/// Format:
+/// ```text
+/// <!-- *=here ✓=done ~=changes -->
+/// {here} {status} {NN} {change_id} [{bookmark_name}]({NN}-{encoded_name}.md)
+///         {first_line}
+/// ```
+fn generate_file_summary(
+    changes: &[SyncChangeView],
+    current_file: Option<&str>,
+) -> String {
+    if changes.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::with_capacity(1 + changes.len() * 2);
+    lines.push("<!-- *=here ✓=done ~=changes -->".to_string());
+
+    for (idx, change) in changes.iter().enumerate() {
+        let padded = format!("{:02}", idx + 1);
+        let encoded_name = plan_file::encode_bookmark_for_filename(&change.bookmark_name);
+        let filename = format!("{}-{}.md", padded, encoded_name);
+
+        let here = if Some(filename.as_str()) == current_file {
+            "*"
+        } else {
+            " "
+        };
+
+        let status = if change.is_done() {
+            "✓"
+        } else if !change.is_empty {
+            "~"
+        } else {
+            " "
+        };
+
+        let first_line = change.first_line();
+
+        lines.push(format!(
+            "{} {} {} {} [{}]({filename})",
+            here, status, padded, change.change_id, change.bookmark_name
+        ));
+        lines.push(format!(
+            "        {}",
+            first_line
+        ));
+    }
+
+    let mut result = lines.join("\n");
+    result.push('\n');
+    result
+}
+
+/// Generate the compact terminal summary content (1-line-per-plan format).
+///
+/// Format per line: `{here} {status} {NN}-{bookmark_name} {change_id} :: {first_line}`
 ///
 /// - `here`: `*` if working copy, space otherwise
 /// - `status`: `✓` if done, `~` if has file changes, space otherwise
 /// - Two columns are independent (a change can be both `*` and `✓`)
-pub fn generate_stack_summary(
+pub fn generate_terminal_summary(
     changes: &[SyncChangeView],
     current_file: Option<&str>,
 ) -> String {
@@ -457,14 +557,14 @@ mod tests {
     // -- generate_stack_summary tests (preserved from previous version) --
 
     #[test]
-    fn test_generate_stack_summary() {
+    fn test_generate_terminal_summary() {
         let changes = vec![
             change_with_bookmark("kpqxywon", "feat-auth", "Refactor auth middleware", true, false),
             change_with_bookmark("mtzrlpvq", "feat-extract", "Extract auth module", false, false),
             change_with_bookmark("ykvsnxrl", "feat-jwt", "Implement JWT strategy", true, true),
         ];
 
-        let summary = generate_stack_summary(&changes, Some("03-feat-jwt.md"));
+        let summary = generate_terminal_summary(&changes, Some("03-feat-jwt.md"));
 
         assert!(summary.contains("    01-feat-auth kpqxywon :: Refactor auth middleware"));
         assert!(summary.contains("  ~ 02-feat-extract mtzrlpvq :: Extract auth module"));
@@ -472,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_stack_summary_done_marker() {
+    fn test_generate_terminal_summary_done_marker() {
         let changes = vec![SyncChangeView {
             change_id: "abcdefgh".to_string(),
             bookmark_name: "feat-done".to_string(),
@@ -482,14 +582,59 @@ mod tests {
             bookmarks: vec![],
         }];
 
-        let summary = generate_stack_summary(&changes, Some("01-feat-done.md"));
+        let summary = generate_terminal_summary(&changes, Some("01-feat-done.md"));
         assert!(summary.contains("* ✓ 01-feat-done abcdefgh :: Done task"));
     }
 
     #[test]
-    fn test_generate_stack_summary_empty() {
+    fn test_generate_terminal_summary_empty() {
         let changes: Vec<SyncChangeView> = vec![];
-        let summary = generate_stack_summary(&changes, None);
+        let summary = generate_terminal_summary(&changes, None);
+        assert!(summary.is_empty());
+    }
+
+    // -- generate_file_summary tests --
+
+    #[test]
+    fn test_generate_file_summary() {
+        let changes = vec![
+            change_with_bookmark("kpqxywon", "feat-auth", "Refactor auth middleware", true, false),
+            change_with_bookmark("mtzrlpvq", "feat-extract", "Extract auth module", false, false),
+            SyncChangeView {
+                change_id: "ykvsnxrl".to_string(),
+                bookmark_name: "feat-jwt".to_string(),
+                description: "Implement JWT strategy\n\nplan-status: ✅".to_string(),
+                is_empty: true,
+                is_working_copy: true,
+                bookmarks: vec![],
+            },
+        ];
+
+        let summary = generate_file_summary(&changes, Some("03-feat-jwt.md"));
+
+        // Legend comment
+        assert!(summary.starts_with("<!-- *=here ✓=done ~=changes -->"));
+        // Plan 1: empty, not WC → blank here, blank status
+        assert!(summary.contains("    01 kpqxywon [feat-auth](01-feat-auth.md)"));
+        assert!(summary.contains("        Refactor auth middleware"));
+        // Plan 2: non-empty, not WC → blank here, ~ status
+        assert!(summary.contains("  ~ 02 mtzrlpvq [feat-extract](02-feat-extract.md)"));
+        assert!(summary.contains("        Extract auth module"));
+        // Plan 3: done + WC → * here, ✓ status
+        assert!(summary.contains("* ✓ 03 ykvsnxrl [feat-jwt](03-feat-jwt.md)"));
+        assert!(summary.contains("        Implement JWT strategy"));
+        // Markdown link syntax present
+        assert!(summary.contains("]("));
+        // Ends with newline
+        assert!(summary.ends_with('\n'));
+        // 1 legend + 3×2 plan lines = 7 lines
+        assert_eq!(summary.lines().count(), 7);
+    }
+
+    #[test]
+    fn test_generate_file_summary_empty() {
+        let changes: Vec<SyncChangeView> = vec![];
+        let summary = generate_file_summary(&changes, None);
         assert!(summary.is_empty());
     }
 
@@ -604,9 +749,16 @@ mod tests {
         ];
         let plan = plan_sync(&state, Some(&changes), 50);
 
-        let summary = plan.stack_summary.as_ref().unwrap();
-        assert!(summary.contains("*   01-feat-auth aaa :: First plan"));
-        assert!(summary.contains("  ~ 02-feat-session bbb :: Second plan"));
+        let summaries = plan.stack_summaries.as_ref().unwrap();
+        // Terminal view preserves 1-line format
+        assert!(summaries.terminal_view.contains("*   01-feat-auth aaa :: First plan"));
+        assert!(summaries.terminal_view.contains("  ~ 02-feat-session bbb :: Second plan"));
+        // File view has 2-line format with markdown links
+        assert!(summaries.file_view.contains("<!-- *=here"));
+        assert!(summaries.file_view.contains("[feat-auth](01-feat-auth.md)"));
+        assert!(summaries.file_view.contains("[feat-session](02-feat-session.md)"));
+        assert!(summaries.file_view.contains("        First plan"));
+        assert!(summaries.file_view.contains("        Second plan"));
     }
 
     #[test]

@@ -28,7 +28,7 @@ use plan_registry::load_registry;
 
 
 /// Read-only commands that get zero-overhead passthrough via exec.
-/// Note: status/st are NOT here — they get special handling to append .stack.
+/// Note: status/st are NOT here — they get special handling to append stack summary.
 const READONLY_COMMANDS: &[&str] = &[
     "log",
     "diff",

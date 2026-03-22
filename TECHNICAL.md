@@ -223,12 +223,18 @@ Uses a **gather → plan → execute** architecture:
    - Files to rename (same bookmark, different index).
    - Files to write (description changed in jj).
    - Symlink target (which file `current.md` points to).
-   - Stack summary content (for `.stack`).
-3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `.stack`.
+   - Stack summaries: both a file view (`stack.md`) and a terminal view (in-memory).
+3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`. The `.stack` dotfile is no longer written.
 
 ### Phase 5: Show stack
 
-Print the `.stack` file to stderr. Each line has the format:
+Print the terminal view to stdout. The terminal view is passed in-memory from `sync()` — no file round-trip. `show_stack()` accepts `Option<&str>` instead of reading from disk.
+
+Two formats are generated from the same `&[SyncChangeView]` data:
+
+#### Terminal view (in-memory, printed to stdout)
+
+Compact 1-line-per-plan format, same as the legacy `.stack` content:
 
 ```
 {here} {status} {NN}-{bookmark_name} {change_id} :: {first_line}
@@ -241,12 +247,34 @@ Print the `.stack` file to stderr. Each line has the format:
 - `{change_id}` = short reverse-hex change ID (the same form used in `jj log`, usable with `jj show`, `jj edit`, and `jj:` references in code comments).
 - `{first_line}` = first line of the change description.
 
-Example `.stack` output:
+Example terminal output:
 
 ```
   ✓ 01-feat-auth kpqxywon :: Extract auth module
   ~ 02-feat-session mtzrlpvq :: Implement session management
 *   03-feat-api ykvsnxrl :: Add API endpoints
+```
+
+#### File view (`stack.md`, written to disk)
+
+2-line-per-plan markdown format with clickable links, visible in file browsers:
+
+```
+<!-- *=here ✓=done ~=changes -->
+{here} {status} {NN} {change_id} [{bookmark_name}]({NN}-{encoded_name}.md)
+        {first_line}
+```
+
+Example `stack.md`:
+
+```
+<!-- *=here ✓=done ~=changes -->
+  ✓ 01 kpqxywon [feat-auth](01-feat-auth.md)
+        Extract auth module
+  ~ 02 mtzrlpvq [feat-session](02-feat-session.md)
+        Implement session management
+*   03 ykvsnxrl [feat-api](03-feat-api.md)
+        Add API endpoints
 ```
 
 ---
@@ -557,7 +585,7 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 ### Bats integration tests (`./test.sh`)
 
-125 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
+126 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
 
 ### PR integration tests
 

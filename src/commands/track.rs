@@ -7,7 +7,7 @@ use crate::workspace::Workspace;
 /// Run `jj plan track <bookmark-name>` — adopt an existing bookmark as a plan.
 ///
 /// This registers an existing bookmark in the PlanRegistry so it appears
-/// in the `.stack` summary, gets plan files, and is a navigation target.
+/// in the `stack.md` summary, gets plan files, and is a navigation target.
 ///
 /// ## Args
 ///

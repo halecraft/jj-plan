@@ -27,7 +27,7 @@ pub fn encode_bookmark_for_filename(name: &str) -> String {
 /// callers use `PlanRegistry::resolve_encoded()` to map it back to the
 /// canonical bookmark name.
 ///
-/// Excluded filenames: `error.md`, `current.md`, `.stack`, `template.md`,
+/// Excluded filenames: `error.md`, `current.md`, `stack.md`, `template.md`,
 /// `problem.md`, and any file that doesn't start with two digits + dash
 /// or doesn't end with `.md`.
 pub fn parse_plan_filename(name: &str) -> Option<&str> {

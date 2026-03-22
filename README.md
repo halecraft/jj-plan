@@ -249,7 +249,7 @@ The binary maintains a directory of markdown files synced with change descriptio
 ```
 .jj-plan/
   current.md          → symlink to active change's plan
-  .stack              → one-line summary of the full stack
+  stack.md            → browsable stack overview with clickable markdown links
   01-feat-auth.md     — first plan (closest to trunk)
   02-feat-session.md
   03-feat-api.md      — tip
@@ -280,7 +280,7 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Plans have status tracking | `plan-status: ✅` in description; inferred from empty/non-empty |
 | Plans have working memory | `[scratch]` sections for drafts; `jj plan done` strips them |
 | `jj describe` works naturally | `-m` mode intercepted and routed through plan files |
-| Change IDs visible in stack | `.stack` and `jj stack` show short reverse-hex IDs — copy-paste into `jj show`, `jj edit`, or `jj:` references |
+| Change IDs visible in stack | `stack.md` and `jj stack` show short reverse-hex IDs — copy-paste into `jj show`, `jj edit`, or `jj:` references |
 | Stack is always visible | `jj status` appends the plan stack summary |
 | Stack is navigable | `jj plan next`/`prev`/`go` for index, change ID, or bookmark-based movement |
 | New plans are structured | Configurable templates with `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation |
@@ -334,8 +334,8 @@ bats jj-plan.bats              # sequential
 - **Template repo**: A jj repo with `.jj-plan/` is created once per run. Each test gets an isolated `cp -r` copy (~2ms).
 - **Direct bats style**: Tests run commands inline — no wrapper functions, no subshells.
 - **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
-- **Unit tests**: 198 Rust tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
-- **Integration tests**: 125 bats tests covering end-to-end CLI behavior, plan file sync, stack display, navigation, abandon recovery, config, templates, and encoded bookmark names.
+- **Unit tests**: 200 Rust tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
+- **Integration tests**: 126 bats tests covering end-to-end CLI behavior, plan file sync, stack display, navigation, abandon recovery, config, templates, and encoded bookmark names.
 
 ## Documentation
 

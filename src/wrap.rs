@@ -84,8 +84,8 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             debug_log!("  plan_dir: {:?}", plan_dir.path);
         }
     }
-    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
-    sync::show_stack(plan_dir);
+    let terminal_view = sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
+    sync::show_stack(plan_dir, terminal_view.as_deref());
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.
@@ -108,7 +108,7 @@ pub fn build_sync_views(workspace: &Workspace, registry: &PlanRegistry) -> Optio
 
 /// A lightweight view of a stack change for sync and flush.
 ///
-/// Each `SyncChangeView` represents one entry in the `.stack` summary file
+/// Each `SyncChangeView` represents one entry in the `stack.md` summary
 /// and one plan file `NN-{bookmark_name}.md`.
 pub struct SyncChangeView {
     /// Short reverse-hex change ID (for `jj describe -r` and display).
@@ -127,7 +127,7 @@ pub struct SyncChangeView {
 }
 
 impl SyncChangeView {
-    /// First line of the description, for display in `.stack` summary.
+    /// First line of the description, for display in stack summary.
     pub fn first_line(&self) -> &str {
         self.description.lines().next().unwrap_or("")
     }

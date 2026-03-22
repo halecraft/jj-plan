@@ -76,7 +76,7 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
-    /// First line of the description, for display in `.stack` summary.
+    /// First line of the description, for display in stack summary.
     pub fn first_line(&self) -> &str {
         self.description.lines().next().unwrap_or("")
     }

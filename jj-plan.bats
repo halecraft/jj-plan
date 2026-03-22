@@ -110,9 +110,10 @@ teardown() {
 # Inclusive model: bookmark is first member
 # =============================================================================
 
-@test "start bookmark change is included in .stack as first member" {
+@test "start bookmark change is included in stack.md as first member" {
   jj describe -m "I am the start bookmark"
-  [[ "$(cat .jj-plan/.stack)" == *"01-"*":: I am the start bookmark"* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"01 "*"[start]("*")"* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"I am the start bookmark"* ]]
 }
 
 @test "single-change stack (@ is the bookmark) shows one entry" {
@@ -343,70 +344,74 @@ Need JWT and API key support
 # Stack summary
 # =============================================================================
 
-@test ".stack file is generated with first lines of plan files" {
+@test "stack.md is generated with first lines of plan files" {
   jj describe -m "Refactor auth middleware"
   jj plan new step-1; jj describe -m "Extract auth module"
   jj plan new step-2; jj describe -m "Implement JWT strategy"
   local stack
-  stack=$(cat .jj-plan/.stack)
-  [[ "$stack" == *"01-"*":: Refactor auth middleware"* ]]
-  [[ "$stack" == *"02-"*":: Extract auth module"* ]]
-  [[ "$stack" == *"03-"*":: Implement JWT strategy"* ]]
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"[start]("*")"* ]]
+  [[ "$stack" == *"Refactor auth middleware"* ]]
+  [[ "$stack" == *"[step-1]("*")"* ]]
+  [[ "$stack" == *"Extract auth module"* ]]
+  [[ "$stack" == *"[step-2]("*")"* ]]
+  [[ "$stack" == *"Implement JWT strategy"* ]]
 }
 
-@test ".stack marks current change with asterisk" {
+@test "stack.md marks current change with asterisk" {
   jj describe -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj plan new step-1; jj describe -m "Step 1"
   jj plan new step-2; jj describe -m "Step 2"
   # Current is Step 2 (tip)
-  [[ "$(grep '^\*' .jj-plan/.stack)" == *"03-"*":: Step 2"* ]]
+  [[ "$(grep '^\*' .jj-plan/stack.md)" == *"03 "*"[step-2]("* ]]
   # Switch to first
   jj edit -r "$PLAN"
-  [[ "$(grep '^\*' .jj-plan/.stack)" == *"01-"*":: Plan"* ]]
+  [[ "$(grep '^\*' .jj-plan/stack.md)" == *"01 "*"[start]("* ]]
 }
 
-@test ".stack updates when stack changes" {
+@test "stack.md updates when stack changes" {
   jj describe -m "Plan"
   local before
-  before=$(cat .jj-plan/.stack | wc -l | tr -d " ")
+  before=$(cat .jj-plan/stack.md | wc -l | tr -d " ")
   jj plan new step-1; jj describe -m "Step 1"
   local after
-  after=$(cat .jj-plan/.stack | wc -l | tr -d " ")
-  [[ "$before" -eq 1 ]]
-  [[ "$after" -eq 2 ]]
+  after=$(cat .jj-plan/stack.md | wc -l | tr -d " ")
+  # 1 legend + 2 lines per plan: 1 plan = 3, 2 plans = 5
+  [[ "$before" -eq 3 ]]
+  [[ "$after" -eq 5 ]]
 }
 
 # =============================================================================
 # Status indicators
 # =============================================================================
 
-@test ".stack shows blank for empty not-started changes" {
+@test "stack.md shows blank for empty not-started changes" {
   jj describe -m "Plan"
   jj plan new step-1; jj describe -m "Step 1"
   jj plan new step-2; jj describe -m "Step 2"
-  [[ "$(grep '01-' .jj-plan/.stack)" == "    01-"* ]]
+  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == "    01 "* ]]
 }
 
-@test ".stack shows ~ for non-empty non-current changes" {
+@test "stack.md shows ~ for non-empty non-current changes" {
   jj describe -m "Step 1"
   echo "some work" > file.txt
   jj plan new step-1; jj describe -m "Step 2"
-  [[ "$(grep '01-' .jj-plan/.stack)" == "  ~ 01-"* ]]
+  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == "  ~ 01 "* ]]
 }
 
-@test ".stack shows ✓ for changes with plan-status: ✅ in description" {
+@test "stack.md shows ✓ for changes with plan-status: ✅ in description" {
   jj describe -m "Step 1"
   jj plan new step-1; jj describe -m "Step 2"
   # Mark Step 1 as done by editing its plan file (bookmark-named: 01-start.md)
   printf "Step 1\n\nDid the work.\n\nplan-status: ✅" > ".jj-plan/01-start.md"
   # Trigger a sync
   jj describe -m "Step 2 updated"
-  [[ "$(grep '01-' .jj-plan/.stack)" == "  ✓ 01-"* ]]
+  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == "  ✓ 01 "* ]]
 }
 
-@test ".stack shows all four status types together" {
+@test "stack.md shows all four status types together" {
   # Change 0: will be marked done
   jj describe -m "Done change"
   # Change 1: will have file changes (has-changes)
@@ -423,11 +428,28 @@ Need JWT and API key support
   # Trigger sync
   jj describe -m "Current work"
   local stack
-  stack=$(cat .jj-plan/.stack)
-  [[ "$stack" == *"  ✓ 01-"*":: Done change"* ]]
-  [[ "$stack" == *"  ~ 02-"*":: Has changes"* ]]
-  [[ "$stack" == *"*   03-"*":: Current work"* ]]
-  [[ "$stack" == *"    04-"*":: Future work"* ]]
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"  ✓ 01 "*"[start]("*")"* ]]
+  [[ "$stack" == *"Done change"* ]]
+  [[ "$stack" == *"  ~ 02 "*"[step-1]("*")"* ]]
+  [[ "$stack" == *"Has changes"* ]]
+  [[ "$stack" == *"*   03 "*"[step-2]("*")"* ]]
+  [[ "$stack" == *"Current work"* ]]
+  [[ "$stack" == *"    04 "*"[step-3]("*")"* ]]
+  [[ "$stack" == *"Future work"* ]]
+}
+
+@test "stack.md contains clickable markdown links" {
+  jj describe -m "Auth feature"
+  jj plan new step-1; jj describe -m "Extract module"
+  [[ -f .jj-plan/stack.md ]]
+  # Contains markdown link syntax
+  [[ "$(cat .jj-plan/stack.md)" == *"]("* ]]
+  # Contains bookmark names in links
+  [[ "$(cat .jj-plan/stack.md)" == *"[start]("* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"[step-1]("* ]]
+  # Contains the legend comment
+  [[ "$(cat .jj-plan/stack.md)" == *"<!-- *=here"* ]]
 }
 
 @test "plan-status: ✅ round-trips through jj description" {
@@ -445,7 +467,7 @@ Need JWT and API key support
   [[ "$desc" == *"plan-status: ✅"* ]]
 }
 
-@test "jj status flushes non-current file edits and updates .stack" {
+@test "jj status flushes non-current file edits and updates stack" {
   jj describe -m "Phase 1"
   local P2
   jj plan new step-1; jj describe -m "phase 2 placeholder"
@@ -454,7 +476,7 @@ Need JWT and API key support
   # Write rich plan to Phase 2 (not current) WITHOUT running a jj command
   # Plan files use bookmark names, not change IDs: step-1 is bookmark for P2
   printf "Phase 2: Full implementation plan\n\nDetailed steps here" > ".jj-plan/02-step-1.md"
-  # jj status should flush the edit and show updated .stack
+  # jj status should flush the edit and show updated terminal view
   run jj status
   [[ "$output" == *":: Phase 2: Full implementation plan"* ]]
   [[ "$("$REAL_JJ" log -r "$P2" -T description --no-graph)" == *"Phase 2: Full implementation plan"* ]]
@@ -1084,7 +1106,7 @@ Need JWT and API key support
   printf "Plan\n\nplan-status: ✅" > ".jj-plan/01-start.md"
   # Switch back to Plan — it is both current AND done
   jj edit -r "$PLAN"
-  [[ "$(grep '01-' .jj-plan/.stack)" == "* ✓ 01-"*":: Plan"* ]]
+  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == "* ✓ 01 "* ]]
 }
 
 @test "plan-status: ✅ detected when not on the last line" {
@@ -1093,7 +1115,7 @@ Need JWT and API key support
   # Write plan-status in the middle, with trailing content after it (bookmark-named: 01-start.md)
   printf "Step 1\n\nplan-status: ✅\n\n## Notes\nSome trailing content" > ".jj-plan/01-start.md"
   jj describe -m "Step 2 updated"
-  [[ "$(grep '01-' .jj-plan/.stack)" == "  ✓ 01-"* ]]
+  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == "  ✓ 01 "* ]]
 }
 
 # =============================================================================
