@@ -105,6 +105,7 @@ fn run_done_stack(
     // Reload after describes, then sync and show stack
     workspace.reload();
     crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+    crate::wrap::show_plan_stack(plan_dir, workspace, registry);
 
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
@@ -188,6 +189,7 @@ fn run_done_single(
         // Explicit target or no advance needed — reload + sync once.
         workspace.reload();
         crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+        crate::wrap::show_plan_stack(plan_dir, workspace, registry);
     }
     Ok(0)
 }
@@ -250,6 +252,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
         None => {
             // No stack resolved — still sync to pick up the done marker.
             crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
             return;
         }
     };
@@ -260,6 +263,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
         None => {
             // Can't determine position — sync what we have.
             crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
             return;
         }
     };
@@ -274,10 +278,12 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
             let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
             workspace.reload();
             crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
         }
         None => {
             // All done — still sync to pick up the done marker we just wrote.
             crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
             eprintln!("All plans in stack are done 🎉");
         }
     }

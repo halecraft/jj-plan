@@ -208,6 +208,7 @@ jj plan new feat-auth          # create a change + bookmark + plan file
 jj plan new feat-session       # add another plan to the stack
 jj plan done                   # mark current plan done
 jj stack submit                # push as stacked PRs
+jj stack untrack               # stop tracking the current stack
 ```
 
 New plans are seeded with a minimal self-referencing summary line. For structured sections (Background, Tasks, etc.), create a `.jj-plan/template.md` or set the `JJ_PLAN_TEMPLATE` environment variable.
@@ -241,6 +242,21 @@ jj stack submit --draft        # create PRs as drafts
 ```
 
 The base branch of each PR is automatically set to the previous bookmark (or the default branch for the first). When you update a plan and re-submit, existing PRs are updated in place.
+
+### Multi-stack awareness
+
+jj-plan detects and visualizes multiple concurrent stacks. Stacks are discovered automatically from DAG topology (sibling branches from trunk) or explicitly via `--stack`:
+
+```sh
+jj plan new --stack auth auth-refactor    # start a new stack with a base bookmark
+jj plan new auth-tests                    # inherits the "auth" stack automatically
+jj edit -r trunk()
+jj plan new --stack dashboard dash-api    # start a second stack
+jj stack                                  # visualizes both stacks with column gutter
+jj stack untrack                          # untrack the current stack
+```
+
+Explicit stacks create a `stack/<name>` bookmark as a visible boundary. When stacks are merged to trunk, they are auto-cleaned from the registry. The `JJ_PLAN_STACK_PREFIX` environment variable configures the bookmark prefix (default: `stack/`).
 
 ### The `.jj-plan/` directory
 
@@ -276,6 +292,8 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Plans are co-editable (human + AI) | `.jj-plan/` syncs markdown files ↔ descriptions |
 | Plans become PR descriptions | `jj stack submit` uses plan content as PR title + body |
 | Stacked PRs | `jj stack submit/sync/merge` for full PR lifecycle |
+| Multi-stack awareness | Sibling branches auto-detected; `--stack` for explicit boundaries |
+| Stack lifecycle | `jj stack untrack` cleans up; merged stacks auto-cleaned |
 | Gap detection at submit time | Unbookmarked changes flagged; `--allow-gaps` to override |
 | Plans have status tracking | `plan-status: ✅` in description; inferred from empty/non-empty |
 | Plans have working memory | `[scratch]` sections for drafts; `jj plan done` strips them |

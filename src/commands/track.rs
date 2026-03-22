@@ -115,6 +115,7 @@ pub fn run_track(
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
     crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
+    crate::wrap::show_plan_stack(plan_dir, workspace, &post_registry);
 
     Ok(0)
 }

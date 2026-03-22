@@ -101,6 +101,24 @@ pub fn resolve_plan_dir(repo_root: Option<&Path>) -> Option<PlanDir> {
     None
 }
 
+/// Read JJ_PLAN_STACK_PREFIX from the environment, defaulting to `stack/`.
+///
+/// This prefix is used for stack base bookmarks that mark explicit
+/// boundaries between logical stacks within a linear chain.
+pub fn stack_prefix() -> String {
+    std::env::var("JJ_PLAN_STACK_PREFIX")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "stack/".to_string())
+}
+
+/// Check whether a bookmark name is a stack base bookmark.
+///
+/// A stack base bookmark starts with the configured prefix (default `stack/`).
+pub fn is_stack_base_bookmark(name: &str) -> bool {
+    name.starts_with(&stack_prefix())
+}
+
 /// Read JJ_PLAN_MAX from the environment, defaulting to 50.
 pub fn plan_max() -> usize {
     std::env::var("JJ_PLAN_MAX")

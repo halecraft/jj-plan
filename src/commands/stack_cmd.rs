@@ -1,15 +1,16 @@
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
 use crate::merge::{create_merge_plan, execute_merge, MergeStep, PrInfo};
-use crate::plan_dir::PlanDir;
+use crate::plan_dir::{self, PlanDir};
+use crate::plan_registry;
 use crate::pr_cache::{load_pr_cache, save_pr_cache};
-use crate::stack_builder::{build_stack, collect_submission_chain, find_submit_target, narrow_segments};
+use crate::stack_builder::{build_multi_stack, build_stack, collect_submission_chain, find_submit_target, narrow_segments};
 use crate::stack_context::StackContext;
 use crate::submit::{
     analyze_submission, create_submission_plan, execute_submission,
     Phase, ProgressCallback, PushStatus,
 };
-use crate::types::{MergeMethod, PlanRegistry, StackResult};
+use crate::types::{Gap, MergeMethod, NarrowedBookmarkSegment, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 
 use async_trait::async_trait;
@@ -19,8 +20,8 @@ use async_trait::async_trait;
 /// `args` is the full argument list starting with "stack".
 /// For example: `["stack", "submit"]` or `["stack", "--help"]`.
 pub fn dispatch_stack(
-    _jj: &JjBinary,
-    _plan_dir: &PlanDir,
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
@@ -35,22 +36,142 @@ pub fn dispatch_stack(
 
     match subcommand {
         None => {
-            // Bare `jj stack` — show stack visualization
-            show_stack_visualization(workspace, registry);
+            // Bare `jj stack` — flush pending edits, sync plan files, then show visualization.
+            crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+            workspace.reload();
+            crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+            crate::wrap::show_plan_stack(plan_dir, workspace, registry);
             Ok(0)
         }
         Some("submit") => run_submit(workspace, &args[1..], registry),
         Some("sync") => run_sync(workspace, &args[1..], registry),
         Some("merge") => run_merge(workspace, &args[1..], registry),
         Some("auth") => run_auth(&args[1..]),
+        Some("untrack") => run_stack_untrack(jj, plan_dir, &args[1..], workspace, registry),
         Some(unknown) => {
             eprintln!("jj stack: unknown subcommand '{}'", unknown);
             eprintln!();
-            eprintln!("Available subcommands: submit, sync, merge, auth");
+            eprintln!("Available subcommands: submit, sync, merge, auth, untrack");
             eprintln!("Run 'jj stack --help' for more information.");
             Ok(1)
         }
     }
+}
+
+/// Run `jj stack untrack` — untrack all plans in the current stack.
+///
+/// This is a pure registry operation: it removes all plans belonging to the
+/// current stack from `plans.toml` and deletes the stack base bookmark (if
+/// any). It never mutates commit descriptions.
+///
+/// Determines the current stack by looking up `@`'s plan in the registry
+/// and reading its `stack` value. All plans with the same `stack` value
+/// are untracked. If `@` has no plan or `stack = None`, all implicit
+/// trunk-stack plans (those with `stack = None`) are untracked.
+fn run_stack_untrack(
+    jj: &JjBinary,
+    plan_dir: &PlanDir,
+    args: &[String],
+    workspace: &mut Workspace,
+    registry: &PlanRegistry,
+) -> Result<i32> {
+    let dry_run = has_flag(args, "--dry-run");
+
+    // 1. Flush pending plan edits before mutation
+    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+
+    // 2. Determine the current stack by looking up @'s plan
+    workspace.reload();
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+
+    let current_stack_id = find_current_stack_id(workspace, registry);
+
+    // 3. Find all plans in this stack
+    let plans_to_untrack = registry.plans_in_stack(current_stack_id.as_deref());
+
+    if plans_to_untrack.is_empty() {
+        eprintln!("jj stack untrack: no plans found in the current stack");
+        return Ok(1);
+    }
+
+    let plan_names: Vec<String> = plans_to_untrack.iter().map(|p| p.name.clone()).collect();
+
+    // Find the stack base bookmark (if any).
+    // Scope to the bookmark whose change_id matches the current stack_id
+    // (standard hex comparison — both sides use commit.change_id().hex()).
+    let stack_prefix = plan_dir::stack_prefix();
+    let base_bookmark = if let Some(ref sid) = current_stack_id {
+        workspace
+            .local_bookmarks()
+            .iter()
+            .find(|b| b.name.starts_with(&stack_prefix) && b.change_id == *sid)
+            .map(|b| b.name.clone())
+    } else {
+        None
+    };
+
+    // 4. Dry-run: show what would happen
+    if dry_run {
+        eprintln!("jj stack untrack --dry-run:");
+        eprintln!("  Would untrack {} plan(s):", plan_names.len());
+        for name in &plan_names {
+            eprintln!("    {}", name);
+        }
+        if let Some(ref bb) = base_bookmark {
+            eprintln!("  Would delete stack base bookmark: {}", bb);
+        }
+        return Ok(0);
+    }
+
+    // 5. Untrack each plan from the registry
+    let mut registry_mut = plan_registry::load_registry(&repo_root);
+    for name in &plan_names {
+        registry_mut.untrack(name);
+    }
+    plan_registry::save_registry(&repo_root, &registry_mut);
+
+    // 6. Delete the stack base bookmark if one exists
+    if let Some(ref bb) = base_bookmark {
+        if let Err(e) = workspace.delete_bookmark(bb) {
+            eprintln!("jj stack untrack: warning: failed to delete bookmark '{}': {}", bb, e);
+        }
+    }
+
+    // 7. Show summary
+    eprintln!("Untracked {} plan(s):", plan_names.len());
+    for name in &plan_names {
+        eprintln!("  {}", name);
+    }
+    if let Some(ref bb) = base_bookmark {
+        eprintln!("Deleted stack base bookmark: {}", bb);
+    }
+
+    // 8. Sync and show updated state
+    workspace.reload();
+    let post_registry = plan_registry::load_registry(&repo_root);
+    crate::wrap::resolve_and_sync(plan_dir, workspace, &post_registry);
+    crate::wrap::show_plan_stack(plan_dir, workspace, &post_registry);
+
+    Ok(0)
+}
+
+/// Find the stack ID for the current working copy's plan.
+///
+/// Looks up `@`'s bookmarks in the registry and returns the `stack` value
+/// of the first match. Returns `None` if `@` has no tracked plan or the
+/// plan has `stack = None` (implicit trunk stack).
+fn find_current_stack_id(workspace: &Workspace, registry: &PlanRegistry) -> Option<String> {
+    let commits = workspace.evaluate_revset("@")?;
+    let wc = commits.first()?;
+    let entry = workspace.commit_to_log_entry(wc);
+
+    for bm_name in &entry.local_bookmarks {
+        if let Some(planned) = registry.get(bm_name) {
+            return planned.stack.clone();
+        }
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -845,119 +966,322 @@ fn run_auth(args: &[String]) -> Result<i32> {
 // Stack visualization
 // ---------------------------------------------------------------------------
 
+/// A prepared display row for one segment in a stack column.
+struct DisplayRow {
+    /// The bookmark name for this segment.
+    bookmark_name: String,
+    /// Short change ID (reverse hex) for display.
+    short_change_id: String,
+    /// Whether this is the working copy commit.
+    is_wc: bool,
+    /// Parenthesized indicators like (@), (✓), (PR #3).
+    indicator_str: String,
+    /// First line of the commit description.
+    first_line: String,
+}
+
+/// A prepared stack column for multi-column rendering.
+struct StackColumn {
+    /// Human-readable stack name.
+    name: String,
+    /// Display rows, tip (index 0) to trunk (last index).
+    rows: Vec<DisplayRow>,
+    /// Whether this column contains the working copy.
+    has_wc: bool,
+    /// Gap warnings for this stack.
+    gaps: Vec<Gap>,
+}
+
+/// Render multi-column graph lines from prepared stack columns.
+///
+/// Pure function: takes prepared display data, returns lines to print.
+/// Each line does NOT include a trailing newline.
+///
+/// For a single stack, renders identically to the pre-multi-column format
+/// (no column gutter, just `○`/`◉` + `│` markers).
+///
+/// For multiple stacks, renders a compact column gutter on the left where
+/// each stack gets a 2-char-wide column (`○ `, `│ `, `◉ `), and the
+/// segment content (bookmark name, description) appears to the right of
+/// the active column's marker.
+fn render_multi_column(columns: &[StackColumn]) -> Vec<String> {
+    if columns.is_empty() {
+        return vec![
+            "No plans between trunk and working copy.".to_string(),
+            "Create one with: jj plan new <bookmark-name>".to_string(),
+        ];
+    }
+
+    let num_cols = columns.len();
+
+    if num_cols == 1 {
+        return render_single_column(&columns[0]);
+    }
+
+    // Multi-stack: interleave columns in a compact gutter layout.
+    //
+    // Strategy: render each stack sequentially (largest first, matching
+    // the existing sort order from build_multi_stack), but prefix every
+    // line with a gutter showing which columns are active.
+    //
+    // Each column in the gutter is 2 chars wide: "│ " when passive,
+    // "○ " or "◉ " when a segment node is on this row.
+
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(String::new()); // leading blank line
+
+    for (col_idx, column) in columns.iter().enumerate() {
+        // Stack header
+        let mut header_gutter = build_gutter(num_cols, col_idx, GutterMark::Header);
+        header_gutter.push_str(&format!("stack: {}", column.name));
+        lines.push(format!("  {}", header_gutter));
+
+        // Segments from tip to trunk
+        for (row_idx, row) in column.rows.iter().enumerate() {
+            let mark = if row.is_wc { GutterMark::WorkingCopy } else { GutterMark::Node };
+            let mut node_gutter = build_gutter(num_cols, col_idx, mark);
+            node_gutter.push_str(&format!(
+                "{} {}",
+                row.bookmark_name,
+                row.indicator_str,
+            ));
+            lines.push(format!("  {}", node_gutter));
+
+            if !row.first_line.is_empty() {
+                let mut desc_gutter = build_gutter(num_cols, col_idx, GutterMark::Continuation);
+                desc_gutter.push_str(&format!("  {}", row.first_line));
+                lines.push(format!("  {}", desc_gutter));
+            }
+
+            // Spacer between segments (not after last)
+            if row_idx < column.rows.len() - 1 {
+                let spacer_gutter = build_gutter(num_cols, col_idx, GutterMark::Continuation);
+                lines.push(format!("  {}", spacer_gutter));
+            }
+        }
+
+        // Gap warnings
+        if !column.gaps.is_empty() {
+            let total_unbookmarked: usize = column.gaps.iter().map(|g| g.unbookmarked.len()).sum();
+            lines.push(String::new());
+            let mut warn_gutter = build_gutter(num_cols, col_idx, GutterMark::Continuation);
+            warn_gutter.push_str(&format!("⚠ {} unbookmarked change(s) between plans", total_unbookmarked));
+            lines.push(format!("  {}", warn_gutter));
+            for gap in &column.gaps {
+                for change in &gap.unbookmarked {
+                    let mut gap_gutter = build_gutter(num_cols, col_idx, GutterMark::Continuation);
+                    gap_gutter.push_str(&format!("  {} {}", change.short_id, change.description_first_line));
+                    lines.push(format!("  {}", gap_gutter));
+                }
+            }
+        }
+
+        // Spacer between stacks
+        if col_idx < num_cols - 1 {
+            let spacer = build_gutter(num_cols, col_idx, GutterMark::Continuation);
+            lines.push(format!("  {}", spacer));
+        }
+    }
+
+    // Trunk merge line
+    let merge_line = build_trunk_merge(num_cols);
+    lines.push(format!("  {}", merge_line));
+    lines.push(format!("  {}trunk()", "◆ "));
+    lines.push(String::new());
+
+    lines
+}
+
+/// Gutter marker types for multi-column rendering.
+enum GutterMark {
+    /// A regular (non-working-copy) node: ○
+    Node,
+    /// The working copy node: ◉
+    WorkingCopy,
+    /// A continuation/pipe line: │
+    Continuation,
+    /// A header line (stack name): │ for other columns
+    Header,
+}
+
+/// Build the gutter prefix for a line in the multi-column layout.
+///
+/// `num_cols` is the total number of stack columns.
+/// `active_col` is the column that "owns" this line.
+/// `mark` controls what character appears in the active column.
+///
+/// Returns a string like "│ ○ " or "│ │ " (2 chars per column).
+fn build_gutter(num_cols: usize, active_col: usize, mark: GutterMark) -> String {
+    let mut gutter = String::with_capacity(num_cols * 2 + 1);
+    for col in 0..num_cols {
+        if col == active_col {
+            match mark {
+                GutterMark::Node => gutter.push_str("○ "),
+                GutterMark::WorkingCopy => gutter.push_str("◉ "),
+                GutterMark::Continuation | GutterMark::Header => gutter.push_str("│ "),
+            }
+        } else {
+            gutter.push_str("│ ");
+        }
+    }
+    gutter
+}
+
+/// Build the trunk merge line for multi-column layout.
+///
+/// For 1 column: "│"
+/// For 2 columns: "├─╯"
+/// For 3 columns: "├─┴─╯"
+/// For N columns: "├─┴─┴─...─╯"
+fn build_trunk_merge(num_cols: usize) -> String {
+    if num_cols <= 1 {
+        return "│".to_string();
+    }
+    let mut line = String::from("├─");
+    for i in 1..num_cols {
+        if i < num_cols - 1 {
+            line.push_str("┴─");
+        } else {
+            line.push('╯');
+        }
+    }
+    line
+}
+
+/// Render a single-stack column (no gutter, identical to pre-multi-column output).
+fn render_single_column(column: &StackColumn) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(String::new()); // leading blank line
+
+    for (i, row) in column.rows.iter().enumerate() {
+        let marker = if row.is_wc { "◉" } else { "○" };
+        lines.push(format!(
+            "  {} {} {} {}",
+            marker,
+            row.bookmark_name,
+            row.short_change_id,
+            row.indicator_str,
+        ));
+
+        if !row.first_line.is_empty() {
+            lines.push(format!("  │ {}", row.first_line));
+        }
+
+        if i < column.rows.len() - 1 {
+            lines.push("  │".to_string());
+        }
+    }
+
+    // Gap warnings
+    if !column.gaps.is_empty() {
+        let total: usize = column.gaps.iter().map(|g| g.unbookmarked.len()).sum();
+        lines.push(String::new());
+        lines.push(format!("  ⚠ {} unbookmarked change(s) between plans", total));
+        for gap in &column.gaps {
+            for change in &gap.unbookmarked {
+                lines.push(format!("    {} {}", change.short_id, change.description_first_line));
+            }
+        }
+    }
+
+    // Trunk
+    lines.push("  │".to_string());
+    lines.push("  ◆ trunk()".to_string());
+    lines.push(String::new());
+
+    lines
+}
+
+/// Prepare display rows from narrowed segments.
+///
+/// Converts `NarrowedBookmarkSegment`s into `DisplayRow`s ready for
+/// rendering. Extracts change IDs via the workspace, and collects
+/// indicators (working copy, done, synced, PR number).
+fn prepare_display_rows(
+    narrowed: &[NarrowedBookmarkSegment],
+    workspace: &Workspace,
+    pr_cache: Option<&crate::pr_cache::PrCache>,
+) -> Vec<DisplayRow> {
+    // Reverse to get tip-to-trunk order for display
+    narrowed.iter().rev().map(|seg| {
+        let bookmark_name = &seg.bookmark.name;
+        let tip = seg.changes.first();
+        let is_wc = tip.is_some_and(|c| c.is_working_copy);
+        let is_synced = seg.bookmark.is_synced;
+        let is_done = tip.is_some_and(|c| c.is_done());
+
+        let short_change_id = tip
+            .and_then(|c| workspace.short_change_id_from_hex(&c.change_id))
+            .unwrap_or_default();
+
+        let mut indicators = Vec::new();
+        if is_wc { indicators.push("@".to_string()); }
+        if is_done { indicators.push("✓".to_string()); }
+        if is_synced { indicators.push("synced".to_string()); }
+        if let Some(cache) = pr_cache {
+            if let Some(cached_pr) = cache.get(bookmark_name) {
+                indicators.push(format!("PR #{}", cached_pr.number));
+            }
+        }
+
+        let indicator_str = if indicators.is_empty() {
+            String::new()
+        } else {
+            format!("({})", indicators.join(", "))
+        };
+
+        let first_line = tip
+            .map(|c| c.first_line().to_string())
+            .unwrap_or_default();
+
+        DisplayRow {
+            bookmark_name: bookmark_name.clone(),
+            short_change_id,
+            is_wc,
+            indicator_str,
+            first_line,
+        }
+    }).collect()
+}
+
 /// Show stack visualization with bookmark structure and PR status.
 fn show_stack_visualization(workspace: &Workspace, registry: &PlanRegistry) {
-    let stack_result = build_stack(workspace, Some(registry));
+    let multi = build_multi_stack(workspace, registry);
 
-    match stack_result {
-        StackResult::Empty => {
-            eprintln!("No plans between trunk and working copy.");
-            eprintln!("Create one with: jj plan new <bookmark-name>");
+    if multi.stacks.is_empty() {
+        eprintln!("No plans between trunk and working copy.");
+        eprintln!("Create one with: jj plan new <bookmark-name>");
+        return;
+    }
+
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let pr_cache = load_pr_cache(&repo_root).ok();
+
+    // Prepare stack columns
+    let columns: Vec<StackColumn> = multi.stacks.iter().map(|group| {
+        let narrowed = narrow_segments(
+            &crate::types::Stack {
+                segments: group.segments.clone(),
+                gaps: group.gaps.clone(),
+            },
+            registry,
+        );
+
+        let rows = prepare_display_rows(&narrowed, workspace, pr_cache.as_ref());
+        let has_wc = rows.iter().any(|r| r.is_wc);
+
+        StackColumn {
+            name: group.name.clone(),
+            rows,
+            has_wc,
+            gaps: group.gaps.clone(),
         }
+    }).collect();
 
-        StackResult::Ok(stack) => {
-            // Load PR cache for status display
-            let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-            let pr_cache = load_pr_cache(&repo_root).ok();
-
-            let narrowed = narrow_segments(&stack, registry);
-
-            // Display leaf-first (reverse of trunk-to-tip order)
-            if narrowed.is_empty() && stack.segments.is_empty() {
-                eprintln!("No plans between trunk and working copy.");
-                eprintln!("Create one with: jj plan new <bookmark-name>");
-                return;
-            }
-
-            eprintln!();
-
-            // Show segments from tip to trunk
-            for (i, seg) in narrowed.iter().enumerate().rev() {
-                let bookmark_name = &seg.bookmark.name;
-                let tip = seg.changes.first();
-                let is_wc = tip.is_some_and(|c| c.is_working_copy);
-                let is_synced = seg.bookmark.is_synced;
-                let is_done = tip.is_some_and(|c| c.is_done());
-
-                // Resolve short change ID for display.
-                // LogEntry.change_id stores standard hex; we need the short
-                // reverse-hex form that jj uses for display and revsets.
-                let short_change_id = tip
-                    .and_then(|c| workspace.short_change_id_from_hex(&c.change_id))
-                    .unwrap_or_default();
-
-                // Build status indicators
-                let mut indicators = Vec::new();
-
-                // Working copy marker
-                if is_wc {
-                    indicators.push("@".to_string());
-                }
-
-                // Done marker
-                if is_done {
-                    indicators.push("✓".to_string());
-                }
-
-                // Sync status
-                if is_synced {
-                    indicators.push("synced".to_string());
-                }
-
-                // PR status from cache
-                if let Some(ref cache) = pr_cache {
-                    if let Some(cached_pr) = cache.get(bookmark_name) {
-                        indicators.push(format!("PR #{}", cached_pr.number));
-                    }
-                }
-
-                let indicator_str = if indicators.is_empty() {
-                    String::new()
-                } else {
-                    format!("({})", indicators.join(", "))
-                };
-
-                eprintln!(
-                    "  {} {} {} {}",
-                    if is_wc { "◉" } else { "○" },
-                    bookmark_name,
-                    short_change_id,
-                    indicator_str,
-                );
-
-                // Show first line of description
-                if let Some(change) = tip {
-                    eprintln!("  │ {}", change.first_line());
-                }
-
-                if i > 0 {
-                    eprintln!("  │");
-                }
-            }
-
-            // Show gaps if any
-            if !stack.gaps.is_empty() {
-                eprintln!();
-                eprintln!(
-                    "  ⚠ {} unbookmarked change(s) between plans",
-                    stack
-                        .gaps
-                        .iter()
-                        .map(|g| g.unbookmarked.len())
-                        .sum::<usize>()
-                );
-                for gap in &stack.gaps {
-                    for change in &gap.unbookmarked {
-                        eprintln!("    {} {}", change.short_id, change.description_first_line);
-                    }
-                }
-            }
-
-            // Show trunk at bottom
-            eprintln!("  │");
-            eprintln!("  ◆ trunk()");
-            eprintln!();
-        }
+    // Render and print
+    let lines = render_multi_column(&columns);
+    for line in &lines {
+        eprintln!("{}", line);
     }
 }
 
@@ -977,6 +1301,7 @@ fn print_stack_help() {
     eprintln!("  submit [bookmark]   Push and create/update PRs");
     eprintln!("  sync                Fetch, push, and update stack");
     eprintln!("  merge               Merge approved PRs from bottom of stack");
+    eprintln!("  untrack             Stop tracking the current stack");
     eprintln!("  auth                Authentication management");
     eprintln!();
     eprintln!("Options:");
@@ -1039,4 +1364,167 @@ fn print_auth_help() {
     eprintln!("  jj stack auth github setup   Show GitHub setup instructions");
     eprintln!("  jj stack auth gitlab test    Test GitLab authentication");
     eprintln!("  jj stack auth gitlab setup   Show GitLab setup instructions");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Gap;
+
+    fn make_row(name: &str, desc: &str, is_wc: bool) -> DisplayRow {
+        DisplayRow {
+            bookmark_name: name.to_string(),
+            short_change_id: "abcd1234".to_string(),
+            is_wc,
+            indicator_str: if is_wc { "(@)".to_string() } else { String::new() },
+            first_line: desc.to_string(),
+        }
+    }
+
+    fn make_column(name: &str, rows: Vec<DisplayRow>) -> StackColumn {
+        let has_wc = rows.iter().any(|r| r.is_wc);
+        StackColumn {
+            name: name.to_string(),
+            rows,
+            has_wc,
+            gaps: vec![],
+        }
+    }
+
+    #[test]
+    fn trunk_merge_single_column() {
+        assert_eq!(build_trunk_merge(1), "│");
+    }
+
+    #[test]
+    fn trunk_merge_two_columns() {
+        assert_eq!(build_trunk_merge(2), "├─╯");
+    }
+
+    #[test]
+    fn trunk_merge_three_columns() {
+        assert_eq!(build_trunk_merge(3), "├─┴─╯");
+    }
+
+    #[test]
+    fn trunk_merge_four_columns() {
+        assert_eq!(build_trunk_merge(4), "├─┴─┴─╯");
+    }
+
+    #[test]
+    fn single_stack_renders_without_gutter() {
+        let col = make_column("auth", vec![
+            make_row("auth-tests", "Add tests", false),
+            make_row("auth-refactor", "Refactor auth", false),
+        ]);
+        let lines = render_multi_column(&[col]);
+        let output = lines.join("\n");
+
+        // Should have ○ markers (not ◉ since neither is WC)
+        assert!(output.contains("○ auth-tests"), "should show auth-tests node");
+        assert!(output.contains("○ auth-refactor"), "should show auth-refactor node");
+        // Should have trunk
+        assert!(output.contains("◆ trunk()"), "should show trunk");
+        // Should NOT have "stack:" header (single-stack case)
+        assert!(!output.contains("stack:"), "single-stack should not show stack header");
+        // Should NOT have multi-column gutter (no "│ ○" pattern)
+        assert!(!output.contains("│ ○"), "single-stack should not have column gutter");
+    }
+
+    #[test]
+    fn single_stack_shows_working_copy_marker() {
+        let col = make_column("feat", vec![
+            make_row("feat-api", "Feature API", true),
+        ]);
+        let lines = render_multi_column(&[col]);
+        let output = lines.join("\n");
+
+        assert!(output.contains("◉ feat-api"), "working copy should use ◉ marker");
+    }
+
+    #[test]
+    fn multi_stack_shows_stack_headers() {
+        let cols = vec![
+            make_column("auth", vec![
+                make_row("auth-refactor", "Refactor auth", false),
+            ]),
+            make_column("dashboard", vec![
+                make_row("dash-api", "Dashboard API", true),
+            ]),
+        ];
+        let lines = render_multi_column(&cols);
+        let output = lines.join("\n");
+
+        assert!(output.contains("stack: auth"), "should show auth stack header");
+        assert!(output.contains("stack: dashboard"), "should show dashboard stack header");
+    }
+
+    #[test]
+    fn multi_stack_shows_column_gutter() {
+        let cols = vec![
+            make_column("auth", vec![
+                make_row("auth-refactor", "Refactor auth", false),
+            ]),
+            make_column("dashboard", vec![
+                make_row("dash-api", "Dashboard API", true),
+            ]),
+        ];
+        let lines = render_multi_column(&cols);
+        let output = lines.join("\n");
+
+        // The auth column (col 0) should show ○ with a │ gutter for col 1
+        assert!(output.contains("○ │"), "auth column node should have gutter for dashboard");
+        // The dashboard column (col 1) should show ◉ with a │ gutter for col 0
+        assert!(output.contains("│ ◉"), "dashboard column node should have gutter for auth");
+        // Trunk merge
+        assert!(output.contains("├─╯"), "two columns should merge at trunk with ├─╯");
+        assert!(output.contains("◆ trunk()"), "should show trunk");
+    }
+
+    #[test]
+    fn multi_stack_three_columns_merge() {
+        let cols = vec![
+            make_column("a", vec![make_row("a1", "A", false)]),
+            make_column("b", vec![make_row("b1", "B", false)]),
+            make_column("c", vec![make_row("c1", "C", true)]),
+        ];
+        let lines = render_multi_column(&cols);
+        let output = lines.join("\n");
+
+        assert!(output.contains("├─┴─╯"), "three columns should merge with ├─┴─╯");
+    }
+
+    #[test]
+    fn empty_stacks_shows_help() {
+        let lines = render_multi_column(&[]);
+        assert!(lines[0].contains("No plans"));
+    }
+
+    #[test]
+    fn column_assignment_matches_input_order() {
+        // build_multi_stack sorts by segment count descending.
+        // render_multi_column preserves that order: index 0 = leftmost column.
+        let cols = vec![
+            make_column("largest", vec![
+                make_row("l-2", "L2", false),
+                make_row("l-1", "L1", false),
+            ]),
+            make_column("medium", vec![
+                make_row("m-1", "M1", true),
+            ]),
+            make_column("small", vec![
+                make_row("s-1", "S1", false),
+            ]),
+        ];
+        let lines = render_multi_column(&cols);
+
+        // Find the line indices of each stack header
+        let largest_idx = lines.iter().position(|l| l.contains("stack: largest")).unwrap();
+        let medium_idx = lines.iter().position(|l| l.contains("stack: medium")).unwrap();
+        let small_idx = lines.iter().position(|l| l.contains("stack: small")).unwrap();
+
+        // Stacks should appear in order: largest first (top), then medium, then small
+        assert!(largest_idx < medium_idx, "largest stack should render before medium");
+        assert!(medium_idx < small_idx, "medium stack should render before small");
+    }
 }

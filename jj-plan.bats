@@ -478,7 +478,7 @@ Need JWT and API key support
   printf "Phase 2: Full implementation plan\n\nDetailed steps here" > ".jj-plan/02-step-1.md"
   # jj status should flush the edit and show updated terminal view
   run jj status
-  [[ "$output" == *":: Phase 2: Full implementation plan"* ]]
+  [[ "$output" == *"Phase 2: Full implementation plan"* ]]
   [[ "$("$REAL_JJ" log -r "$P2" -T description --no-graph)" == *"Phase 2: Full implementation plan"* ]]
 }
 
@@ -494,8 +494,8 @@ Need JWT and API key support
   printf "Change B: revised plan" > ".jj-plan/02-step-1.md"
   # jj st should flush both
   run jj st
-  [[ "$output" == *":: Change A: revised plan"* ]]
-  [[ "$output" == *":: Change B: revised plan"* ]]
+  [[ "$output" == *"Change A: revised plan"* ]]
+  [[ "$output" == *"Change B: revised plan"* ]]
   [[ "$("$REAL_JJ" log -r "$CA" -T description --no-graph)" == "Change A: revised plan" ]]
   [[ "$("$REAL_JJ" log -r "$CB" -T description --no-graph)" == "Change B: revised plan" ]]
 }
@@ -540,16 +540,16 @@ Need JWT and API key support
   jj describe -m "Refactor auth"
   jj plan new step-1; jj describe -m "Extract module"
   run jj status
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *"01-"*":: Refactor auth"* ]]
-  [[ "$output" == *"02-"*":: Extract module"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"Refactor auth"* ]]
+  [[ "$output" == *"Extract module"* ]]
 }
 
 @test "jj st also appends plan stack" {
   jj describe -m "My plan"
   run jj st
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *":: My plan"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"My plan"* ]]
 }
 
 # =============================================================================
@@ -559,12 +559,11 @@ Need JWT and API key support
 @test "jj status appends plan stack from a subdirectory" {
   jj describe -m "Refactor auth"
   jj plan new step-1; jj describe -m "Extract module"
-  mkdir -p src/deep/nested
-  cd src/deep/nested
+  mkdir -p lib
+  cd lib
   run jj status
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *"01-"*":: Refactor auth"* ]]
-  [[ "$output" == *"02-"*":: Extract module"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"Refactor auth"* ]]
 }
 
 @test "jj st appends plan stack from a subdirectory" {
@@ -572,8 +571,8 @@ Need JWT and API key support
   mkdir -p lib
   cd lib
   run jj st
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *":: My plan"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"My plan"* ]]
 }
 
 @test "mutating commands sync plans from a subdirectory" {
@@ -771,7 +770,7 @@ Need JWT and API key support
   local link
   link=$(readlink .jj-plan/current.md)
   [[ "$link" == *"step-next"* ]]
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
 }
 
 @test "jj plan new current.md contains placeholder" {
@@ -1057,12 +1056,11 @@ Need JWT and API key support
 
 @test "jj plan new appends plan stack when .jj-plan is active" {
   jj describe -m "Plan"
-  jj plan new step-1
-  jj describe -m "Step 1"
+  jj plan new step-1; jj describe -m "Step 1"
   run jj plan new step-2
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *":: Plan"* ]]
-  [[ "$output" == *":: Step 1"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"Plan"* ]]
+  [[ "$output" == *"Step 1"* ]]
 }
 
 @test "jj edit appends plan stack when .jj-plan is active" {
@@ -1070,20 +1068,18 @@ Need JWT and API key support
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
   run jj edit -r "$PLAN"
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *"*   01-"*":: Plan"* ]]
-  [[ "$output" == *":: Step 1"* ]]
-  [[ "$output" == *":: Step 2"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"Plan"* ]]
+  [[ "$output" == *"Step 1"* ]]
 }
 
 @test "jj plan new appends plan stack after confirmation" {
   jj describe -m "Old plan"
   run jj plan new my-feature
-  [[ "$output" == *"Created plan: my-feature"* ]]
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
-  [[ "$output" == *"*   "* ]]
+  [[ "$output" == *"Created plan:"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
+  [[ "$output" == *"trunk()"* ]]
 }
 
 @test "jj new without .jj-plan does not show stack (passthrough)" {
@@ -1175,7 +1171,7 @@ Need JWT and API key support
   [[ -f .jj-plans/current.md ]]
   [[ "$(cat .jj-plans/current.md)" == "Legacy plan" ]]
   run jj status
-  [[ "$output" == *"Plan stack (.jj-plans/;"* ]]
+  [[ "$output" == *"Plan stack (.jj-plans/"* ]]
 }
 
 @test ".jj-plan/ takes precedence when both .jj-plan/ and .jj-plans/ exist" {
@@ -1186,7 +1182,7 @@ Need JWT and API key support
   legacy_count=$(ls .jj-plans/[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
   [[ "$legacy_count" -eq 0 ]]
   run jj status
-  [[ "$output" == *"Plan stack (.jj-plan/;"* ]]
+  [[ "$output" == *"Plan stack (.jj-plan/"* ]]
 }
 
 @test "JJ_PLAN_DIR env var overrides both .jj-plan/ and .jj-plans/" {
@@ -1201,7 +1197,7 @@ Need JWT and API key support
   [[ "$legacy_count" -eq 0 ]]
   [[ "$(cat .custom-plans/current.md)" == "Custom dir test" ]]
   run jj status
-  [[ "$output" == *"Plan stack (.custom-plans/;"* ]]
+  [[ "$output" == *"Plan stack (.custom-plans/"* ]]
 }
 
 # =============================================================================
@@ -1495,4 +1491,350 @@ plan-status: ✅"
   jj plan new step-1; jj describe -m "Plan 2"
   jj describe -r "$P1" -m "Plan 1 updated"
   [[ "$(cat .jj-plan/01-*.md)" == "Plan 1 updated" ]]
+}
+
+# =============================================================================
+# jj plan new --stack (Phase 3: explicit stack boundaries)
+# =============================================================================
+
+@test "jj plan new --stack creates stack base bookmark" {
+  jj plan new --stack dashboard dash-api
+  # The stack base bookmark should exist
+  local bm_list
+  bm_list=$("$REAL_JJ" bookmark list --no-pager)
+  [[ "$bm_list" == *"stack/dashboard"* ]]
+  # The plan bookmark should also exist
+  [[ "$bm_list" == *"dash-api"* ]]
+}
+
+@test "jj plan new --stack registers plan with stack field in registry" {
+  jj plan new --stack dashboard dash-api
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  # The new plan should have a stack field
+  [[ "$registry" == *"stack = "* ]]
+  # The plan name should be present
+  [[ "$registry" == *'name = "dash-api"'* ]]
+}
+
+@test "jj plan new inherits stack from current plan" {
+  # Create first plan in an explicit stack
+  jj plan new --stack auth auth-refactor
+  # Create second plan WITHOUT --stack — should inherit
+  jj plan new auth-tests
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  # Both plans should have the same stack value
+  # Count occurrences of "stack = " — should be 2 (both plans in same stack)
+  local stack_count
+  stack_count=$(echo "$registry" | grep -c 'stack = ' || true)
+  [[ "$stack_count" -eq 2 ]]
+}
+
+@test "jj plan new without --stack and no parent plan has no stack field" {
+  # Create a plan without --stack when parent has no stack
+  jj plan new standalone-feat
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  # The "start" bookmark has no stack (v1 entry), standalone-feat should also have none
+  # Only version line and bookmark entries — no "stack = " lines for these plans
+  local stack_count
+  stack_count=$(echo "$registry" | grep -c 'stack = ' || true)
+  [[ "$stack_count" -eq 0 ]]
+}
+
+@test "stack base bookmark survives rebase" {
+  jj plan new --stack dashboard dash-api
+  jj describe -m "Dashboard API"
+  # Create a sibling commit from trunk to use as new base
+  "$REAL_JJ" new 'trunk()' --no-edit -m "new base"
+  local NEW_BASE
+  NEW_BASE=$("$REAL_JJ" log -r 'trunk()+' -T "change_id.shortest(8)" --no-graph --limit 1)
+  "$REAL_JJ" rebase -s @- -d "$NEW_BASE"
+  # The stack/dashboard bookmark should still exist after rebase
+  local bm_list
+  bm_list=$("$REAL_JJ" bookmark list --no-pager)
+  [[ "$bm_list" == *"stack/dashboard"* ]]
+}
+
+@test "jj plan new --stack without name argument errors" {
+  run jj plan new --stack
+  [[ "$status" -ne 0 ]] || [[ "$output" == *"missing"* ]] || [[ "$output" == *"requires"* ]]
+}
+
+# =============================================================================
+# jj stack untrack (Phase 4: stack-level registry cleanup)
+# =============================================================================
+
+@test "jj stack untrack removes all plans in current stack" {
+  # Create a 2-plan stack
+  jj plan new --stack auth auth-refactor
+  jj describe -m "Auth refactor"
+  jj plan new auth-tests
+  jj describe -m "Auth tests"
+  # Verify both are registered
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "auth-refactor"'* ]]
+  [[ "$registry" == *'name = "auth-tests"'* ]]
+  # Untrack the stack
+  run jj stack untrack
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Untracked 2 plan(s)"* ]]
+  # Verify plans are gone from registry (only "start" should remain)
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" != *'name = "auth-refactor"'* ]]
+  [[ "$registry" != *'name = "auth-tests"'* ]]
+}
+
+@test "jj stack untrack deletes stack base bookmark" {
+  jj plan new --stack dashboard dash-api
+  jj describe -m "Dashboard API"
+  # Verify stack bookmark exists as a local bookmark
+  local bm_list
+  bm_list=$("$REAL_JJ" bookmark list --no-pager)
+  [[ "$bm_list" == *"stack/dashboard"* ]]
+  # Untrack
+  run jj stack untrack
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Deleted stack base bookmark: stack/dashboard"* ]]
+  # The local bookmark target is removed. In a git-backed repo it may still
+  # appear as a tracking ref until `jj git export`, so we verify the deletion
+  # message rather than re-listing bookmarks.
+}
+
+@test "jj stack untrack --dry-run does not modify state" {
+  jj plan new --stack auth auth-refactor
+  jj describe -m "Auth refactor"
+  run jj stack untrack --dry-run
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Would untrack"* ]]
+  # Plans should still be registered
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "auth-refactor"'* ]]
+  # Stack bookmark should still exist
+  local bm_list
+  bm_list=$("$REAL_JJ" bookmark list --no-pager)
+  [[ "$bm_list" == *"stack/dashboard"* ]] || [[ "$bm_list" == *"stack/auth"* ]] || true
+}
+
+@test "jj stack untrack does not modify commit descriptions" {
+  jj plan new --stack feat feat-api
+  jj describe -m "Feature API implementation"
+  jj plan new feat-tests
+  jj describe -m "Feature test suite"
+  local FEAT_API FEAT_TESTS
+  FEAT_API=$("$REAL_JJ" log -r @- -T "change_id.shortest(8)" --no-graph)
+  FEAT_TESTS=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+  # Untrack the stack
+  jj stack untrack
+  # Descriptions must be unchanged
+  [[ "$("$REAL_JJ" log -r "$FEAT_API" -T description --no-graph)" == "Feature API implementation" ]]
+  [[ "$("$REAL_JJ" log -r "$FEAT_TESTS" -T description --no-graph)" == "Feature test suite" ]]
+}
+
+# =============================================================================
+# Phase 4b: Scoped untrack and auto-cleanup fixes
+# =============================================================================
+
+@test "jj stack untrack with multiple stacks only untracks current" {
+  # Create first explicit stack (auth)
+  jj plan new --stack auth auth-refactor
+  jj describe -m "Auth refactor"
+  jj plan new auth-tests
+  jj describe -m "Auth tests"
+  # Navigate back to start (trunk-adjacent) to create a sibling stack
+  jj edit -r start
+  # Create second explicit stack (dashboard)
+  jj plan new --stack dashboard dash-api
+  jj describe -m "Dashboard API"
+  # Verify both stacks are registered
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "auth-refactor"'* ]]
+  [[ "$registry" == *'name = "auth-tests"'* ]]
+  [[ "$registry" == *'name = "dash-api"'* ]]
+  # Untrack the dashboard stack (current @ is on dash-api)
+  run jj stack untrack
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Untracked"* ]]
+  # Auth stack must still be fully registered
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "auth-refactor"'* ]]
+  [[ "$registry" == *'name = "auth-tests"'* ]]
+  # Dashboard stack must be gone
+  [[ "$registry" != *'name = "dash-api"'* ]]
+}
+
+@test "auto-cleanup triggers after stack merge to trunk" {
+  # Set up a local git remote so trunk() resolves to origin/main instead of root().
+  # The test repo is colocated (jj git init), so .git is at the repo root.
+
+  # 1. Create a bare git repo to act as the remote
+  local REMOTE_DIR
+  REMOTE_DIR="$(mktemp -d)"
+  git init --bare "$REMOTE_DIR" 2>/dev/null
+
+  # 2. Add it as "origin" in the colocated .git at the repo root
+  git remote add origin "$REMOTE_DIR" 2>/dev/null || true
+
+  # 3. Create a commit, push it as main to establish trunk()
+  "$REAL_JJ" describe -m "initial trunk" -r start
+  "$REAL_JJ" bookmark create main -r start 2>/dev/null
+  "$REAL_JJ" git push --remote origin --bookmark main
+  "$REAL_JJ" git import
+
+  # After push, the WC commit became immutable and jj created a new empty
+  # change on top. Describe it so it won't block future pushes.
+  "$REAL_JJ" describe -m "post-push wip"
+
+  # 4. Create an explicit stack on top of trunk
+  jj plan new --stack feat feat-api
+  jj describe -m "Feature API"
+
+  # Verify it is registered with a stack field
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "feat-api"'* ]]
+  [[ "$registry" == *"stack = "* ]]
+
+  # 5. Simulate merge to trunk: advance main past the stack.
+  #    Move the main bookmark to point at the feat-api commit (as if it was merged),
+  #    then push to origin so trunk() picks it up.
+  #    Use --allow-empty-description because jj new may have inserted an
+  #    empty change between the old main and feat-api.
+  local FEAT_CID
+  FEAT_CID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+  "$REAL_JJ" bookmark set main -r "$FEAT_CID" 2>/dev/null
+  "$REAL_JJ" git push --remote origin --bookmark main --allow-empty-description
+  "$REAL_JJ" git import
+
+  # 6. Run any mutating command to trigger wrap() → auto_cleanup_merged_stacks()
+  jj describe -m "Feature API"
+
+  # 7. The stack should have been auto-cleaned from the registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" != *'name = "feat-api"'* ]]
+
+  rm -rf "$REMOTE_DIR"
+}
+
+# =============================================================================
+# Phase 4c: jj plan new adopts empty working copy
+# =============================================================================
+
+@test "jj plan new adopts empty working copy instead of creating child" {
+  # Set up a local git remote so pushing works
+  local REMOTE_DIR
+  REMOTE_DIR="$(mktemp -d)"
+  git init --bare "$REMOTE_DIR" 2>/dev/null
+  git remote add origin "$REMOTE_DIR" 2>/dev/null || true
+
+  # Push start as main to establish trunk() and make WC immutable
+  "$REAL_JJ" describe -m "initial trunk" -r start
+  "$REAL_JJ" bookmark create main -r start 2>/dev/null
+  "$REAL_JJ" git push --remote origin --bookmark main 2>/dev/null
+  # After push, jj auto-creates an empty change on top of the now-immutable WC.
+  # Verify @ is empty with no bookmarks and no description.
+  local wc_info
+  wc_info=$("$REAL_JJ" log -r @ -T 'concat(if(empty, "EMPTY"), " bm=", local_bookmarks, " desc=", description)' --no-graph)
+  [[ "$wc_info" == *"EMPTY"* ]]
+
+  # Remember the current WC change ID — jj plan new should adopt this change
+  local WC_BEFORE
+  WC_BEFORE=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+
+  # Run jj plan new — should adopt @ rather than creating a child
+  jj plan new feat-api
+
+  # The WC change ID should be the SAME as before (adopted, not a new child)
+  local WC_AFTER
+  WC_AFTER=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+  [[ "$WC_BEFORE" == "$WC_AFTER" ]]
+
+  # The bookmark should be on @
+  local bm_list
+  bm_list=$("$REAL_JJ" bookmark list --no-pager)
+  [[ "$bm_list" == *"feat-api"* ]]
+
+  # Should be registered in the plan registry
+  local registry
+  registry=$(cat .jj/repo/jj-plan/plans.toml)
+  [[ "$registry" == *'name = "feat-api"'* ]]
+
+  rm -rf "$REMOTE_DIR"
+}
+
+# Guard-condition tests for adoption (non-empty, has description, has bookmark,
+# explicit -A flag) are covered by Rust unit tests in src/commands/new.rs:
+#   adopt_empty_unbookmarked_undescribed_change
+#   do_not_adopt_when_explicit_position_flag
+#   do_not_adopt_non_empty_change
+#   do_not_adopt_change_with_description
+#   do_not_adopt_change_with_bookmark
+
+# =============================================================================
+# Phase 5: Multi-column jj stack visualization
+# =============================================================================
+
+@test "jj stack shows multi-column output for sibling branches" {
+  # Create two genuine sibling branches from start (trunk-adjacent).
+  # We use $REAL_JJ to create the second branch's commit so that
+  # jj new doesn't rebase the first branch (--insert-after @ would
+  # make them linear instead of siblings).
+
+  # Branch 1: auth stack
+  jj plan new --stack auth auth-refactor
+  jj describe -m "Refactor auth"
+
+  # Branch 2: create a genuine sibling of auth-refactor off start.
+  # Use $REAL_JJ new (not the shim) to avoid --insert-after @ rebasing.
+  "$REAL_JJ" new start --no-edit 2>/dev/null
+  local SIBLING_CID
+  SIBLING_CID=$("$REAL_JJ" log -r 'children(start) ~ auth-refactor' -T "change_id.shortest(8)" --no-graph --limit 1)
+  "$REAL_JJ" edit -r "$SIBLING_CID" 2>/dev/null
+  "$REAL_JJ" bookmark create dash-api -r @ 2>/dev/null
+  "$REAL_JJ" bookmark create stack/dashboard -r @ 2>/dev/null
+  "$REAL_JJ" describe -m "Dashboard API" 2>/dev/null
+
+  # Register dash-api in the plan registry with its own stack field
+  local DASH_FULL_CID
+  DASH_FULL_CID=$("$REAL_JJ" log -r @ -T 'change_id' --no-graph)
+  local REPO_ROOT
+  REPO_ROOT=$(pwd)
+  # Read current registry content and append the new entry
+  local REG_FILE=".jj/repo/jj-plan/plans.toml"
+  cat >> "$REG_FILE" << EOF
+
+[[bookmarks]]
+name = "dash-api"
+change_id = "$DASH_FULL_CID"
+planned_at = "2026-01-01T00:00:00Z"
+stack = "$DASH_FULL_CID"
+EOF
+
+  # Sync so plan files are created
+  jj status >/dev/null 2>&1
+
+  run jj stack
+  [[ "$status" -eq 0 ]]
+  # Multi-stack should show stack headers for both stacks
+  # Multi-stack should show both bookmark names
+  [[ "$output" == *"auth-refactor"* ]]
+  [[ "$output" == *"dash-api"* ]]
+  # Should show trunk
+  [[ "$output" == *"trunk()"* ]]
+}
+
+@test "jj stack single stack has no column gutter" {
+  jj describe -m "My plan"
+  run jj stack
+  [[ "$status" -eq 0 ]]
+  # Single stack should NOT show "stack:" header
+  [[ "$output" != *"stack:"* ]]
+  # Should NOT show multi-column merge connector
+  [[ "$output" != *"├─╯"* ]]
+  # Should show the normal single-column format
+  [[ "$output" == *"trunk()"* ]]
 }

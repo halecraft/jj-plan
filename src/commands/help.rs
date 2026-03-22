@@ -38,6 +38,19 @@ impl ColorWhen {
             Self::Debug => cfg!(debug_assertions),
         }
     }
+
+    /// Whether ANSI styling should be emitted for the current stderr target.
+    ///
+    /// Plan stack output goes to stderr, so color decisions for it should
+    /// check stderr's terminal status, not stdout's.
+    pub fn should_color_stderr(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => io::stderr().is_terminal(),
+            Self::Debug => cfg!(debug_assertions),
+        }
+    }
 }
 
 /// Parsed info for a `jj plan --help`-style invocation.

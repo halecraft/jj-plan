@@ -22,7 +22,8 @@
 //!
 //! Context: jj:pozrnomw, jj:ntksslnn
 
-use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, NarrowedBookmarkSegment, PlanRegistry, Stack, StackResult, SubmissionChain, UnbookmarkedChange};
+use crate::types::{Bookmark, BookmarkSegment, Gap, LogEntry, MultiStack, NarrowedBookmarkSegment, PlanRegistry, Stack, StackGroup, StackResult, SubmissionChain, UnbookmarkedChange};
+use std::collections::{HashMap, HashSet};
 use std::result::Result as StdResult;
 use crate::workspace::Workspace;
 
@@ -96,6 +97,306 @@ pub fn build_stack(workspace: &Workspace, registry: Option<&PlanRegistry>) -> St
     }
 
     result
+}
+
+/// Group plan bookmarks into connected chains by walking parent links.
+///
+/// Two bookmarks are in the same chain if one is an ancestor of the other
+/// (transitively, through commits in the `commit_map`). Uses union-find
+/// for efficient grouping.
+///
+/// Returns a map from group ID → list of indices into `bookmark_commit_ids`.
+/// Each group is one independent chain of plans.
+fn group_bookmarks_by_ancestry(
+    bookmark_commit_ids: &[(String, String)],
+    commit_map: &HashMap<String, LogEntry>,
+) -> HashMap<usize, Vec<usize>> {
+    let n = bookmark_commit_ids.len();
+    let mut parent_uf: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    // Build commit_id → bookmark index map for quick lookup during walks
+    let commit_to_bm_idx: HashMap<&str, usize> = bookmark_commit_ids
+        .iter()
+        .enumerate()
+        .map(|(i, (_, cid))| (cid.as_str(), i))
+        .collect();
+
+    // For each bookmark, walk ancestors and union with any other bookmark found
+    for (i, (_, start_cid)) in bookmark_commit_ids.iter().enumerate() {
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut queue: Vec<&str> = vec![start_cid.as_str()];
+
+        while let Some(cid) = queue.pop() {
+            if !visited.insert(cid) {
+                continue;
+            }
+            // If this commit is another bookmark (not ourselves), union
+            if let Some(&j) = commit_to_bm_idx.get(cid) {
+                if j != i {
+                    union(&mut parent_uf, i, j);
+                }
+            }
+            // Walk parents that are in our commit map
+            if let Some(entry) = commit_map.get(cid) {
+                for parent_cid in &entry.parents {
+                    if commit_map.contains_key(parent_cid.as_str()) {
+                        queue.push(parent_cid.as_str());
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect groups by union-find root
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent_uf, i);
+        groups.entry(root).or_default().push(i);
+    }
+
+    groups
+}
+
+/// Build a multi-stack view of ALL registered plan bookmarks across the repo.
+///
+/// Unlike `build_stack()` which only sees `trunk()..@`, this function
+/// discovers all registered plan bookmarks regardless of working copy
+/// position, groups them into independent chains by walking parent links,
+/// and returns a `MultiStack` with one `StackGroup` per chain.
+///
+/// Used by `jj stack` visualization. The sync/flush pipeline continues
+/// to use `build_stack()` for the @-relative view.
+pub fn build_multi_stack(workspace: &Workspace, registry: &PlanRegistry) -> MultiStack {
+    let tracked = registry.tracked_names();
+    if tracked.is_empty() {
+        return MultiStack { stacks: vec![] };
+    }
+
+    // 1. For each registered bookmark, evaluate trunk()..bookmark and collect
+    //    all commits into a unified map. Bookmarks that don't resolve are skipped.
+    let mut commit_map: HashMap<String, LogEntry> = HashMap::new();
+    let mut bookmark_commit_ids: Vec<(String, String)> = Vec::new(); // (bookmark_name, commit_id)
+
+    for bookmark_name in &tracked {
+        let revset = format!("trunk()..{}", bookmark_name);
+        let commits = match workspace.evaluate_revset_reversed(&revset) {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+
+        for commit in &commits {
+            let entry = workspace.commit_to_log_entry(commit);
+            let cid = entry.commit_id.clone();
+            // Record if this commit carries the plan bookmark
+            if entry.local_bookmarks.contains(&bookmark_name.to_string()) {
+                bookmark_commit_ids.push((bookmark_name.to_string(), cid.clone()));
+            }
+            commit_map.entry(cid).or_insert(entry);
+        }
+    }
+
+    if bookmark_commit_ids.is_empty() {
+        return MultiStack { stacks: vec![] };
+    }
+
+    // 2. Partition bookmarks: registry `stack` field is the primary grouping
+    //    signal. Bookmarks with stack = None fall through to DAG-topology grouping.
+    //
+    //    Build a map: bookmark_name → index in bookmark_commit_ids
+    let bm_name_to_idx: HashMap<&str, usize> = bookmark_commit_ids
+        .iter()
+        .enumerate()
+        .map(|(i, (name, _))| (name.as_str(), i))
+        .collect();
+
+    // Partition into registry-grouped (by stack value) and ungrouped (stack = None)
+    let mut registry_groups: HashMap<String, Vec<usize>> = HashMap::new(); // stack_id → indices
+    let mut ungrouped_indices: Vec<usize> = Vec::new();
+
+    for (bm_name, idx) in &bm_name_to_idx {
+        if let Some(planned) = registry.get(bm_name) {
+            if let Some(ref stack_id) = planned.stack {
+                registry_groups.entry(stack_id.clone()).or_default().push(*idx);
+            } else {
+                ungrouped_indices.push(*idx);
+            }
+        } else {
+            ungrouped_indices.push(*idx);
+        }
+    }
+
+    // 3. For ungrouped bookmarks (stack = None), use DAG-topology grouping.
+    let ungrouped_bm_cids: Vec<(String, String)> = ungrouped_indices
+        .iter()
+        .map(|&i| bookmark_commit_ids[i].clone())
+        .collect();
+
+    let dag_groups = if !ungrouped_bm_cids.is_empty() {
+        let raw_groups = group_bookmarks_by_ancestry(&ungrouped_bm_cids, &commit_map);
+        // Map indices back from ungrouped-local to bookmark_commit_ids-global
+        let mut remapped: Vec<Vec<usize>> = Vec::new();
+        for (_root, local_indices) in raw_groups {
+            let global_indices: Vec<usize> = local_indices
+                .iter()
+                .map(|&li| ungrouped_indices[li])
+                .collect();
+            remapped.push(global_indices);
+        }
+        remapped
+    } else {
+        Vec::new()
+    };
+
+    // Collect all bookmark names that belong to explicit (registry-grouped) stacks
+    // BEFORE consuming registry_groups. These must be excluded from DAG-topology
+    // groups to prevent duplicates.
+    let explicitly_grouped: HashSet<&str> = registry_groups
+        .values()
+        .flat_map(|indices| indices.iter().map(|&i| bookmark_commit_ids[i].0.as_str()))
+        .collect();
+
+    // 4. Combine all groups: registry-grouped first, then DAG-grouped.
+    //    Each group is (Option<stack_id>, Vec<index into bookmark_commit_ids>).
+    let mut all_groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+
+    for (stack_id, indices) in registry_groups {
+        all_groups.push((Some(stack_id), indices));
+    }
+    for indices in dag_groups {
+        all_groups.push((None, indices));
+    }
+
+    // 5. For each group, collect the commits that form that chain and
+    //    run build_segments_and_gaps to produce segments.
+    let stack_prefix = crate::plan_dir::stack_prefix();
+    let mut stack_groups: Vec<StackGroup> = Vec::new();
+
+    for (stack_id, member_indices) in &all_groups {
+        // Collect all bookmark names in this group
+        let group_bookmark_names: HashSet<&str> = member_indices
+            .iter()
+            .map(|&i| bookmark_commit_ids[i].0.as_str())
+            .collect();
+
+        // Re-evaluate a union revset for this group's bookmarks to get
+        // topologically-sorted commits.
+        let bookmark_list: Vec<&str> = group_bookmark_names.iter().copied().collect();
+        let union_revset = if bookmark_list.len() == 1 {
+            format!("trunk()..{}", bookmark_list[0])
+        } else {
+            let parts: Vec<String> = bookmark_list.iter().map(|b| b.to_string()).collect();
+            format!("trunk()..({})", parts.join(" | "))
+        };
+
+        let commits = match workspace.evaluate_revset_reversed(&union_revset) {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+
+        let entries: Vec<LogEntry> = commits
+            .iter()
+            .map(|c| workspace.commit_to_log_entry(c))
+            .collect();
+        let short_ids: Vec<String> = commits
+            .iter()
+            .map(|c| workspace.short_change_id(c))
+            .collect();
+
+        // Build a per-group filtered registry so that only this group's
+        // bookmarks produce segments. Without filtering, bookmarks from
+        // other groups that happen to share commits (e.g. a shared trunk-
+        // adjacent commit) would appear as segments in multiple groups.
+        let mut group_registry = PlanRegistry::new();
+        for bm in &registry.bookmarks {
+            if group_bookmark_names.contains(bm.name.as_str()) {
+                group_registry.track(bm.clone());
+            } else if stack_id.is_none() {
+                // For DAG-topology groups (implicit stacks), also include
+                // ungrouped bookmarks that are NOT claimed by an explicit
+                // stack. This lets shared ancestors like `start` appear
+                // as segments in the implicit group without duplicating
+                // bookmarks that belong to explicit stacks.
+                if !explicitly_grouped.contains(bm.name.as_str()) {
+                    group_registry.track(bm.clone());
+                }
+            }
+        }
+
+        let result = build_segments_and_gaps(&entries, &short_ids, Some(&group_registry));
+
+        if let StackResult::Ok(stack) = result {
+            if stack.segments.is_empty() {
+                continue;
+            }
+
+            // Derive group name from the first (trunk-most) registered bookmark.
+            // Skip bookmarks that aren't in the registry (e.g. `start` might
+            // appear as a segment in multiple groups but isn't the plan we want
+            // to name the group after).
+            let first_registered = stack.segments.iter()
+                .flat_map(|seg| seg.bookmarks.iter())
+                .find(|b| registry.is_tracked(&b.name))
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| {
+                    stack.segments.first()
+                        .and_then(|seg| seg.bookmarks.first())
+                        .map(|b| b.name.clone())
+                        .unwrap_or_else(|| "unnamed".to_string())
+                });
+
+            // Check for explicit stack/* base bookmark, but ONLY for groups
+            // that have an explicit stack_id. Implicit (DAG-topology) groups
+            // don't have base bookmarks. Also only scan segment tip commits
+            // (changes[0]) to avoid picking up stack/* bookmarks from shared
+            // ancestor commits that belong to a different group.
+            let base_bookmark = if stack_id.is_some() {
+                stack.segments.iter()
+                    .filter_map(|seg| seg.changes.first())
+                    .find_map(|entry| {
+                        entry.local_bookmarks.iter().find(|b| b.starts_with(&stack_prefix)).cloned()
+                    })
+            } else {
+                None
+            };
+
+            let name = base_bookmark.as_ref()
+                .map(|b| b.strip_prefix(&stack_prefix).unwrap_or(b).to_string())
+                .unwrap_or(first_registered);
+
+            stack_groups.push(StackGroup {
+                name,
+                base_bookmark,
+                base_change_id: stack_id.clone(),
+                segments: stack.segments,
+                gaps: stack.gaps,
+            });
+        }
+    }
+
+    // Sort stacks by segment count descending (largest/most-established first),
+    // with alphabetical name as tiebreaker for stable ordering.
+    stack_groups.sort_by(|a, b| {
+        b.segments.len().cmp(&a.segments.len())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    MultiStack { stacks: stack_groups }
 }
 
 /// Internal: group entries into bookmark segments and detect gaps.
@@ -1081,6 +1382,102 @@ mod tests {
         assert_eq!(chain.segments.len(), 2);
         assert_eq!(chain.gaps.len(), 1);
         assert_eq!(chain.gaps[0].before_bookmark, "feat-b");
+    }
+
+    // -----------------------------------------------------------------------
+    // group_bookmarks_by_ancestry tests (pure, no workspace needed)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_group_single_chain() {
+        // trunk <- c1 (bm-a) <- c2 (bm-b) <- c3 (bm-c)
+        // All three bookmarks are in one linear chain → 1 group
+        let mut commit_map = HashMap::new();
+        commit_map.insert("c1".to_string(), make_entry_with_parents("ch1", "c1", &["trunk"], &["bm-a"]));
+        commit_map.insert("c2".to_string(), make_entry_with_parents("ch2", "c2", &["c1"], &["bm-b"]));
+        commit_map.insert("c3".to_string(), make_entry_with_parents("ch3", "c3", &["c2"], &["bm-c"]));
+
+        let bookmark_commit_ids = vec![
+            ("bm-a".to_string(), "c1".to_string()),
+            ("bm-b".to_string(), "c2".to_string()),
+            ("bm-c".to_string(), "c3".to_string()),
+        ];
+
+        let groups = group_bookmarks_by_ancestry(&bookmark_commit_ids, &commit_map);
+        assert_eq!(groups.len(), 1, "3 linear bookmarks should form 1 group");
+        let group = groups.values().next().unwrap();
+        assert_eq!(group.len(), 3);
+    }
+
+    #[test]
+    fn test_group_two_branches() {
+        // trunk <- c1 (bm-a) <- c2 (bm-b)
+        // trunk <- c3 (bm-c)
+        // bm-a and bm-b are connected; bm-c is independent → 2 groups
+        let mut commit_map = HashMap::new();
+        commit_map.insert("c1".to_string(), make_entry_with_parents("ch1", "c1", &["trunk"], &["bm-a"]));
+        commit_map.insert("c2".to_string(), make_entry_with_parents("ch2", "c2", &["c1"], &["bm-b"]));
+        commit_map.insert("c3".to_string(), make_entry_with_parents("ch3", "c3", &["trunk"], &["bm-c"]));
+
+        let bookmark_commit_ids = vec![
+            ("bm-a".to_string(), "c1".to_string()),
+            ("bm-b".to_string(), "c2".to_string()),
+            ("bm-c".to_string(), "c3".to_string()),
+        ];
+
+        let groups = group_bookmarks_by_ancestry(&bookmark_commit_ids, &commit_map);
+        assert_eq!(groups.len(), 2, "2 branches from trunk should form 2 groups");
+
+        // One group should have 2 members (bm-a, bm-b), the other 1 (bm-c)
+        let mut sizes: Vec<usize> = groups.values().map(|g| g.len()).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_group_empty() {
+        let commit_map: HashMap<String, LogEntry> = HashMap::new();
+        let bookmark_commit_ids: Vec<(String, String)> = vec![];
+        let groups = group_bookmarks_by_ancestry(&bookmark_commit_ids, &commit_map);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_group_three_independent() {
+        // Three bookmarks with no shared ancestry in the map → 3 groups
+        let mut commit_map = HashMap::new();
+        commit_map.insert("c1".to_string(), make_entry_with_parents("ch1", "c1", &["trunk"], &["bm-a"]));
+        commit_map.insert("c2".to_string(), make_entry_with_parents("ch2", "c2", &["trunk"], &["bm-b"]));
+        commit_map.insert("c3".to_string(), make_entry_with_parents("ch3", "c3", &["trunk"], &["bm-c"]));
+
+        let bookmark_commit_ids = vec![
+            ("bm-a".to_string(), "c1".to_string()),
+            ("bm-b".to_string(), "c2".to_string()),
+            ("bm-c".to_string(), "c3".to_string()),
+        ];
+
+        let groups = group_bookmarks_by_ancestry(&bookmark_commit_ids, &commit_map);
+        assert_eq!(groups.len(), 3, "3 independent bookmarks should form 3 groups");
+    }
+
+    #[test]
+    fn test_group_diamond_merge() {
+        // trunk <- c1 (bm-a) <- c2
+        //                    <- c3 (bm-b)
+        // c2 has parents [c1], c3 has parents [c1]
+        // bm-a and bm-b share ancestor c1 → 1 group
+        let mut commit_map = HashMap::new();
+        commit_map.insert("c1".to_string(), make_entry_with_parents("ch1", "c1", &["trunk"], &["bm-a"]));
+        commit_map.insert("c2".to_string(), make_entry_with_parents("ch2", "c2", &["c1"], &[]));
+        commit_map.insert("c3".to_string(), make_entry_with_parents("ch3", "c3", &["c1"], &["bm-b"]));
+
+        let bookmark_commit_ids = vec![
+            ("bm-a".to_string(), "c1".to_string()),
+            ("bm-b".to_string(), "c3".to_string()),
+        ];
+
+        let groups = group_bookmarks_by_ancestry(&bookmark_commit_ids, &commit_map);
+        assert_eq!(groups.len(), 1, "bm-b descends from bm-a via c1 → same group");
     }
 
     #[test]

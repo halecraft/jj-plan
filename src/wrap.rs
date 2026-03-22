@@ -1,6 +1,10 @@
+use crate::commands::help::ColorWhen;
 use crate::jj_binary::JjBinary;
-use crate::plan_dir::PlanDir;
-use crate::types::PlanRegistry;
+use crate::plan_dir::{self, PlanDir};
+use crate::plan_registry;
+use crate::pr_cache::load_pr_cache;
+use crate::stack_builder::{build_multi_stack, narrow_segments};
+use crate::types::{PlanRegistry, Stack};
 use crate::workspace::Workspace;
 use crate::sync;
 
@@ -30,30 +34,165 @@ pub fn wrap(
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
-    // 3-6. Reload repo, re-resolve stack, sync plan files, show stack
+    // 3-5. Reload repo, re-resolve stack, sync plan files
     workspace.reload();
     resolve_and_sync(plan_dir, workspace, registry);
+
+    // 6. Display the plan stack
+    show_plan_stack(plan_dir, workspace, registry);
+
+    // 7. Auto-cleanup merged stacks (registry + base bookmarks behind trunk)
+    auto_cleanup_merged_stacks(workspace, plan_dir);
 
     Ok(exit_code)
 }
 
-/// Canonical post-mutation sync: build stack → sync plan files → show stack.
+/// Canonical post-mutation sync: build stack → sync plan files.
 ///
 /// This is the single entry point for "re-read jj state and update plan files
-/// after a mutation". All command modules should call this instead of
-/// maintaining their own sync helpers.
+/// after a mutation". Does NOT display anything — callers that want to show
+/// the stack should follow up with `show_plan_stack()`.
 ///
 /// Callers must call `workspace.reload()` after CLI mutations before
 /// calling this.
+
+/// Auto-cleanup stacks whose base change is behind trunk (fully merged).
+///
+/// Scans the registry for plans with an explicit `stack` value, checks
+/// whether that change ID is an ancestor of `trunk()`, and if so untracks
+/// all plans in that stack and deletes the base bookmark.
+///
+/// This runs after every mutating command (via `wrap()`), so merged stacks
+/// are cleaned up automatically without user intervention.
+pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir) {
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let registry = plan_registry::load_registry(&repo_root);
+
+    // Collect unique explicit stack IDs (standard hex change IDs of stack bases)
+    let mut stack_ids: Vec<String> = Vec::new();
+    for bm in &registry.bookmarks {
+        if let Some(ref sid) = bm.stack {
+            if !stack_ids.contains(sid) {
+                stack_ids.push(sid.clone());
+            }
+        }
+    }
+
+    if stack_ids.is_empty() {
+        return;
+    }
+
+    let stack_prefix = plan_dir::stack_prefix();
+    let mut cleaned_any = false;
+
+    for stack_id in &stack_ids {
+        // Convert standard hex change ID to reverse-hex for use in revsets.
+        // jj revsets only accept reverse-hex change IDs; standard hex is
+        // interpreted as a commit ID and will silently fail to resolve.
+        let revset_id = match workspace.short_change_id_from_hex(stack_id) {
+            Some(id) => id,
+            None => continue, // Invalid hex or unknown change — skip
+        };
+
+        // Check if the stack base change is an ancestor of trunk()
+        let revset = format!("{} & ::trunk()", revset_id);
+        let is_merged = workspace
+            .evaluate_revset(&revset)
+            .map(|commits| !commits.is_empty())
+            .unwrap_or(false);
+
+        if !is_merged {
+            continue;
+        }
+
+        // This stack has been fully merged — clean it up
+        let plans = registry.plans_in_stack(Some(stack_id));
+        if plans.is_empty() {
+            continue;
+        }
+
+        let plan_names: Vec<String> = plans.iter().map(|p| p.name.clone()).collect();
+
+        // Derive a human-readable stack name from the base bookmark.
+        // Scope to the bookmark whose change_id matches this stack_id
+        // (standard hex comparison — both sides use commit.change_id().hex()).
+        let stack_name = workspace
+            .local_bookmarks()
+            .iter()
+            .find(|b| b.name.starts_with(&stack_prefix) && b.change_id == *stack_id)
+            .map(|b| b.name.strip_prefix(&stack_prefix).unwrap_or(&b.name).to_string())
+            .unwrap_or_else(|| plan_names.first().cloned().unwrap_or_default());
+
+        // Untrack all plans in this stack
+        let mut registry_mut = plan_registry::load_registry(&repo_root);
+        for name in &plan_names {
+            registry_mut.untrack(name);
+        }
+        plan_registry::save_registry(&repo_root, &registry_mut);
+
+        // Delete the stack base bookmark if one exists.
+        // Scope to the bookmark whose change_id matches this stack_id.
+        let base_bm: Option<String> = workspace
+            .local_bookmarks()
+            .iter()
+            .find(|b| b.name.starts_with(&stack_prefix) && b.change_id == *stack_id)
+            .map(|b| b.name.clone());
+
+        if let Some(ref bb) = base_bm {
+            let _ = workspace.delete_bookmark(bb);
+        }
+
+        eprintln!("jj-plan: auto-cleaned stack '{}' (merged to trunk)", stack_name);
+        cleaned_any = true;
+    }
+
+    if cleaned_any {
+        // Re-sync after cleanup so plan files reflect the updated registry
+        workspace.reload();
+        let post_registry = plan_registry::load_registry(&repo_root);
+        resolve_and_sync(plan_dir, workspace, &post_registry);
+    }
+}
+
 pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
     debug_log!("resolve_and_sync(plan_dir={:?})", plan_dir.path);
 
     let max_stack_size = crate::plan_dir::plan_max();
 
+    // Auto-untrack registry entries whose bookmarks no longer exist in jj.
+    // When `jj abandon` deletes a bookmark (the default behavior without
+    // --retain-bookmarks), the registry entry becomes stale. Clean it up
+    // so the plan file disappears on the next sync cycle.
+    let all_bookmarks = workspace.local_bookmarks();
+    let live_bookmark_names: std::collections::HashSet<&str> = all_bookmarks
+        .iter()
+        .map(|b| b.name.as_str())
+        .collect();
+
+    let stale: Vec<String> = registry
+        .bookmarks
+        .iter()
+        .filter(|b| !live_bookmark_names.contains(b.name.as_str()))
+        .map(|b| b.name.clone())
+        .collect();
+
+    if !stale.is_empty() {
+        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+        let mut registry_mut = plan_registry::load_registry(&repo_root);
+        for name in &stale {
+            registry_mut.untrack(name);
+        }
+        plan_registry::save_registry(&repo_root, &registry_mut);
+        eprintln!(
+            "jj-plan: auto-untracked {} abandoned bookmark(s): {}",
+            stale.len(),
+            stale.join(", ")
+        );
+    }
+
     // Migrate any legacy change-ID-based filenames to bookmark-named files.
     // This must happen before gather_current_state() in sync so the rest of
     // the pipeline sees only bookmark-named files.
-    let all_bookmarks = workspace.local_bookmarks();
     crate::plan_file::migrate_legacy_filenames(&plan_dir.path, |legacy_change_id| {
         // Resolve the short reverse-hex change ID to a bookmark name.
         // We compare the short ID from the filename against each bookmark's
@@ -84,8 +223,194 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             debug_log!("  plan_dir: {:?}", plan_dir.path);
         }
     }
-    let terminal_view = sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
-    sync::show_stack(plan_dir, terminal_view.as_deref());
+    let _terminal_view = sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry);
+}
+
+// ---------------------------------------------------------------------------
+// ANSI color helpers
+// ---------------------------------------------------------------------------
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const GREEN: &str = "\x1b[32m";
+const CYAN: &str = "\x1b[36m";
+const DIM: &str = "\x1b[2m";
+// 256-color codes matching jj's change ID rendering:
+const BRIGHT_MAGENTA: &str = "\x1b[1m\x1b[38;5;5m"; // bold + 256-color magenta (unique prefix)
+const GRAY: &str = "\x1b[38;5;8m";                   // 256-color dark gray (rest of ID)
+
+/// Resolve whether to use color for plan stack output.
+///
+/// Checks stderr (not stdout) since all plan stack output goes to stderr.
+/// Respects jj's `ui.color` config via `configured_color_mode()`, which
+/// calls `jj config get ui.color`.
+fn should_color() -> bool {
+    configured_color_mode().should_color_stderr()
+}
+
+/// Read jj's configured color mode, falling back to Auto.
+fn configured_color_mode() -> ColorWhen {
+    let Ok(jj) = crate::jj_binary::JjBinary::resolve() else {
+        return ColorWhen::Auto;
+    };
+    let Ok((status, stdout, _)) = jj.run_silent(&["config", "get", "ui.color"]) else {
+        return ColorWhen::Auto;
+    };
+    if !status.success() {
+        return ColorWhen::Auto;
+    }
+    ColorWhen::parse(stdout.trim()).unwrap_or(ColorWhen::Auto)
+}
+
+/// Display the plan stack using the multi-stack visualization with color.
+///
+/// This is the single rendering entry point for all command paths.
+/// Call after `resolve_and_sync()` to show the current state.
+pub fn show_plan_stack(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+    let multi = build_multi_stack(workspace, registry);
+
+    if multi.stacks.is_empty() {
+        eprintln!("No plans between trunk and working copy.");
+        eprintln!("Create one with: jj plan new <bookmark-name>");
+        return;
+    }
+
+    let color = should_color();
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let pr_cache = load_pr_cache(&repo_root).ok();
+    let num_stacks = multi.stacks.len();
+    let is_multi = num_stacks > 1;
+
+    // Header
+    eprintln!();
+    eprint!("Plan stack ({}/", plan_dir.dir_name());
+    if is_multi {
+        eprint!(" {} stacks", num_stacks);
+    }
+    eprintln!("):");
+
+    for (stack_idx, group) in multi.stacks.iter().enumerate() {
+        if is_multi {
+            eprintln!("  stack: {}", group.name);
+        }
+
+        let narrowed = narrow_segments(
+            &Stack {
+                segments: group.segments.clone(),
+                gaps: group.gaps.clone(),
+            },
+            registry,
+        );
+
+        // Show segments from tip to trunk (narrowed is trunk-to-tip, so reverse)
+        for (i, seg) in narrowed.iter().enumerate().rev() {
+            let bookmark_name = &seg.bookmark.name;
+            let tip = seg.changes.first();
+            let is_wc = tip.is_some_and(|c| c.is_working_copy);
+            let is_done = tip.is_some_and(|c| c.is_done());
+
+            let short_change_id = tip
+                .and_then(|c| workspace.short_change_id_from_hex(&c.change_id))
+                .unwrap_or_default();
+
+            // Split change ID into unique prefix + rest for colored rendering
+            let change_id_split = tip
+                .and_then(|c| workspace.change_id_with_prefix_split(&c.change_id));
+
+            let mut indicators = Vec::new();
+            if is_wc { indicators.push("@".to_string()); }
+            if is_done { indicators.push("✓".to_string()); }
+            if seg.bookmark.is_synced { indicators.push("synced".to_string()); }
+            if let Some(ref cache) = pr_cache {
+                if let Some(cached_pr) = cache.get(bookmark_name) {
+                    indicators.push(format!("PR #{}", cached_pr.number));
+                }
+            }
+
+            // Build the display line with optional color
+            let marker = if is_wc { "◉" } else { "○" };
+            let first_line = tip
+                .map(|c| c.first_line().to_string())
+                .unwrap_or_default();
+
+            if color {
+                let indicator_str = if indicators.is_empty() {
+                    String::new()
+                } else {
+                    // Color: green for ✓ and @, dim for the parens
+                    let colored_parts: Vec<String> = indicators.iter().map(|ind| {
+                        if ind == "✓" { format!("{GREEN}✓{RESET}") }
+                        else if ind == "@" { format!("{BOLD}{GREEN}@{RESET}") }
+                        else { ind.clone() }
+                    }).collect();
+                    format!("({})", colored_parts.join(", "))
+                };
+
+                let marker_colored = if is_wc {
+                    format!("{BOLD}{GREEN}{marker}{RESET}")
+                } else {
+                    format!("{DIM}{marker}{RESET}")
+                };
+
+                let change_id_colored = match &change_id_split {
+                    Some((prefix, rest)) => format!("{BRIGHT_MAGENTA}{prefix}{RESET}{GRAY}{rest}{RESET}"),
+                    None => short_change_id.clone(),
+                };
+
+                eprintln!(
+                    "  {} {BOLD}{}{RESET} {} {}",
+                    marker_colored, bookmark_name, change_id_colored, indicator_str,
+                );
+                if !first_line.is_empty() {
+                    eprintln!("  {DIM}│{RESET} {}", first_line);
+                }
+            } else {
+                let indicator_str = if indicators.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", indicators.join(", "))
+                };
+                eprintln!("  {} {} {} {}", marker, bookmark_name, short_change_id, indicator_str);
+                if !first_line.is_empty() {
+                    eprintln!("  │ {}", first_line);
+                }
+            }
+
+            if i > 0 {
+                if color {
+                    eprintln!("  {DIM}│{RESET}");
+                } else {
+                    eprintln!("  │");
+                }
+            }
+        }
+
+        // Show gaps if any
+        if !group.gaps.is_empty() {
+            let total: usize = group.gaps.iter().map(|g| g.unbookmarked.len()).sum();
+            eprintln!();
+            eprintln!("  ⚠ {} unbookmarked change(s) between plans", total);
+            for gap in &group.gaps {
+                for change in &gap.unbookmarked {
+                    eprintln!("    {} {}", change.short_id, change.description_first_line);
+                }
+            }
+        }
+
+        if is_multi && stack_idx < num_stacks - 1 {
+            eprintln!();
+        }
+    }
+
+    // Trunk
+    if color {
+        eprintln!("  {DIM}│{RESET}");
+        eprintln!("  {CYAN}◆{RESET} trunk()");
+    } else {
+        eprintln!("  │");
+        eprintln!("  ◆ trunk()");
+    }
+    eprintln!();
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.

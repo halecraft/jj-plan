@@ -119,15 +119,60 @@ Three breaking changes were resolved:
 
 ## Stack Model (`src/stack_builder.rs`)
 
-### Revset
+### Single-stack view (sync/flush pipeline)
 
-The stack is everything between trunk and the working copy:
+The sync/flush pipeline uses `build_stack()`, which sees everything between trunk and the working copy:
 
 ```
 trunk()..(@  | descendants(@))
 ```
 
-This range is evaluated via jj-lib's in-process revset engine. The result is walked in topological order (parents before children) and partitioned into segments.
+This range is evaluated via jj-lib's in-process revset engine. The result is walked in topological order (parents before children) and partitioned into segments. This is the `@`-relative view — it only sees the lineage of the current working copy.
+
+### Multi-stack view (visualization)
+
+`build_multi_stack()` discovers ALL registered plan bookmarks across the repo, regardless of working copy position. It uses a two-pass approach:
+
+1. **Discovery**: For each registered bookmark, evaluate `trunk()..{bookmark}` and collect all commits into a unified map.
+2. **Grouping**: Bookmarks with an explicit `stack` field in the registry are grouped by that value. Remaining bookmarks (`stack = None`) are grouped by DAG topology using a union-find algorithm (`group_bookmarks_by_ancestry()`).
+3. **Segment building**: Each group's bookmarks are combined into a union revset (`trunk()..(bm1 | bm2 | ...)`), evaluated, and fed through `build_segments_and_gaps()`.
+
+The result is a `MultiStack` containing one `StackGroup` per independent chain:
+
+```rust
+pub struct StackGroup {
+    pub name: String,                    // Human-readable (from stack/* bookmark or first plan)
+    pub base_bookmark: Option<String>,   // e.g. "stack/auth"
+    pub base_change_id: Option<String>,  // Change ID of the stack's base
+    pub segments: Vec<BookmarkSegment>,
+    pub gaps: Vec<Gap>,
+}
+
+pub struct MultiStack {
+    pub stacks: Vec<StackGroup>,         // Ordered: segment count desc, alpha tiebreaker
+}
+```
+
+`build_multi_stack()` is used only by `jj stack` visualization and `jj stack untrack`. The sync/flush pipeline continues to use `build_stack()`. This separation ensures zero coupling between multi-stack awareness and the critical sync path.
+
+### Stack base bookmarks
+
+Explicit stack boundaries use `stack/<name>` bookmarks (prefix configurable via `JJ_PLAN_STACK_PREFIX`). These are regular jj bookmarks — visible in `jj log`, jjui, and any tool. jj-plan creates and manages them, but they're just bookmarks.
+
+- Created by `jj plan new --stack <name>` on the same change as the first plan bookmark.
+- Survive rebase (attached to jj change IDs, which are stable).
+- Auto-cleaned when the stack base change falls behind `trunk()` (merged to trunk).
+- Used for group naming in `build_multi_stack()` and for deletion in `jj stack untrack`.
+
+### Implicit vs explicit stacks
+
+| | Implicit (topology-inferred) | Explicit (`stack/` bookmark) |
+|---|---|---|
+| Created by | `jj plan new` without `--stack` | `jj plan new --stack <name>` |
+| Registry `stack` field | `None` | `Some(change_id)` |
+| Grouping | DAG parent-link analysis | Registry `stack` value equality |
+| Boundary visible in jj log | No | Yes (`stack/<name>` bookmark) |
+| Stack lifecycle | Manual `jj plan untrack` per bookmark | `jj stack untrack` for the whole stack |
 
 ### Segments and gaps
 
@@ -143,11 +188,19 @@ Merge commits (commits with two or more parents) in the `trunk()..@` range are h
 
 When `build_stack()` receives a `PlanRegistry`, only bookmarks registered in the registry produce segments. Non-registered bookmarks are treated as if they don't exist — their changes are absorbed into adjacent segments or become gap material.
 
+### Auto-cleanup of merged stacks
+
+After every mutating command (via `wrap()`), `auto_cleanup_merged_stacks()` scans for explicit stacks whose base change ID is an ancestor of `trunk()`. These stacks have been fully merged — their plans are untracked from the registry and their base bookmarks are deleted automatically.
+
+**Important**: Change IDs stored in the registry (`PlannedBookmark.change_id`) use standard hex encoding (`commit.change_id().hex()`). jj revsets require reverse-hex encoding. Any code embedding registry change IDs into revsets must convert via `Workspace::short_change_id_from_hex()` first.
+
 ### Key functions
 
 | Function | Signature | Purpose |
 |---|---|---|
-| `build_stack` | `(&Workspace, Option<&PlanRegistry>) → StackResult` | Build the full stack |
+| `build_stack` | `(&Workspace, Option<&PlanRegistry>) → StackResult` | Build the @-relative stack (sync/flush) |
+| `build_multi_stack` | `(&Workspace, &PlanRegistry) → MultiStack` | Build all stacks (visualization) |
+| `group_bookmarks_by_ancestry` | `(&[(String, String)], &HashMap) → HashMap` | Union-find grouping by DAG topology |
 | `find_submit_target` | `(&Stack) → Option<&BookmarkSegment>` | Find the segment nearest to `@` |
 | `narrow_segments` | `(&Stack, &PlanRegistry) → Vec<NarrowedBookmarkSegment>` | One bookmark per segment |
 | `collect_submission_chain` | `(&Stack, &str) → Result<SubmissionChain, String>` | Trunk-to-target chain with gaps |
@@ -317,18 +370,33 @@ Files matching the old `NN-CHANGEID.md` pattern (8+ chars of `[k-z]` reverse-hex
 Persistent state stored at `.jj/repo/jj-plan/plans.toml`:
 
 ```toml
-version = 1
+version = 2
 
 [[bookmarks]]
 name = "feat-auth"
 change_id = "aabbccddee..."
 planned_at = "2025-01-15T10:30:00Z"
+stack = "aabbccddee..."
 
 [[bookmarks]]
 name = "feat-session"
 change_id = "ffeeddccbb..."
 planned_at = "2025-01-15T11:00:00Z"
+stack = "aabbccddee..."
 ```
+
+### Version history
+
+- **v1**: Initial format (`name`, `change_id`, `remote`, `planned_at`).
+- **v2**: Added optional `stack` field for multi-stack grouping. Backward-compatible: v1 files load with `stack = None` on all entries via `#[serde(default)]`. Old binaries reading v2 files silently ignore the unknown `stack` key.
+
+### Stack field
+
+The `stack` field is `Option<String>` — the standard-hex change ID of the stack's base bookmark. `None` (or absent for v1 compat) means "implicit trunk stack." Plans with the same `stack` value belong to the same logical stack. The value is a change ID (stable across rebase), not a bookmark name.
+
+`PlanRegistry::plans_in_stack(stack_id: Option<&str>)` returns all bookmarks matching a given stack value. When `stack_id` is `None`, returns all implicit trunk-stack plans.
+
+### Workspace indirection
 
 The registry handles jj workspace indirection — in child workspaces (created via `jj workspace add`), `.jj/repo` is a text file pointing to the parent's repo directory. `resolve_repo_path()` reads this pointer transparently.
 
@@ -532,6 +600,7 @@ This ensures the plan file is always the source of truth, even when users type `
 | `JJ_PLAN_DEBUG` | Enable diagnostic logging to stderr (any value) | unset |
 | `JJ_PLAN_DIR` | Override plan directory path | `.jj-plan/` → `.jj-plans/` |
 | `JJ_PLAN_MAX` | Max stack size before refusing to sync | `50` |
+| `JJ_PLAN_STACK_PREFIX` | Prefix for stack base bookmarks | `stack/` |
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in |
 | `GITHUB_TOKEN` / `GH_TOKEN` | GitHub personal access token | — |
 | `GITLAB_TOKEN` / `GL_TOKEN` | GitLab personal access token | — |
@@ -570,10 +639,10 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 | Module | Tests | Covers |
 |---|---|---|
-| `types.rs` | 20 | `LogEntry` methods, `PlanRegistry` CRUD, `resolve_encoded`, `would_collide`, TOML roundtrip |
-| `commands/` | 40 | Dispatch, describe interception, navigation, new/track/untrack, stack commands |
+| `commands/` | 51 | Dispatch, describe interception, navigation, new/track/untrack, stack visualization, WC adoption |
 | `plan_file.rs` | 30 | Filename parsing, bookmark encoding, registry-based resolution, legacy detection |
-| `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain` |
+| `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain`, multi-stack grouping |
+| `types.rs` | 23 | `LogEntry` methods, `PlanRegistry` CRUD, `resolve_encoded`, `would_collide`, TOML roundtrip, v1→v2 compat, `plans_in_stack` |
 | `markdown.rs` | 20 | Scratch stripping, code fence immunity, edge cases |
 | `template.rs` | 16 | Resolution chain, interpolation, bookmark placeholders, fallback |
 | `sync.rs` | 14 | Gather/plan/execute phases, symlink targeting, edge cases |

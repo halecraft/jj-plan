@@ -291,6 +291,26 @@ impl Workspace {
         Some(reverse_hex[..len].to_string())
     }
 
+    /// Convert a standard-hex change ID to a (unique_prefix, rest) pair.
+    ///
+    /// Returns the full reverse-hex string split at the shortest unique
+    /// prefix boundary. For colored rendering: show `unique_prefix` in
+    /// bright magenta and `rest` in dim gray, matching jj's display.
+    ///
+    /// Returns `None` if the hex string is invalid.
+    pub fn change_id_with_prefix_split(&self, hex_change_id: &str) -> Option<(String, String)> {
+        let change_id = ChangeId::try_from_hex(hex_change_id)?;
+        let unique_len = self
+            .repo
+            .shortest_unique_change_id_prefix_len(&change_id)
+            .unwrap_or(8);
+        let display_len = unique_len.max(8);
+        let reverse_hex = encode_reverse_hex(change_id.as_bytes());
+        let display_len = display_len.min(reverse_hex.len());
+        let unique_len = unique_len.min(display_len);
+        Some((reverse_hex[..unique_len].to_string(), reverse_hex[unique_len..display_len].to_string()))
+    }
+
     // -----------------------------------------------------------------------
     // Bookmark queries (from ryu, adapted)
     // -----------------------------------------------------------------------

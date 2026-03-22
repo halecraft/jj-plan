@@ -172,11 +172,50 @@ pub struct SubmissionChain {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-stack types
+// ---------------------------------------------------------------------------
+
+/// A group of related plan segments forming one logical stack.
+///
+/// In the implicit case (no explicit `stack/*` base bookmark), a StackGroup
+/// is a connected chain of plan bookmarks in the DAG — plans that are
+/// ancestors/descendants of each other. In the explicit case, the boundary
+/// is marked by a `stack/*` base bookmark.
+#[derive(Debug)]
+pub struct StackGroup {
+    /// Human-readable name (derived from base bookmark or first plan bookmark).
+    pub name: String,
+    /// The stack base bookmark name, if an explicit `stack/*` boundary exists.
+    pub base_bookmark: Option<String>,
+    /// Change ID of the base (for registry grouping). None = implicit trunk stack.
+    pub base_change_id: Option<String>,
+    /// Segments within this stack, trunk-to-tip order.
+    pub segments: Vec<BookmarkSegment>,
+    /// Gaps within this stack.
+    pub gaps: Vec<Gap>,
+}
+
+/// Multiple independent stacks discovered from the repository.
+///
+/// Built by `build_multi_stack()`. Each `StackGroup` is one independent
+/// chain of plans. Stacks are ordered by their base's topological distance
+/// from trunk (closest first).
+#[derive(Debug)]
+pub struct MultiStack {
+    /// Independent stack groups, ordered by base distance from trunk.
+    pub stacks: Vec<StackGroup>,
+}
+
+// ---------------------------------------------------------------------------
 // Plan registry types (persistent, serde-enabled)
 // ---------------------------------------------------------------------------
 
 /// Version constant for the plan registry file format.
-pub const PLAN_REGISTRY_VERSION: u32 = 1;
+///
+/// Version history:
+/// - v1: Initial format (name, change_id, remote, planned_at)
+/// - v2: Added `stack` field (Option<String>) for stack grouping
+pub const PLAN_REGISTRY_VERSION: u32 = 2;
 
 /// Persistent record that a bookmark is a plan.
 ///
@@ -189,6 +228,12 @@ pub struct PlannedBookmark {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
     pub planned_at: DateTime<Utc>,
+    /// Stack grouping: the change ID of the stack's base bookmark.
+    /// `None` means "implicit trunk stack" (no explicit boundary).
+    /// Plans with the same `stack` value belong to the same logical stack.
+    /// Added in v2; v1 files load with `stack = None` via serde default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
 }
 
 impl PlannedBookmark {
@@ -199,6 +244,7 @@ impl PlannedBookmark {
             change_id: change_id.into(),
             remote: None,
             planned_at: Utc::now(),
+            stack: None,
         }
     }
 
@@ -213,6 +259,22 @@ impl PlannedBookmark {
             change_id: change_id.into(),
             remote: Some(remote.into()),
             planned_at: Utc::now(),
+            stack: None,
+        }
+    }
+
+    /// Create a new planned bookmark assigned to an explicit stack.
+    pub fn with_stack(
+        name: impl Into<String>,
+        change_id: impl Into<String>,
+        stack: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            change_id: change_id.into(),
+            remote: None,
+            planned_at: Utc::now(),
+            stack: Some(stack.into()),
         }
     }
 }
@@ -263,6 +325,18 @@ impl PlanRegistry {
     /// Names of all tracked bookmarks.
     pub fn tracked_names(&self) -> Vec<&str> {
         self.bookmarks.iter().map(|b| b.name.as_str()).collect()
+    }
+
+    /// Return all bookmarks belonging to a given stack.
+    ///
+    /// When `stack_id` is `Some(id)`, returns bookmarks whose `stack` field
+    /// matches that value. When `stack_id` is `None`, returns bookmarks
+    /// with `stack = None` (the implicit trunk stack).
+    pub fn plans_in_stack(&self, stack_id: Option<&str>) -> Vec<&PlannedBookmark> {
+        self.bookmarks
+            .iter()
+            .filter(|b| b.stack.as_deref() == stack_id)
+            .collect()
     }
 
     /// Resolve an encoded filename portion to the canonical bookmark name.
@@ -678,6 +752,90 @@ mod tests {
         assert_eq!(reg2.bookmarks[1].remote.as_deref(), Some("origin"));
 
         // Verify round-trip equality for the bookmarks
+        assert_eq!(reg.bookmarks, reg2.bookmarks);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: stack field and v1/v2 compatibility tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_registry_v1_loads_as_v2() {
+        // A v1 TOML string has no `stack` field on bookmarks.
+        // Deserialization should succeed with stack = None on all entries.
+        let v1_toml = r#"
+version = 1
+
+[[bookmarks]]
+name = "feat-auth"
+change_id = "abc123"
+planned_at = "2025-01-15T10:30:00Z"
+
+[[bookmarks]]
+name = "feat-db"
+change_id = "def456"
+remote = "origin"
+planned_at = "2025-01-15T11:00:00Z"
+"#;
+
+        let reg: PlanRegistry = toml::from_str(v1_toml).expect("v1 should parse");
+        assert_eq!(reg.bookmarks.len(), 2);
+        assert!(reg.bookmarks[0].stack.is_none(), "v1 entry should have stack = None");
+        assert!(reg.bookmarks[1].stack.is_none(), "v1 entry should have stack = None");
+        assert_eq!(reg.bookmarks[0].name, "feat-auth");
+        assert_eq!(reg.bookmarks[1].remote.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn test_plans_in_stack() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::with_stack("auth-1", "aa", "stack-base-abc"));
+        reg.track(PlannedBookmark::with_stack("auth-2", "bb", "stack-base-abc"));
+        reg.track(PlannedBookmark::new("bugfix", "cc"));        // implicit trunk stack
+        reg.track(PlannedBookmark::new("cleanup", "dd"));        // implicit trunk stack
+
+        // Plans in explicit stack
+        let auth_plans = reg.plans_in_stack(Some("stack-base-abc"));
+        assert_eq!(auth_plans.len(), 2);
+        assert_eq!(auth_plans[0].name, "auth-1");
+        assert_eq!(auth_plans[1].name, "auth-2");
+
+        // Plans in implicit trunk stack (stack = None)
+        let trunk_plans = reg.plans_in_stack(None);
+        assert_eq!(trunk_plans.len(), 2);
+        assert_eq!(trunk_plans[0].name, "bugfix");
+        assert_eq!(trunk_plans[1].name, "cleanup");
+
+        // Non-existent stack
+        let empty = reg.plans_in_stack(Some("no-such-stack"));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_registry_roundtrip_v2() {
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        reg.track(PlannedBookmark::with_stack("dashboard", "ccdd", "stack-base-xyz"));
+        reg.track(PlannedBookmark::with_remote("feat-deploy", "eeff", "origin"));
+
+        // Serialize to TOML
+        let toml_str = toml::to_string(&reg).expect("serialize v2");
+
+        // stack should appear for dashboard but not for feat-auth or feat-deploy
+        assert!(toml_str.contains("stack = \"stack-base-xyz\""),
+            "v2 TOML should contain stack field for dashboard");
+        assert_eq!(toml_str.matches("stack =").count(), 1,
+            "only one bookmark should have a stack field serialized");
+
+        // Deserialize back
+        let reg2: PlanRegistry = toml::from_str(&toml_str).expect("deserialize v2");
+        assert_eq!(reg2.version, PLAN_REGISTRY_VERSION);
+        assert_eq!(reg2.bookmarks.len(), 3);
+        assert!(reg2.bookmarks[0].stack.is_none());
+        assert_eq!(reg2.bookmarks[1].stack.as_deref(), Some("stack-base-xyz"));
+        assert!(reg2.bookmarks[2].stack.is_none());
+
+        // Round-trip equality
         assert_eq!(reg.bookmarks, reg2.bookmarks);
     }
 }
