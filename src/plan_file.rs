@@ -176,23 +176,6 @@ where
     }
 }
 
-/// Check if any plan files (NN-*.md) exist in the directory.
-///
-/// Used for plan-loss detection: if plan files exist but no registered
-/// plan bookmarks can be resolved, the plans may have been untracked.
-pub fn plan_files_exist(plan_dir: &Path) -> bool {
-    if let Ok(entries) = fs::read_dir(plan_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if parse_plan_filename(&name).is_some() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 /// Check if `current.md` points to `error.md` (error state).
 ///
 /// During error state, flush is skipped to prevent overwriting error info.
@@ -220,17 +203,6 @@ pub fn is_error_state(plan_dir: &Path) -> bool {
 
 /// Write content to a file, warning on failure.
 pub fn write_or_warn(path: &Path, content: &str) {
-    if let Err(e) = fs::write(path, content) {
-        eprintln!(
-            "jj-plan: warning: failed to write {}: {}",
-            path.display(),
-            e
-        );
-    }
-}
-
-/// Write bytes to a file, warning on failure.
-pub fn write_bytes_or_warn(path: &Path, content: &[u8]) {
     if let Err(e) = fs::write(path, content) {
         eprintln!(
             "jj-plan: warning: failed to write {}: {}",
@@ -372,29 +344,6 @@ mod tests {
         assert_eq!(parse_plan_filename("ab-test.md"), None); // non-digit prefix
         assert_eq!(parse_plan_filename("1-short.md"), None); // single digit
         assert_eq!(parse_plan_filename("01-.md"), None); // empty name (len <= 6)
-    }
-
-    // -- plan_files_exist tests --
-
-    #[test]
-    fn test_plan_files_exist_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(!plan_files_exist(tmp.path()));
-    }
-
-    #[test]
-    fn test_plan_files_exist_with_plan_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat-auth.md"), "content").unwrap();
-        assert!(plan_files_exist(tmp.path()));
-    }
-
-    #[test]
-    fn test_plan_files_exist_with_non_plan_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("current.md"), "content").unwrap();
-        fs::write(tmp.path().join(".stack"), "content").unwrap();
-        assert!(!plan_files_exist(tmp.path()));
     }
 
     // -- collect_plan_files tests --

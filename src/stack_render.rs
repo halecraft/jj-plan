@@ -34,8 +34,6 @@ use crate::workspace::Workspace;
 pub enum Style {
     /// Default unstyled text.
     Plain,
-    /// Dim/faded text (connectors, secondary info).
-    Dim,
     /// Non-working-copy node marker: ○
     Marker,
     /// Working copy node marker: ◉
@@ -160,7 +158,7 @@ pub fn format_ansi(lines: &[Vec<Span>]) -> Vec<String> {
                     Style::Plain | Style::StackHeader | Style::Warning => {
                         buf.push_str(&span.text);
                     }
-                    Style::Dim | Style::Marker | Style::Connector => {
+                    Style::Marker | Style::Connector => {
                         buf.push_str(DIM);
                         buf.push_str(&span.text);
                         buf.push_str(RESET);
@@ -276,8 +274,6 @@ pub struct StackColumn {
     pub name: String,
     /// Display rows, tip (index 0) to trunk (last index).
     pub rows: Vec<DisplayRow>,
-    /// Whether this column contains the working copy.
-    pub has_wc: bool,
     /// Gap warnings for this stack.
     pub gaps: Vec<Gap>,
 }
@@ -698,7 +694,6 @@ pub fn build_columns(
             );
 
             let mut rows = prepare_display_rows(&narrowed, workspace, pr_cache);
-            let has_wc = rows.iter().any(|r| r.is_wc);
 
             // Multi-stack: per-group indices don't match global plan file indices,
             // so clear plan_filename to prevent incorrect markdown links.
@@ -711,7 +706,6 @@ pub fn build_columns(
             StackColumn {
                 name: group.name.clone(),
                 rows,
-                has_wc,
                 gaps: group.gaps.clone(),
             }
         })
@@ -746,11 +740,9 @@ mod tests {
     }
 
     fn make_column(name: &str, rows: Vec<DisplayRow>) -> StackColumn {
-        let has_wc = rows.iter().any(|r| r.is_wc);
         StackColumn {
             name: name.to_string(),
             rows,
-            has_wc,
             gaps: vec![],
         }
     }

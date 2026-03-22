@@ -335,20 +335,11 @@ pub struct SyncChangeView {
     pub bookmark_name: String,
     /// Full description text.
     pub description: String,
-    /// Whether this change is empty.
-    pub is_empty: bool,
     /// Whether this is the working copy.
     pub is_working_copy: bool,
-    /// All bookmark names on this change (may include non-plan bookmarks).
-    pub bookmarks: Vec<String>,
 }
 
 impl SyncChangeView {
-    /// First line of the description, for display in stack summary.
-    pub fn first_line(&self) -> &str {
-        types::description_first_line(&self.description)
-    }
-
     /// Whether the description contains `plan-status: ✅`.
     pub fn is_done(&self) -> bool {
         types::description_is_done(&self.description)
@@ -402,9 +393,7 @@ fn stack_to_sync_changes(
                         change_id: short_id,
                         bookmark_name: plan_bookmark_name,
                         description: tip.description.clone(),
-                        is_empty: tip.is_empty,
                         is_working_copy: tip.is_working_copy,
-                        bookmarks: tip.local_bookmarks.clone(),
                     });
                 }
             }

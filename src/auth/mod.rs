@@ -5,8 +5,8 @@
 mod github;
 mod gitlab;
 
-pub use github::{GitHubAuthConfig, get_github_auth, test_github_auth};
-pub use gitlab::{GitLabAuthConfig, get_gitlab_auth, test_gitlab_auth};
+pub use github::{get_github_auth, test_github_auth};
+pub use gitlab::{get_gitlab_auth, test_gitlab_auth};
 
 /// Source of authentication token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

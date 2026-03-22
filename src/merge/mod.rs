@@ -6,5 +6,5 @@
 mod execute;
 mod plan;
 
-pub use execute::{execute_merge, MergeExecutionResult};
-pub use plan::{create_merge_plan, MergeConfidence, MergePlan, MergeStep, PrInfo};
+pub use execute::execute_merge;
+pub use plan::{create_merge_plan, MergeConfidence, MergeStep, PrInfo};

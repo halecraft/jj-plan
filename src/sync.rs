@@ -121,8 +121,6 @@ struct FileRename {
 enum SyncWarning {
     /// Stack bookmark was lost — plan files exist but no base resolves.
     BookmarkLost,
-    /// Stack exceeds max size.
-    StackTooLarge { size: usize, max: usize },
 }
 
 /// The complete plan for a sync operation. Computed by `plan_sync()` with
@@ -287,12 +285,6 @@ fn execute_sync(plan_dir: &Path, plan: &SyncPlan) {
             SyncWarning::BookmarkLost => {
                 eprintln!("jj-plan: WARNING: No plans found in stack. Register a bookmark: jj plan track <bookmark>");
             }
-            SyncWarning::StackTooLarge { size, max } => {
-                eprintln!(
-                    "jj-plan: WARNING: stack has {} changes (max {})",
-                    size, max
-                );
-            }
         }
     }
 
@@ -362,26 +354,22 @@ mod tests {
     ///
     /// `id` is used as both the change_id and bookmark_name for simplicity
     /// in existing tests. Use `change_with_bookmark` when they need to differ.
-    fn change(id: &str, desc: &str, is_empty: bool, is_wc: bool) -> SyncChangeView {
+    fn change(id: &str, desc: &str, _is_empty: bool, is_wc: bool) -> SyncChangeView {
         SyncChangeView {
             change_id: id.to_string(),
             bookmark_name: id.to_string(),
             description: desc.to_string(),
-            is_empty,
             is_working_copy: is_wc,
-            bookmarks: vec![],
         }
     }
 
     /// Build a SyncChangeView with distinct change_id and bookmark_name.
-    fn change_with_bookmark(change_id: &str, bookmark_name: &str, desc: &str, is_empty: bool, is_wc: bool) -> SyncChangeView {
+    fn change_with_bookmark(change_id: &str, bookmark_name: &str, desc: &str, _is_empty: bool, is_wc: bool) -> SyncChangeView {
         SyncChangeView {
             change_id: change_id.to_string(),
             bookmark_name: bookmark_name.to_string(),
             description: desc.to_string(),
-            is_empty,
             is_working_copy: is_wc,
-            bookmarks: vec![],
         }
     }
 

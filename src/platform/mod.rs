@@ -7,7 +7,7 @@ mod factory;
 mod github;
 mod gitlab;
 
-pub use detection::{detect_platform, parse_repo_info};
+pub use detection::parse_repo_info;
 pub use factory::create_platform_service;
 pub use github::GitHubService;
 pub use gitlab::GitLabService;

@@ -112,13 +112,6 @@ pub fn stack_prefix() -> String {
         .unwrap_or_else(|| "stack/".to_string())
 }
 
-/// Check whether a bookmark name is a stack base bookmark.
-///
-/// A stack base bookmark starts with the configured prefix (default `stack/`).
-pub fn is_stack_base_bookmark(name: &str) -> bool {
-    name.starts_with(&stack_prefix())
-}
-
 /// Read JJ_PLAN_MAX from the environment, defaulting to 50.
 pub fn plan_max() -> usize {
     std::env::var("JJ_PLAN_MAX")

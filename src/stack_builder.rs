@@ -514,31 +514,6 @@ fn build_segments_and_gaps(entries: &[LogEntry], short_ids: &[String], registry:
     StackResult::Ok(Stack { segments, gaps })
 }
 
-/// Enrich bookmark segments with sync status from the workspace.
-///
-/// The stack builder creates `Bookmark` structs with `has_remote: false`
-/// and `is_synced: false` because `LogEntry.local_bookmarks` only contains
-/// names. This function replaces those stubs with actual sync data from
-/// `workspace.local_bookmarks()`.
-pub fn enrich_bookmarks(stack: &mut Stack, workspace: &Workspace) {
-    let all_bookmarks = workspace.local_bookmarks();
-    let bookmark_map: std::collections::HashMap<&str, &Bookmark> = all_bookmarks
-        .iter()
-        .map(|b| (b.name.as_str(), b))
-        .collect();
-
-    for segment in &mut stack.segments {
-        for bm in &mut segment.bookmarks {
-            if let Some(real) = bookmark_map.get(bm.name.as_str()) {
-                bm.has_remote = real.has_remote;
-                bm.is_synced = real.is_synced;
-                bm.commit_id = real.commit_id.clone();
-                bm.change_id = real.change_id.clone();
-            }
-        }
-    }
-}
-
 /// Find the submit target: the tip-most bookmarked segment near `@`.
 ///
 /// Search strategy:

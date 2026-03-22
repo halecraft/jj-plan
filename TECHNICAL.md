@@ -8,7 +8,7 @@ For the quick-start guide, see [README.md](README.md). For the command reference
 
 ## Overview
 
-jj-plan is a Rust binary (~11,700 lines) that shadows the real `jj` binary. It provides two capabilities:
+jj-plan is a Rust binary (~13,900 lines) that shadows the real `jj` binary. It provides two capabilities:
 
 1. **Plan management** — Bidirectional sync between `.jj-plan/` markdown files and jj change descriptions, with navigation, templating, and working memory lifecycle.
 2. **Stacked PRs** — Push bookmarks as PRs to GitHub or GitLab, with plan content as PR descriptions, stack-aware base branch targeting, merge readiness checks, and post-merge cleanup.
@@ -31,19 +31,19 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/main.rs` | 149 | Entry point, command dispatch |
 | `src/error.rs` | 110 | `JjPlanError` enum (~25 variants) |
 | `src/types.rs` | 850 | All domain types: `Bookmark`, `LogEntry`, `Stack`, `PlanRegistry`, PR/platform types, `description_first_line`/`description_is_done` free functions |
-| `src/workspace.rs` | 972 | Unified jj-lib wrapper: reads + git write operations |
-| `src/stack_render.rs` | 1083 | Pure stack rendering: Span/Style model, multi-column layout, ANSI/plain/markdown formatting |
-| `src/stack_builder.rs` | 1079 | Stack construction, gap detection, `collect_submission_chain()` |
-| `src/wrap.rs` | 418 | Wrap lifecycle, `resolve_and_sync()`, `resolve_sync_and_show()`, `StackDisplayData`, `SyncChangeView` |
-| `src/flush.rs` | 294 | Plan file → jj description sync (file is authoritative) |
-| `src/sync.rs` | 599 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
-| `src/plan_file.rs` | 655 | Plan file parsing, bookmark name encoding, legacy migration |
-| `src/plan_dir.rs` | 208 | Repo root and plan directory resolution |
+| `src/workspace.rs` | 1045 | Unified jj-lib wrapper: reads + git write operations |
+| `src/stack_render.rs` | 1075 | Pure stack rendering: Span/Style model, multi-column layout, ANSI/plain/markdown formatting |
+| `src/stack_builder.rs` | 1477 | Stack construction, gap detection, `collect_submission_chain()` |
+| `src/wrap.rs` | 407 | Wrap lifecycle, `resolve_and_sync()`, `resolve_sync_and_show()`, `StackDisplayData`, `SyncChangeView` |
+| `src/flush.rs` | 298 | Plan file → jj description sync (file is authoritative) |
+| `src/sync.rs` | 587 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
+| `src/plan_file.rs` | 574 | Plan file parsing, bookmark name encoding, legacy migration |
+| `src/plan_dir.rs` | 219 | Repo root and plan directory resolution |
 | `src/plan_registry.rs` | 229 | PlanRegistry persistence (`.jj/repo/jj-plan/plans.toml`) |
 | `src/pr_cache.rs` | 252 | PR cache persistence (`.jj/repo/jj-plan/pr-cache.toml`) |
 | `src/stack_context.rs` | 94 | Shared context for `jj stack` commands |
 | `src/markdown.rs` | 633 | `strip_scratch_sections()` with code fence awareness |
-| `src/template.rs` | 293 | Plan template resolution and interpolation |
+| `src/template.rs` | 274 | Plan template resolution and interpolation |
 | `src/jj_binary.rs` | 144 | Real jj binary discovery |
 | `src/platform/mod.rs` | 52 | `PlatformService` async trait |
 | `src/platform/github.rs` | 276 | GitHub implementation (octocrab) |
@@ -61,7 +61,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/merge/mod.rs` | 9 | Merge engine re-exports |
 | `src/merge/plan.rs` | 171 | Pure merge planning (two-pass algorithm) |
 | `src/merge/execute.rs` | 75 | Merge execution via platform API |
-| `src/commands/stack_cmd.rs` | 993 | `jj stack` dispatch, submit/sync/merge/auth CLI |
+| `src/commands/stack_cmd.rs` | 1041 | `jj stack` dispatch, submit/sync/merge/auth CLI |
 | `src/commands/done.rs` | 315 | `jj plan done` with scratch stripping |
 | `src/commands/describe.rs` | 379 | `jj describe -m` interception |
 | `src/commands/new.rs` | 195 | `jj plan new` bookmark creation |

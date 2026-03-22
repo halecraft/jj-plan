@@ -10,7 +10,7 @@ use crate::submit::{
     analyze_submission, create_submission_plan, execute_submission,
     Phase, ProgressCallback, PushStatus,
 };
-use crate::types::{Gap, MergeMethod, PlanRegistry, StackResult};
+use crate::types::{MergeMethod, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 
 use async_trait::async_trait;
@@ -197,7 +197,7 @@ fn get_option<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
 
 /// Get the first positional argument (non-flag, non-option-value).
 fn first_positional(args: &[String]) -> Option<&str> {
-    let known_flags = [
+    let _known_flags = [
         "--dry-run",
         "--confirm",
         "--draft",

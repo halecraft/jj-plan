@@ -43,18 +43,6 @@ pub fn resolve_template(plan_dir: &Path) -> String {
     DEFAULT_TEMPLATE.to_string()
 }
 
-/// Apply a template by interpolating the change ID.
-///
-/// - Replaces all occurrences of `{{CHANGE_ID}}` with the actual change ID.
-/// - Replaces all occurrences of `{{BOOKMARK}}` with the bookmark name
-///   (if provided via `apply_template_full`).
-/// - If no `{{CHANGE_ID}}` placeholder exists in the template, prepends a
-///   self-referencing comment `<!-- jj:CHANGE_ID -->` as the second line
-///   (after the title line) so the change always has a self-reference.
-pub fn apply_template(template: &str, change_id: &str) -> String {
-    apply_template_full(template, change_id, None)
-}
-
 /// Apply a template by interpolating the change ID and optional bookmark name.
 ///
 /// - Replaces all occurrences of `{{CHANGE_ID}}` with the actual change ID.
@@ -86,13 +74,6 @@ pub fn apply_template_full(template: &str, change_id: &str, bookmark: Option<&st
             }
         }
     }
-}
-
-/// Convenience: resolve the template for a plan directory and apply it with
-/// the given change ID. Returns the fully interpolated description string.
-pub fn render_template(plan_dir: &Path, change_id: &str) -> String {
-    let raw = resolve_template(plan_dir);
-    apply_template(&raw, change_id)
 }
 
 /// Convenience: resolve the template and apply it with both change ID and
@@ -180,21 +161,21 @@ mod tests {
     #[test]
     fn test_apply_template_with_placeholder() {
         let template = "(plan: jj:{{CHANGE_ID}})\n\n## Background\n";
-        let result = apply_template(template, "abcdefgh");
+        let result = apply_template_full(template, "abcdefgh", None);
         assert_eq!(result, "(plan: jj:abcdefgh)\n\n## Background\n");
     }
 
     #[test]
     fn test_apply_template_multiple_placeholders() {
         let template = "Title: {{CHANGE_ID}}\n\nRef: jj:{{CHANGE_ID}}\n";
-        let result = apply_template(template, "xyz12345");
+        let result = apply_template_full(template, "xyz12345", None);
         assert_eq!(result, "Title: xyz12345\n\nRef: jj:xyz12345\n");
     }
 
     #[test]
     fn test_apply_template_no_placeholder_injects_comment() {
         let template = "My custom title\n\n## Section\n\nContent.\n";
-        let result = apply_template(template, "abcdefgh");
+        let result = apply_template_full(template, "abcdefgh", None);
         assert_eq!(
             result,
             "My custom title\n<!-- jj:abcdefgh -->\n\n## Section\n\nContent.\n"
@@ -204,14 +185,14 @@ mod tests {
     #[test]
     fn test_apply_template_no_placeholder_single_line() {
         let template = "Just a title";
-        let result = apply_template(template, "mychange");
+        let result = apply_template_full(template, "mychange", None);
         assert_eq!(result, "Just a title\n<!-- jj:mychange -->\n");
     }
 
     #[test]
     fn test_apply_template_no_placeholder_with_trailing_newline() {
         let template = "Title line\n";
-        let result = apply_template(template, "testid");
+        let result = apply_template_full(template, "testid", None);
         assert_eq!(result, "Title line\n<!-- jj:testid -->\n");
     }
 
@@ -255,12 +236,12 @@ mod tests {
         assert_eq!(result, "# feat-auth\n\n(plan: jj:abc123)\n");
     }
 
-    // ── render_template integration tests ─────────────────────────────
+    // ── render_template_with_bookmark integration tests ───────────────
 
     #[test]
     fn test_render_template_default() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = render_template(tmp.path(), "testid01");
+        let result = render_template_with_bookmark(tmp.path(), "testid01", "feat-test");
         assert!(result.starts_with("(plan: jj:testid01)"));
         assert!(!result.contains("{{CHANGE_ID}}"));
     }
@@ -274,7 +255,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = render_template(tmp.path(), "abc");
+        let result = render_template_with_bookmark(tmp.path(), "abc", "feat-test");
         assert_eq!(result, "Custom: abc\n\n## Notes\n");
     }
 
@@ -287,7 +268,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = render_template(tmp.path(), "myid");
+        let result = render_template_with_bookmark(tmp.path(), "myid", "feat-test");
         assert!(result.contains("<!-- jj:myid -->"));
         assert!(result.starts_with("No placeholder here\n"));
     }
