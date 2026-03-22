@@ -399,6 +399,7 @@ impl Workspace {
     }
 
     /// Check whether a commit identified by a revset target exists.
+    #[allow(dead_code)] // Foundational workspace introspection — needed for future merge/rebase flows.
     pub fn commit_exists(&self, target: &str) -> bool {
         self.evaluate_revset(target)
             .map(|commits| !commits.is_empty())
@@ -409,6 +410,7 @@ impl Workspace {
     ///
     /// Evaluates `children(change_id) ~ change_id` and returns the first
     /// result's shortest change ID, or `None` if no children exist.
+    #[allow(dead_code)] // Foundational workspace introspection — needed for future navigation commands.
     pub fn first_child_change_id(&self, change_id: &str) -> Option<String> {
         let revset_str = format!("children({}) ~ {}", change_id, change_id);
         let commits = self.evaluate_revset(&revset_str)?;
@@ -458,6 +460,7 @@ impl Workspace {
     // -----------------------------------------------------------------------
 
     /// Access the underlying jj-lib repo (for stack builder).
+    #[allow(dead_code)] // Low-level accessor — used by stack builder internals and future jj-lib consumers.
     pub fn repo(&self) -> &Arc<ReadonlyRepo> {
         &self.repo
     }
@@ -661,6 +664,7 @@ impl Workspace {
     }
 
     /// Rebase a bookmark and its descendants onto trunk.
+    #[allow(dead_code)] // 50-line jj-lib rebase — needed for future post-merge cleanup flow.
     pub fn rebase_bookmark_onto_trunk(
         &mut self,
         bookmark: &str,
@@ -790,6 +794,7 @@ pub fn select_remote(
 
 /// Error type for op-head resolution that satisfies jj-lib's trait bounds.
 #[derive(Debug)]
+#[allow(dead_code)] // Variants hold jj-lib errors for type-safe From impls; inner fields used only via Debug.
 enum OpResolveError {
     OpHeadResolution(jj_lib::op_heads_store::OpHeadResolutionError),
     OpHeadsStore(jj_lib::op_heads_store::OpHeadsStoreError),

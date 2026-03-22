@@ -68,11 +68,7 @@ impl PrCache {
         self.prs.len() < len_before
     }
 
-    /// Remove entries for bookmarks not in the provided list.
-    pub fn retain_bookmarks(&mut self, bookmarks: &[&str]) {
-        self.prs
-            .retain(|p| bookmarks.contains(&p.bookmark.as_str()));
-    }
+
 }
 
 /// Get path to the PR cache file.
@@ -202,20 +198,6 @@ mod tests {
         assert!(cache.get("feat-db").is_some());
 
         assert!(!cache.remove("feat-auth")); // Already removed
-    }
-
-    #[test]
-    fn test_retain_bookmarks() {
-        let mut cache = PrCache::new();
-        cache.upsert("feat-auth", &make_test_pr(123), "origin");
-        cache.upsert("feat-db", &make_test_pr(124), "origin");
-        cache.upsert("feat-ui", &make_test_pr(125), "origin");
-
-        cache.retain_bookmarks(&["feat-auth", "feat-ui"]);
-
-        assert!(cache.get("feat-auth").is_some());
-        assert!(cache.get("feat-db").is_none());
-        assert!(cache.get("feat-ui").is_some());
     }
 
     #[test]

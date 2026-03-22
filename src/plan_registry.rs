@@ -168,11 +168,12 @@ mod tests {
             "feat-auth".to_string(),
             "abc123".to_string(),
         ));
-        registry.track(PlannedBookmark::with_remote(
+        let mut feat_db = PlannedBookmark::new(
             "feat-db".to_string(),
             "def456".to_string(),
-            "upstream".to_string(),
-        ));
+        );
+        feat_db.remote = Some("upstream".to_string());
+        registry.track(feat_db);
 
         save_registry(temp.path(), &registry);
 

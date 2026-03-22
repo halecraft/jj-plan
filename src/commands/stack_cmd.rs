@@ -7,7 +7,8 @@ use crate::pr_cache::save_pr_cache;
 use crate::stack_builder::{build_stack, collect_submission_chain, find_submit_target, narrow_segments};
 use crate::stack_context::StackContext;
 use crate::submit::{
-    analyze_submission, create_submission_plan, execute_submission,
+    analyze_submission, comments, create_submission_plan, execute_submission,
+    ExecutionStep, NoopProgress, SubmissionPlan,
     Phase, ProgressCallback, PushStatus,
 };
 use crate::types::{MergeMethod, PlanRegistry, StackResult};
@@ -240,7 +241,6 @@ struct CliProgress;
 impl ProgressCallback for CliProgress {
     async fn on_phase(&self, phase: Phase) -> Result<()> {
         match phase {
-            Phase::Analyzing => eprintln!("Analyzing stack..."),
             Phase::Planning => eprintln!("Planning submission..."),
             Phase::Executing => eprintln!("Executing..."),
             Phase::AddingComments => eprintln!("Adding stack comments..."),
@@ -253,7 +253,6 @@ impl ProgressCallback for CliProgress {
         match status {
             PushStatus::Started => eprint!("  Pushing {bookmark}..."),
             PushStatus::Success => eprintln!(" ✓"),
-            PushStatus::AlreadySynced => eprintln!(" (already synced)"),
             PushStatus::Failed(ref msg) => eprintln!(" ✗ {msg}"),
         }
         Ok(())
@@ -341,9 +340,23 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
 
     let dry_run = has_flag(args, "--dry-run");
     let draft = has_flag(args, "--draft");
+    let publish = has_flag(args, "--publish");
+    let update_descriptions = has_flag(args, "--update-descriptions");
+    let no_comments = has_flag(args, "--no-comments");
     let allow_gaps = has_flag(args, "--allow-gaps");
     let remote_override = get_option(args, "--remote");
     let target_bookmark = first_positional(args);
+
+    // Mutual exclusion: --draft and --publish cannot coexist.
+    if draft && publish {
+        eprintln!("Error: --draft and --publish are mutually exclusive.");
+        eprintln!();
+        eprintln!("  --draft     creates new PRs as drafts");
+        eprintln!("  --publish   converts existing draft PRs to ready-for-review");
+        eprintln!();
+        eprintln!("These cannot be used together.");
+        return Ok(1);
+    }
 
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
 
@@ -420,7 +433,7 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
         })?;
 
     rt.block_on(async {
-        run_submit_async(workspace, &repo_root, &registry, &target, remote_override, dry_run, draft).await
+        run_submit_async(workspace, &repo_root, &registry, &target, remote_override, dry_run, draft, update_descriptions, publish, no_comments).await
     })
 }
 
@@ -432,6 +445,9 @@ async fn run_submit_async(
     remote_override: Option<&str>,
     dry_run: bool,
     draft: bool,
+    update_descriptions: bool,
+    publish: bool,
+    no_comments: bool,
 ) -> Result<i32> {
     let ctx = StackContext::new(workspace, repo_root, remote_override, registry).await?;
 
@@ -478,6 +494,8 @@ async fn run_submit_async(
         &ctx.remote_name,
         draft,
         &pr_content,
+        update_descriptions,
+        publish,
     )
     .await?;
 
@@ -487,21 +505,31 @@ async fn run_submit_async(
     }
 
     // Print plan summary
-    eprintln!(
-        "Submit plan: {} push(es), {} create(s), {} update(s)",
-        plan.count_pushes(),
-        plan.count_creates(),
-        plan.count_updates()
-    );
+    let desc_updates = plan.count_description_updates();
+    let publishes = plan.count_publishes();
+    let mut parts = vec![
+        format!("{} push(es)", plan.count_pushes()),
+        format!("{} create(s)", plan.count_creates()),
+        format!("{} update(s)", plan.count_updates()),
+    ];
+    if desc_updates > 0 {
+        parts.push(format!("{desc_updates} description update(s)"));
+    }
+    if publishes > 0 {
+        parts.push(format!("{publishes} publish(es)"));
+    }
+    eprintln!("Submit plan: {}", parts.join(", "));
 
     if dry_run {
         eprintln!();
         eprintln!("Dry run — no changes will be made:");
     }
 
-    // Execute
+    // Execute — use NoopProgress for dry-run to avoid duplicating messages
+    // (dry-run output comes from execute_submission's own dry-run branch).
+    let noop = NoopProgress;
     let progress: &dyn ProgressCallback = if dry_run {
-        &CliProgress
+        &noop
     } else {
         &CliProgress
     };
@@ -514,6 +542,77 @@ async fn run_submit_async(
             eprintln!("Warning: failed to save PR cache: {e}");
         }
     }
+
+    // --- Pass 2: Stack comments ---
+    // Comment steps depend on PR numbers from freshly-created PRs,
+    // so they run after the main plan executes.
+    let comment_result = if !no_comments && result.errors.is_empty() {
+        // Build the chain: (bookmark, pr_number, title) for all segments.
+        // PR numbers come from cache (updated during execution) + freshly created.
+        let mut chain: Vec<(String, u64, String)> = Vec::new();
+        for (bookmark, title, _body) in &pr_content {
+            let pr_number = result
+                .created
+                .iter()
+                .find(|(b, _)| b == bookmark)
+                .map(|(_, pr)| pr.number)
+                .or_else(|| pr_cache.get(bookmark).map(|c| c.number));
+
+            if let Some(number) = pr_number {
+                chain.push((bookmark.clone(), number, title.clone()));
+            }
+        }
+
+        if chain.len() >= 2 {
+            // Only add stack comments for multi-PR stacks (single PR has no stack to navigate).
+            let mut comment_steps = Vec::new();
+
+            for (bookmark, pr_number, _title) in &chain {
+                // Look up existing jj-plan comment on this PR.
+                let existing_comment_id = if !dry_run {
+                    match ctx.platform.list_pr_comments(*pr_number).await {
+                        Ok(pr_comments) => comments::find_existing_comment(&pr_comments),
+                        Err(e) => {
+                            eprintln!("Warning: failed to list comments on #{pr_number}: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let comment_body = comments::generate_stack_comment(&chain, bookmark);
+
+                comment_steps.push(ExecutionStep::AddStackComment {
+                    bookmark: bookmark.clone(),
+                    pr_number: *pr_number,
+                    comment_body,
+                    existing_comment_id,
+                });
+            }
+
+            let comment_plan = SubmissionPlan {
+                steps: comment_steps,
+                remote: ctx.remote_name.clone(),
+            };
+
+            Some(
+                execute_submission(
+                    &comment_plan,
+                    workspace,
+                    ctx.platform.as_ref(),
+                    &mut pr_cache,
+                    progress,
+                    dry_run,
+                )
+                .await?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Print summary
     eprintln!();
@@ -529,12 +628,31 @@ async fn run_submit_async(
     if !result.updated.is_empty() {
         eprintln!("Updated {} PR(s)", result.updated.len());
     }
+    if !result.description_updated.is_empty() {
+        eprintln!("Updated {} description(s)", result.description_updated.len());
+    }
+    if !result.published.is_empty() {
+        eprintln!("Published {} PR(s)", result.published.len());
+    }
+    if let Some(ref cr) = comment_result {
+        if !cr.comments.is_empty() {
+            eprintln!("Updated {} stack comment(s)", cr.comments.len());
+        }
+    }
     if !result.errors.is_empty() {
         eprintln!("Errors:");
         for err in &result.errors {
             eprintln!("  {err}");
         }
         return Ok(1);
+    }
+    if let Some(ref cr) = comment_result {
+        if !cr.errors.is_empty() {
+            eprintln!("Comment errors:");
+            for err in &cr.errors {
+                eprintln!("  {err}");
+            }
+        }
     }
 
     Ok(0)
@@ -608,7 +726,7 @@ async fn run_sync_async(
 
     let target = narrowed.last().unwrap().bookmark.name.clone();
 
-    run_submit_async(workspace, repo_root, registry, &target, remote_override, dry_run, false).await
+    run_submit_async(workspace, repo_root, registry, &target, remote_override, dry_run, false, false, false, false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -992,11 +1110,18 @@ fn print_submit_help() {
     eprintln!("segment near the working copy.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --dry-run           Preview what would be done without making changes");
-    eprintln!("  --draft             Create new PRs as drafts");
-    eprintln!("  --allow-gaps        Allow unbookmarked changes between bookmarks");
-    eprintln!("  --remote <remote>   Specify the remote to push to (default: origin)");
-    eprintln!("  --help, -h          Show this help message");
+    eprintln!("  --dry-run               Preview what would be done without making changes");
+    eprintln!("  --draft                 Create new PRs as drafts");
+    eprintln!("  --publish               Convert existing draft PRs to ready-for-review");
+    eprintln!("  --update-descriptions   Push current plan content to existing PR titles/bodies");
+    eprintln!("  --no-comments           Skip adding/updating stack navigation comments");
+    eprintln!("  --allow-gaps            Allow unbookmarked changes between bookmarks");
+    eprintln!("  --remote <remote>       Specify the remote to push to (default: origin)");
+    eprintln!("  --help, -h              Show this help message");
+    eprintln!();
+    eprintln!("Notes:");
+    eprintln!("  --draft and --publish are mutually exclusive.");
+    eprintln!("  Stack comments are added by default for multi-PR stacks.");
 }
 
 fn print_sync_help() {
@@ -1005,11 +1130,12 @@ fn print_sync_help() {
     eprintln!("Usage: jj stack sync [options]");
     eprintln!();
     eprintln!("Fetches from the remote, then pushes bookmarks and updates PRs.");
+    eprintln!("Equivalent to fetch + submit with default flags.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --dry-run           Preview what would be done without making changes");
-    eprintln!("  --remote <remote>   Specify the remote (default: origin)");
-    eprintln!("  --help, -h          Show this help message");
+    eprintln!("  --dry-run               Preview what would be done without making changes");
+    eprintln!("  --remote <remote>       Specify the remote (default: origin)");
+    eprintln!("  --help, -h              Show this help message");
 }
 
 fn print_merge_help() {

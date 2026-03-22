@@ -8,7 +8,7 @@ use crate::platform::{create_platform_service, parse_repo_info, PlatformService}
 use crate::pr_cache::{load_pr_cache, PrCache};
 use crate::types::PlanRegistry;
 use crate::workspace::{select_remote, Workspace};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Shared context for CLI commands that interact with the platform.
 ///
@@ -23,10 +23,6 @@ use std::path::{Path, PathBuf};
 /// make it difficult to borrow &mut Workspace while also passing &StackContext
 /// to functions. Instead, callers pass both the context and workspace separately.
 pub struct StackContext {
-    /// Root path of the workspace.
-    pub workspace_root: PathBuf,
-    /// Plan registry (which bookmarks are designated for submission).
-    pub plan_registry: PlanRegistry,
     /// PR cache for bookmark → PR mappings.
     pub pr_cache: PrCache,
     /// Platform service (GitHub/GitLab).
@@ -50,10 +46,9 @@ impl StackContext {
         workspace: &Workspace,
         workspace_root: &Path,
         remote: Option<&str>,
-        registry: &PlanRegistry,
+        _registry: &PlanRegistry,
     ) -> Result<Self> {
-        // Use caller-provided registry; load PR cache
-        let plan_registry = registry.clone();
+        // Load PR cache
         let pr_cache = load_pr_cache(workspace_root)?;
 
         // Get remotes and select one
@@ -75,22 +70,10 @@ impl StackContext {
         let default_branch = workspace.default_branch();
 
         Ok(Self {
-            workspace_root: workspace_root.to_path_buf(),
-            plan_registry,
             pr_cache,
             platform,
             remote_name,
             default_branch,
         })
-    }
-
-    /// Check if any bookmarks are tracked.
-    pub fn has_tracked_bookmarks(&self) -> bool {
-        !self.plan_registry.tracked_names().is_empty()
-    }
-
-    /// Get tracked bookmark names.
-    pub fn tracked_names(&self) -> Vec<&str> {
-        self.plan_registry.tracked_names()
     }
 }

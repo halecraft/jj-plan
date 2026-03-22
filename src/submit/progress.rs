@@ -6,7 +6,6 @@ use async_trait::async_trait;
 /// Phases of the submission process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    Analyzing,
     Planning,
     Executing,
     AddingComments,
@@ -16,7 +15,6 @@ pub enum Phase {
 impl std::fmt::Display for Phase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Analyzing => write!(f, "Analyzing"),
             Self::Planning => write!(f, "Planning"),
             Self::Executing => write!(f, "Executing"),
             Self::AddingComments => write!(f, "Updating stack comments"),
@@ -30,7 +28,6 @@ impl std::fmt::Display for Phase {
 pub enum PushStatus {
     Started,
     Success,
-    AlreadySynced,
     Failed(String),
 }
 
@@ -39,7 +36,6 @@ impl std::fmt::Display for PushStatus {
         match self {
             Self::Started => write!(f, "started"),
             Self::Success => write!(f, "success"),
-            Self::AlreadySynced => write!(f, "already synced"),
             Self::Failed(msg) => write!(f, "failed: {msg}"),
         }
     }

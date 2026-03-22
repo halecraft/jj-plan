@@ -27,11 +27,6 @@ use async_trait::async_trait;
 pub trait PlatformService: Send + Sync {
     async fn find_existing_pr(&self, head_branch: &str) -> Result<Option<PullRequest>>;
 
-    async fn create_pr(&self, head: &str, base: &str, title: &str) -> Result<PullRequest> {
-        self.create_pr_with_options(head, base, title, None, false)
-            .await
-    }
-
     async fn create_pr_with_options(
         &self,
         head: &str,
@@ -42,11 +37,25 @@ pub trait PlatformService: Send + Sync {
     ) -> Result<PullRequest>;
 
     async fn update_pr_base(&self, pr_number: u64, new_base: &str) -> Result<PullRequest>;
+    async fn update_pr_description(
+        &self,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest>;
     async fn publish_pr(&self, pr_number: u64) -> Result<PullRequest>;
     async fn list_pr_comments(&self, pr_number: u64) -> Result<Vec<PrComment>>;
     async fn create_pr_comment(&self, pr_number: u64, body: &str) -> Result<()>;
     async fn update_pr_comment(&self, pr_number: u64, comment_id: u64, body: &str) -> Result<()>;
+
+    /// Get platform configuration (owner, repo, host).
+    ///
+    /// Currently unused but part of the trait contract — available for
+    /// future callers that need platform metadata (e.g. generating
+    /// cross-repo links in stack comments).
+    #[allow(dead_code)]
     fn config(&self) -> &PlatformConfig;
+
     async fn get_pr_details(&self, pr_number: u64) -> Result<PullRequestDetails>;
     async fn check_merge_readiness(&self, pr_number: u64) -> Result<MergeReadiness>;
     async fn merge_pr(&self, pr_number: u64, method: MergeMethod) -> Result<MergeResult>;

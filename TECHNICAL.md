@@ -8,7 +8,7 @@ For the quick-start guide, see [README.md](README.md). For the command reference
 
 ## Overview
 
-jj-plan is a Rust binary (~13,900 lines) that shadows the real `jj` binary. It provides two capabilities:
+jj-plan is a Rust binary (~14,400 lines) that shadows the real `jj` binary. It provides two capabilities:
 
 1. **Plan management** — Bidirectional sync between `.jj-plan/` markdown files and jj change descriptions, with navigation, templating, and working memory lifecycle.
 2. **Stacked PRs** — Push bookmarks as PRs to GitHub or GitLab, with plan content as PR descriptions, stack-aware base branch targeting, merge readiness checks, and post-merge cleanup.
@@ -143,8 +143,6 @@ The result is a `MultiStack` containing one `StackGroup` per independent chain:
 ```rust
 pub struct StackGroup {
     pub name: String,                    // Human-readable (from stack/* bookmark or first plan)
-    pub base_bookmark: Option<String>,   // e.g. "stack/auth"
-    pub base_change_id: Option<String>,  // Change ID of the stack's base
     pub segments: Vec<BookmarkSegment>,
     pub gaps: Vec<Gap>,
 }
@@ -417,29 +415,37 @@ This design means the registry is loaded once per command and threaded through a
 
 ### `PlatformService` trait
 
-An async trait (via `async_trait`) with 12 methods covering the full PR lifecycle:
+An async trait (via `async_trait`) with 12 methods covering the full PR lifecycle. All methods are now wired into the CLI:
 
-| Method | Purpose |
-|---|---|
-| `find_existing_pr(head)` | Find open PR for a branch |
-| `create_pr_with_options(head, base, title, body, draft)` | Create a PR |
-| `update_pr_base(number, new_base)` | Retarget a PR |
-| `publish_pr(number)` | Convert draft → ready |
-| `list_pr_comments(number)` | List comments |
-| `create_pr_comment(number, body)` | Post comment |
-| `update_pr_comment(number, comment_id, body)` | Edit comment |
-| `config()` | Get platform config |
-| `get_pr_details(number)` | Extended details for merge |
-| `check_merge_readiness(number)` | Approval + CI + conflict checks |
-| `merge_pr(number, method)` | Perform merge |
+| Method | Purpose | Wired via |
+|---|---|---|
+| `find_existing_pr(head)` | Find open PR for a branch | `create_submission_plan` |
+| `create_pr_with_options(head, base, title, body, draft)` | Create a PR | `execute_submission` → `CreatePr` step |
+| `update_pr_base(number, new_base)` | Retarget a PR | `execute_submission` → `UpdateBase` step |
+| `update_pr_description(number, title, body)` | Update PR title/body | `execute_submission` → `UpdateDescription` step |
+| `publish_pr(number)` | Convert draft → ready | `execute_submission` → `PublishPr` step |
+| `list_pr_comments(number)` | List comments | Comment pass in `run_submit_async` |
+| `create_pr_comment(number, body)` | Post comment | `execute_submission` → `AddStackComment` step |
+| `update_pr_comment(number, comment_id, body)` | Edit comment | `execute_submission` → `AddStackComment` step |
+| `config()` | Get platform config | Reserved (forward-looking) |
+| `get_pr_details(number)` | Extended details for merge/description comparison | `create_submission_plan` (when `--update-descriptions`) |
+| `check_merge_readiness(number)` | Approval + CI + conflict checks | `run_merge_async` |
+| `merge_pr(number, method)` | Perform merge | `run_merge_async` |
 
 ### GitHub implementation (`src/platform/github.rs`)
 
-Uses `octocrab` (typed GitHub client) for REST and GraphQL operations. The `publish_pr` method uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API doesn't support this. CI status is checked via both the legacy Combined Status API and the modern Check Runs API.
+Uses `octocrab` (typed GitHub client) for REST and GraphQL operations:
+
+- **`publish_pr`**: Uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API cannot clear draft status. Fetches the PR's `node_id` via REST, then issues the mutation. Falls back to `gh pr ready` subprocess if GraphQL fails (e.g., classic tokens without GraphQL permissions).
+- **`update_pr_description`**: Uses octocrab's `pulls().update(number).title(...).body(...).send()`.
+- **`convert_pr`**: Maps octocrab PR model to our `PullRequest` type. Uses `base.ref_field` (bare branch name) rather than `base.label` (`owner:branch` format) to ensure correct comparison in the submit plan phase.
 
 ### GitLab implementation (`src/platform/gitlab.rs`)
 
 Uses raw `reqwest` against the GitLab v4 REST API with `PRIVATE-TOKEN` authentication. The project path is URL-encoded for nested groups (e.g., `group%2Fsubgroup%2Frepo`).
+
+- **`publish_pr`**: Uses `PUT /merge_requests/:iid { "draft": false }` (supported since GitLab 15.0).
+- **`update_pr_description`**: Uses `PUT /merge_requests/:iid { "title": ..., "description": ... }`.
 
 ### Platform detection (`src/platform/detection.rs`)
 
@@ -462,14 +468,14 @@ CLI tool invocations use `tokio::process::Command` (async subprocess). Token tes
 
 ## Submit Engine (`src/submit/`)
 
-Three-phase pipeline:
+Two-pass pipeline with six `ExecutionStep` variants:
 
 ### Phase 1: Analysis (`analysis.rs`)
 
 - Takes a `Stack` and `PlanRegistry`, narrows to one-bookmark-per-segment via `narrow_segments()`.
 - Identifies the target bookmark (explicit or default to tip-most).
 - Provides `get_base_branch()`: previous bookmark name or default branch.
-- **Plan-to-PR bridge** (`plan_file_to_pr_content()`): reads the plan file, first line = PR title, remainder = PR body with `[scratch]` stripped and `plan-status: ✅` removed.
+- **Plan-to-PR bridge**: `plan_file_to_pr_content_from_entries()` in `stack_cmd.rs` reads plan files, first line = PR title, remainder = PR body with `[scratch]` stripped and `plan-status: ✅` removed.
 
 ### Phase 2: Planning (`plan.rs`)
 
@@ -478,6 +484,10 @@ For each segment in the chain:
 2. Check for an existing PR via the platform API.
 3. If no PR → `CreatePr` step with plan-derived title/body.
 4. If PR exists with wrong base → `UpdateBase` step.
+5. If `--update-descriptions` and title/body differ → `UpdateDescription` step (requires `get_pr_details` for body comparison).
+6. If `--publish` and PR is draft → `PublishPr` step.
+
+`ExecutionStep` variants: `Push`, `CreatePr`, `UpdateBase`, `UpdateDescription`, `PublishPr`, `AddStackComment`.
 
 ### Phase 3: Execution (`execute.rs`)
 
@@ -485,8 +495,28 @@ Processes steps sequentially:
 - `Push`: `workspace.git_push(bookmark, remote)`
 - `CreatePr`: `platform.create_pr_with_options(...)`
 - `UpdateBase`: `platform.update_pr_base(number, new_base)`
+- `UpdateDescription`: `platform.update_pr_description(number, title, body)`
+- `PublishPr`: `platform.publish_pr(number)`
+- `AddStackComment`: `platform.create_pr_comment(...)` or `platform.update_pr_comment(...)` depending on whether an existing comment ID is present.
 
-Supports `dry_run` mode (logs steps without executing). The `ProgressCallback` trait provides hooks for CLI output.
+Supports `dry_run` mode (logs steps without executing). Uses `NoopProgress` for dry-run (silent) and `CliProgress` for real execution. The `ProgressCallback` trait provides hooks for CLI output.
+
+### Stack Comments (`comments.rs`)
+
+Pure function module for generating and detecting stack navigation comments:
+
+- **`STACK_COMMENT_MARKER`**: `<!-- jj-plan stack -->` — HTML comment used to identify jj-plan comments for idempotent update.
+- **`generate_stack_comment(chain, current_bookmark)`**: Produces a markdown table showing all PRs in the stack with the current PR highlighted in bold with a 👈 indicator.
+- **`find_existing_comment(comments)`**: Scans comment bodies for the marker, returns the comment ID if found.
+
+### Two-Pass Execution Model
+
+Stack comments depend on PR numbers from freshly-created PRs, which aren't known until execution completes. The `run_submit_async` orchestrator uses a two-pass approach:
+
+1. **Pass 1**: Execute the main plan (Push, CreatePr, UpdateBase, UpdateDescription, PublishPr).
+2. **Pass 2**: Build `AddStackComment` steps from the now-known PR numbers (from cache + freshly created), then execute them.
+
+Pass 2 is skipped for single-PR stacks (no navigation needed) or when `--no-comments` is specified.
 
 ---
 

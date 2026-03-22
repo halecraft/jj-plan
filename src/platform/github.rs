@@ -3,6 +3,7 @@
 //! Wraps the octocrab client to provide PR operations against GitHub's API.
 
 use async_trait::async_trait;
+use tokio::process::Command;
 
 use crate::error::{JjPlanError, Result};
 use crate::types::{
@@ -67,8 +68,8 @@ impl GitHubService {
                 .as_ref()
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
-            base_ref: pr.base.label.clone().unwrap_or_default(),
-            head_ref: pr.head.label.clone().unwrap_or_default(),
+            base_ref: pr.base.ref_field.clone(),
+            head_ref: pr.head.ref_field.clone(),
             title: pr.title.clone().unwrap_or_default(),
             node_id: pr.node_id.clone(),
             is_draft: pr.draft.unwrap_or(false),
@@ -115,6 +116,23 @@ impl PlatformService for GitHubService {
         Ok(Self::convert_pr(&pr))
     }
 
+    async fn update_pr_description(
+        &self,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest> {
+        let pr = self
+            .pulls()
+            .update(pr_number)
+            .title(title)
+            .body(body)
+            .send()
+            .await?;
+
+        Ok(Self::convert_pr(&pr))
+    }
+
     async fn update_pr_base(&self, pr_number: u64, new_base: &str) -> Result<PullRequest> {
         let pr = self
             .pulls()
@@ -127,24 +145,75 @@ impl PlatformService for GitHubService {
     }
 
     async fn publish_pr(&self, pr_number: u64) -> Result<PullRequest> {
-        // The REST v3 PATCH endpoint does not support clearing draft status.
-        // We need to use the GraphQL mutation `markPullRequestReadyForReview`.
-        // For now, fall back to the update endpoint which at least refreshes
-        // our local state; the caller can use the GitHub CLI for the actual
-        // publish if needed.
-        let pr = self
-            .pulls()
-            .update(pr_number)
-            .send()
-            .await?;
+        // REST v3 PATCH cannot clear draft status. Use GraphQL mutation
+        // `markPullRequestReadyForReview`, falling back to `gh pr ready`.
 
-        if pr.draft.unwrap_or(false) {
-            return Err(JjPlanError::GitHubApi(
-                "cannot publish PR via REST API; use `gh pr ready` instead".to_string(),
-            ));
+        // Fetch the PR to get its node_id for GraphQL.
+        let pr = self.pulls().get(pr_number).await?;
+        let node_id = pr.node_id.clone().unwrap_or_default();
+
+        if !node_id.is_empty() {
+            // Attempt GraphQL mutation.
+            let mutation = serde_json::json!({
+                "query": format!(
+                    r#"mutation {{
+                        markPullRequestReadyForReview(input: {{ pullRequestId: "{node_id}" }}) {{
+                            pullRequest {{ isDraft }}
+                        }}
+                    }}"#
+                )
+            });
+
+            match self.client.graphql::<serde_json::Value>(&mutation).await {
+                Ok(response) => {
+                    // Check the response for errors or successful un-draft.
+                    let is_draft = response
+                        .pointer("/data/markPullRequestReadyForReview/pullRequest/isDraft")
+                        .and_then(|v| v.as_bool());
+
+                    if is_draft == Some(false) {
+                        // Success — refetch via REST to get the full PR object.
+                        let refreshed = self.pulls().get(pr_number).await?;
+                        return Ok(Self::convert_pr(&refreshed));
+                    }
+
+                    // GraphQL returned but mutation didn't clear draft — check for errors.
+                    if let Some(errors) = response.get("errors") {
+                        eprintln!(
+                            "GraphQL markPullRequestReadyForReview returned errors: {errors}"
+                        );
+                    }
+                    // Fall through to gh CLI fallback.
+                }
+                Err(e) => {
+                    eprintln!("GraphQL publish_pr failed ({e}), falling back to `gh pr ready`");
+                    // Fall through to gh CLI fallback.
+                }
+            }
         }
 
-        Ok(Self::convert_pr(&pr))
+        // Fallback: shell out to `gh pr ready`.
+        let repo_slug = format!("{}/{}", self.config.owner, self.config.repo);
+        let output = Command::new("gh")
+            .args(["pr", "ready", &pr_number.to_string(), "--repo", &repo_slug])
+            .output()
+            .await
+            .map_err(|e| {
+                JjPlanError::GitHubApi(format!(
+                    "failed to run `gh pr ready`: {e}. Install GitHub CLI or use a fine-grained token with GraphQL access."
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(JjPlanError::GitHubApi(format!(
+                "`gh pr ready #{pr_number}` failed: {stderr}"
+            )));
+        }
+
+        // Refetch the PR to return updated state.
+        let refreshed = self.pulls().get(pr_number).await?;
+        Ok(Self::convert_pr(&refreshed))
     }
 
     async fn list_pr_comments(&self, pr_number: u64) -> Result<Vec<PrComment>> {

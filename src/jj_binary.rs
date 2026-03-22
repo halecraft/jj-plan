@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 
 use crate::error::{JjPlanError, Result};
@@ -47,11 +47,6 @@ impl JjBinary {
         }
 
         Err(JjPlanError::JjBinaryNotFound)
-    }
-
-    /// Return the path to the resolved jj binary.
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 
     /// Replace this process with jj (unix exec). Does not return on success.
@@ -103,23 +98,6 @@ impl JjBinary {
     pub fn run_inherit_strings(&self, args: &[String]) -> Result<ExitStatus> {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.run_inherit(&refs)
-    }
-
-    /// Run jj as a child process, capturing stdout. Stderr is inherited.
-    /// Returns (exit_status, stdout_string).
-    ///
-    /// Used for commands where we need to parse jj's output (e.g. `jj root`).
-    pub fn run_capture_stdout(&self, args: &[&str]) -> Result<(ExitStatus, String)> {
-        let output = Command::new(&self.path)
-            .args(args)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(JjPlanError::JjExecFailed)?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok((output.status, stdout))
     }
 
     /// Run jj silently, capturing both stdout and stderr.

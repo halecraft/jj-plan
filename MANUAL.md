@@ -314,12 +314,15 @@ If the stack has gaps (unbookmarked changes between bookmarks), a warning is sho
 Push bookmarks and create or update PRs on GitHub or GitLab.
 
 ```
-jj stack submit                # submit up to the tip-most bookmark near @
-jj stack submit feat-auth      # submit up to a specific bookmark
-jj stack submit --dry-run      # preview without making changes
-jj stack submit --draft        # create new PRs as drafts
-jj stack submit --allow-gaps   # allow unbookmarked changes between bookmarks
-jj stack submit --remote upstream  # specify the remote
+jj stack submit                          # submit up to the tip-most bookmark near @
+jj stack submit feat-auth                # submit up to a specific bookmark
+jj stack submit --dry-run                # preview without making changes
+jj stack submit --draft                  # create new PRs as drafts
+jj stack submit --publish                # convert existing draft PRs to ready-for-review
+jj stack submit --update-descriptions    # push current plan content to existing PR titles/bodies
+jj stack submit --no-comments            # skip adding/updating stack navigation comments
+jj stack submit --allow-gaps             # allow unbookmarked changes between bookmarks
+jj stack submit --remote upstream        # specify the remote
 ```
 
 **What it does:**
@@ -329,10 +332,13 @@ jj stack submit --remote upstream  # specify the remote
 3. For each bookmark in the submission chain:
    - Pushes the bookmark to the remote.
    - Creates a new PR if none exists, or updates an existing PR's base branch if needed.
+   - If `--update-descriptions`: compares plan content against the existing PR title/body and updates if different.
+   - If `--publish`: converts draft PRs to ready-for-review.
 4. PR title and body come from the plan file content:
    - **Title** = first line of the plan file.
    - **Body** = remainder of the plan file, with `[scratch]` sections stripped and `plan-status: ✅` lines removed.
-5. Updates the local PR cache (`.jj/repo/jj-plan/pr-cache.toml`).
+5. For multi-PR stacks (2+ PRs), adds or updates a **stack navigation comment** on each PR (unless `--no-comments`). The comment is a markdown table showing all PRs in the stack with a 👈 indicator on the current PR, identified by a `<!-- jj-plan stack -->` HTML comment marker for idempotent updates.
+6. Updates the local PR cache (`.jj/repo/jj-plan/pr-cache.toml`).
 
 **Arguments:**
 
@@ -346,8 +352,25 @@ jj stack submit --remote upstream  # specify the remote
 |---|---|
 | `--dry-run` | Preview what would be done without making changes |
 | `--draft` | Create new PRs as drafts |
+| `--publish` | Convert existing draft PRs to ready-for-review |
+| `--update-descriptions` | Push current plan content to existing PR titles/bodies |
+| `--no-comments` | Skip adding/updating stack navigation comments |
 | `--allow-gaps` | Allow unbookmarked changes between bookmarks |
 | `--remote <name>` | Specify the remote to push to (default: `origin`) |
+
+> **Note:** `--draft` and `--publish` are mutually exclusive. `--publish` only affects PRs that were already drafts before this submit run — it does not affect newly-created PRs.
+
+**Stack navigation comments:**
+
+For multi-PR stacks (2 or more PRs), `jj stack submit` automatically posts a comment on each PR showing the full stack with navigation links. The comment looks like:
+
+| | PR | Plan |
+|---|---|---|
+| 1 | #42 feat-auth | Extract auth module |
+| **2** | **#43 feat-session** | **Implement session management** 👈 |
+| 3 | #44 feat-api | Add API endpoints |
+
+Comments are identified by a `<!-- jj-plan stack -->` HTML marker and updated in place on re-submit (idempotent). Use `--no-comments` to skip this step.
 
 **Gap detection:**
 
@@ -636,10 +659,13 @@ jj stack submit                    # push and create PRs
 
 ```sh
 # Edit code or plan files...
-jj stack submit                    # re-push and update existing PRs
+jj stack submit                    # re-push and update existing PRs (base branches only)
+jj stack submit --update-descriptions  # also update PR titles/bodies from plan files
 # OR
 jj stack sync                      # fetch first, then re-submit
 ```
+
+> **Note:** By default, re-submitting pushes new code and retargets base branches, but does not overwrite PR descriptions. Use `--update-descriptions` to explicitly push plan content to existing PRs. This is opt-in because a colleague may have edited the PR description directly on the platform.
 
 ### Merge approved PRs and rebase the stack
 
@@ -653,8 +679,10 @@ jj stack merge                     # merges from the bottom of the stack
 ```sh
 jj stack submit --draft            # create PRs as drafts
 # Later, when ready for review:
-jj stack submit                    # existing PRs are not re-created, just pushed
+jj stack submit --publish          # convert all draft PRs in the stack to ready-for-review
 ```
+
+> **Note:** `--publish` uses GitHub's GraphQL `markPullRequestReadyForReview` mutation (with `gh pr ready` as fallback) and GitLab's `PUT /merge_requests/:iid { "draft": false }`.
 
 ### Handle gap warnings
 

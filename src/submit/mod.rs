@@ -4,11 +4,12 @@
 //! and plan-file-derived PR descriptions.
 
 mod analysis;
+pub mod comments;
 mod execute;
 mod plan;
 mod progress;
 
 pub use analysis::analyze_submission;
 pub use execute::execute_submission;
-pub use plan::create_submission_plan;
-pub use progress::{Phase, ProgressCallback, PushStatus};
+pub use plan::{create_submission_plan, ExecutionStep, SubmissionPlan};
+pub use progress::{NoopProgress, Phase, ProgressCallback, PushStatus};

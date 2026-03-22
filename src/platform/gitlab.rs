@@ -17,6 +17,7 @@ pub struct GitLabService {
     client: Client,
     token: String,
     host: String,
+    #[allow(dead_code)] // Read through the `config()` trait method, which is itself #[allow(dead_code)].
     config: PlatformConfig,
     project_path: String,
 }
@@ -222,6 +223,33 @@ impl PlatformService for GitLabService {
         Ok(mr.into())
     }
 
+    async fn update_pr_description(
+        &self,
+        pr_number: u64,
+        title: &str,
+        body: &str,
+    ) -> Result<PullRequest> {
+        let url = self.api_url(&format!(
+            "/projects/{}/merge_requests/{}",
+            self.encoded_project(),
+            pr_number
+        ));
+
+        let mr: MergeRequest = self
+            .client
+            .put(&url)
+            .header("PRIVATE-TOKEN", &self.token)
+            .json(&serde_json::json!({ "title": title, "description": body }))
+            .send()
+            .await?
+            .error_for_status()
+            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
+            .json()
+            .await?;
+
+        Ok(mr.into())
+    }
+
     async fn publish_pr(&self, pr_number: u64) -> Result<PullRequest> {
         let url = self.api_url(&format!(
             "/projects/{}/merge_requests/{}",
@@ -229,12 +257,13 @@ impl PlatformService for GitLabService {
             pr_number
         ));
 
-        // GitLab uses state_event: "ready" to mark as ready for review
+        // Remove draft status. GitLab's state_event only accepts "close"/"reopen";
+        // the correct way to un-draft is { "draft": false } (since GitLab 15.0).
         let mr: MergeRequest = self
             .client
             .put(&url)
             .header("PRIVATE-TOKEN", &self.token)
-            .json(&serde_json::json!({ "state_event": "ready" }))
+            .json(&serde_json::json!({ "draft": false }))
             .send()
             .await?
             .error_for_status()

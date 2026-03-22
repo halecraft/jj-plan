@@ -50,8 +50,10 @@ pub enum MergeStep {
 pub struct MergePlan {
     pub steps: Vec<MergeStep>,
     /// Bookmarks to clean up after merge.
+    #[allow(dead_code)] // Forward-looking: needed for post-merge bookmark cleanup flow.
     pub bookmarks_to_clear: Vec<String>,
     /// The trunk branch name.
+    #[allow(dead_code)] // Forward-looking: needed for post-merge rebase-onto-trunk flow.
     pub trunk_branch: String,
     /// Whether there's anything actionable.
     pub has_actionable: bool,

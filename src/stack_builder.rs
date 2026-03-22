@@ -381,8 +381,6 @@ pub fn build_multi_stack(workspace: &Workspace, registry: &PlanRegistry) -> Mult
 
             stack_groups.push(StackGroup {
                 name,
-                base_bookmark,
-                base_change_id: stack_id.clone(),
                 segments: stack.segments,
                 gaps: stack.gaps,
             });
@@ -604,16 +602,14 @@ pub fn collect_submission_chain(
         .position(|seg| seg.bookmarks.iter().any(|b| b.name == target_bookmark))
         .ok_or_else(|| format!("bookmark '{target_bookmark}' not found in stack"))?;
 
-    // Collect segments from trunk (0) to target (inclusive)
-    let segments: Vec<BookmarkSegment> = stack.segments[0..=target_index].to_vec();
-
-    // Collect gaps that fall within the chain
-    // A gap is relevant if its before_bookmark is one of the collected segments' bookmarks
-    let segment_bookmark_names: Vec<&str> = segments
+    // Collect segments from trunk (0) to target (inclusive) for gap filtering
+    let segment_bookmark_names: Vec<&str> = stack.segments[0..=target_index]
         .iter()
         .flat_map(|seg| seg.bookmarks.iter().map(|b| b.name.as_str()))
         .collect();
 
+    // Collect gaps that fall within the chain
+    // A gap is relevant if its before_bookmark is one of the collected segments' bookmarks
     let gaps: Vec<Gap> = stack
         .gaps
         .iter()
@@ -621,7 +617,7 @@ pub fn collect_submission_chain(
         .cloned()
         .collect();
 
-    Ok(SubmissionChain { segments, gaps })
+    Ok(SubmissionChain { gaps })
 }
 
 // ===========================================================================
@@ -1312,9 +1308,8 @@ mod tests {
 
         // Chain up to feat-b should include feat-a and feat-b
         let chain = collect_submission_chain(&stack, "feat-b").unwrap();
-        assert_eq!(chain.segments.len(), 2);
-        assert_eq!(chain.segments[0].bookmarks[0].name, "feat-a");
-        assert_eq!(chain.segments[1].bookmarks[0].name, "feat-b");
+        // SubmissionChain no longer carries segments (deleted as dead code);
+        // verify via gaps only.
         assert!(chain.gaps.is_empty());
     }
 
@@ -1354,7 +1349,6 @@ mod tests {
         };
 
         let chain = collect_submission_chain(&stack, "feat-b").unwrap();
-        assert_eq!(chain.segments.len(), 2);
         assert_eq!(chain.gaps.len(), 1);
         assert_eq!(chain.gaps[0].before_bookmark, "feat-b");
     }

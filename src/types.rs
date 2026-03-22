@@ -175,8 +175,6 @@ pub struct UnbookmarkedChange {
 /// for the `--allow-gaps` check at submit time.
 #[derive(Debug)]
 pub struct SubmissionChain {
-    /// Segments from trunk (index 0) to target (last index).
-    pub segments: Vec<BookmarkSegment>,
     /// Gaps in the chain (unbookmarked changes between segments).
     pub gaps: Vec<Gap>,
 }
@@ -195,10 +193,6 @@ pub struct SubmissionChain {
 pub struct StackGroup {
     /// Human-readable name (derived from base bookmark or first plan bookmark).
     pub name: String,
-    /// The stack base bookmark name, if an explicit `stack/*` boundary exists.
-    pub base_bookmark: Option<String>,
-    /// Change ID of the base (for registry grouping). None = implicit trunk stack.
-    pub base_change_id: Option<String>,
     /// Segments within this stack, trunk-to-tip order.
     pub segments: Vec<BookmarkSegment>,
     /// Gaps within this stack.
@@ -253,21 +247,6 @@ impl PlannedBookmark {
             name: name.into(),
             change_id: change_id.into(),
             remote: None,
-            planned_at: Utc::now(),
-            stack: None,
-        }
-    }
-
-    /// Create a new planned bookmark with a remote.
-    pub fn with_remote(
-        name: impl Into<String>,
-        change_id: impl Into<String>,
-        remote: impl Into<String>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            change_id: change_id.into(),
-            remote: Some(remote.into()),
             planned_at: Utc::now(),
             stack: None,
         }
@@ -503,12 +482,17 @@ impl MergeReadiness {
 #[derive(Debug, Clone)]
 pub struct MergeResult {
     pub merged: bool,
+    /// Merge commit SHA, if available. Set by both GitHub and GitLab
+    /// merge responses — useful for future post-merge confirmation.
+    #[allow(dead_code)]
     pub sha: Option<String>,
     pub message: Option<String>,
 }
 
 /// Method for merging a PR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Merge and Rebase are valid methods handled by both platforms;
+                     // only Squash is currently the default but --merge-method flag is planned.
 pub enum MergeMethod {
     Squash,
     Merge,
@@ -746,7 +730,9 @@ mod tests {
     fn test_plan_registry_serialization() {
         let mut reg = PlanRegistry::new();
         reg.track(PlannedBookmark::new("feat-auth", "aabb"));
-        reg.track(PlannedBookmark::with_remote("feat-deploy", "ccdd", "origin"));
+        let mut deploy = PlannedBookmark::new("feat-deploy", "ccdd");
+        deploy.remote = Some("origin".to_string());
+        reg.track(deploy);
 
         // Serialize to TOML
         let toml_str = toml::to_string(&reg).expect("serialize");
@@ -826,7 +812,9 @@ planned_at = "2025-01-15T11:00:00Z"
         let mut reg = PlanRegistry::new();
         reg.track(PlannedBookmark::new("feat-auth", "aabb"));
         reg.track(PlannedBookmark::with_stack("dashboard", "ccdd", "stack-base-xyz"));
-        reg.track(PlannedBookmark::with_remote("feat-deploy", "eeff", "origin"));
+        let mut deploy = PlannedBookmark::new("feat-deploy", "eeff");
+        deploy.remote = Some("origin".to_string());
+        reg.track(deploy);
 
         // Serialize to TOML
         let toml_str = toml::to_string(&reg).expect("serialize v2");

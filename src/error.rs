@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 /// Errors that can occur during jj-plan operations.
 #[derive(Debug, thiserror::Error)]
 pub enum JjPlanError {
@@ -11,20 +9,8 @@ pub enum JjPlanError {
     #[error("jj-plan: failed to resolve self path: {0}")]
     SelfResolution(std::io::Error),
 
-    #[error("jj-plan: failed to resolve path {path}: {source}")]
-    PathResolution {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
     #[error("jj-plan: failed to run jj: {0}")]
     JjExecFailed(std::io::Error),
-
-    #[error("jj-plan: jj command failed with exit code {code}: {stderr}")]
-    JjCommandFailed { code: i32, stderr: String },
-
-    #[error("jj-plan: not in a jj repo")]
-    NotInRepo,
 
     #[error("jj-plan: I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -73,21 +59,10 @@ pub enum JjPlanError {
     #[error("jj-plan: no stack found: {0}")]
     NoStack(String),
 
-    // ── Scheduler ────────────────────────────────────────────────────
-
-    #[error("jj-plan: topo-sort cycle detected: {message} (cycle: {cycle_nodes:?})")]
-    SchedulerCycle {
-        message: String,
-        cycle_nodes: Vec<String>,
-    },
-
     // ── Configuration / CLI ──────────────────────────────────────────
 
     #[error("jj-plan: invalid configuration: {0}")]
     Config(String),
-
-    #[error("jj-plan: invalid argument: {0}")]
-    InvalidArgument(String),
 
     #[error("jj-plan: parse error: {0}")]
     Parse(String),

@@ -124,7 +124,7 @@ When you run `jj stack submit`, the plan file content becomes the PR title and b
 - **PR title** = first line of the plan file
 - **PR body** = the rest, with `[scratch]` sections stripped and `plan-status: ✅` lines removed
 
-This is the plan-oriented programming payoff — the plan *is* the PR description. Update the plan, re-submit, and the PR description updates too.
+This is the plan-oriented programming payoff — the plan *is* the PR description. Update the plan, re-submit with `--update-descriptions`, and the PR description updates too.
 
 ### Shared working memory
 
@@ -237,11 +237,14 @@ Each bookmarked plan becomes a PR. `jj stack submit` pushes the entire stack:
 ```sh
 jj stack submit                # submit the full stack as PRs
 jj stack submit feat-auth      # submit up to a specific bookmark
-jj stack submit --dry-run      # preview without making changes
-jj stack submit --draft        # create PRs as drafts
+jj stack submit --dry-run                # preview without making changes
+jj stack submit --draft                  # create PRs as drafts
+jj stack submit --publish                # convert draft PRs to ready-for-review
+jj stack submit --update-descriptions    # push plan content to existing PR titles/bodies
+jj stack submit --no-comments            # skip stack navigation comments
 ```
 
-The base branch of each PR is automatically set to the previous bookmark (or the default branch for the first). When you update a plan and re-submit, existing PRs are updated in place.
+The base branch of each PR is automatically set to the previous bookmark (or the default branch for the first). When you update a plan and re-submit, existing PRs' base branches are updated in place. Use `--update-descriptions` to also push updated plan content to PR titles and bodies. For multi-PR stacks, a stack navigation comment is automatically posted on each PR (use `--no-comments` to skip).
 
 ### Multi-stack awareness
 
@@ -291,6 +294,9 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Plans are permanently addressable | `jj show CHANGE_ID` from any code comment |
 | Plans are co-editable (human + AI) | `.jj-plan/` syncs markdown files ↔ descriptions |
 | Plans become PR descriptions | `jj stack submit` uses plan content as PR title + body |
+| PR descriptions update on demand | `--update-descriptions` pushes plan changes to existing PRs |
+| Stack navigation comments | Multi-PR stacks get a markdown table comment on each PR (idempotent) |
+| Draft → ready promotion | `--publish` converts draft PRs via GraphQL / `gh pr ready` |
 | Stacked PRs | `jj stack submit/sync/merge` for full PR lifecycle |
 | Multi-stack awareness | Sibling branches auto-detected; `--stack` for explicit boundaries |
 | Stack lifecycle | `jj stack untrack` cleans up; merged stacks auto-cleaned |
