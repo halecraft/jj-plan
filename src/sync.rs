@@ -35,7 +35,7 @@ pub fn sync(
     let current_state = gather_current_state(dir, registry);
 
     // PLAN — pure decision logic, no I/O
-    let plan = plan_sync(&current_state, stack_changes, max_stack_size);
+    let plan = plan_sync(&current_state, stack_changes, max_stack_size, registry);
 
     // Extract terminal view before execute consumes the plan
     let terminal_view = plan
@@ -192,6 +192,7 @@ fn plan_sync(
     current_state: &CurrentPlanState,
     stack_changes: Option<&[SyncChangeView]>,
     max_stack_size: usize,
+    registry: &PlanRegistry,
 ) -> SyncPlan {
     let mut plan = SyncPlan {
         files_to_remove: Vec::new(),
@@ -209,8 +210,14 @@ fn plan_sync(
         None => {
             // Plan-loss detection: if plan files exist but no registered
             // bookmarks produced segments, the plans may have been untracked.
-            if !current_state.entries.is_empty() {
+            // Only warn if the registry still has entries (unexpected loss).
+            // If the registry is empty, this is an intentional untrack — no warning.
+            if !current_state.entries.is_empty() && !registry.bookmarks.is_empty() {
                 plan.warnings.push(SyncWarning::BookmarkLost);
+            }
+            // Clean up all stale plan files when stack is gone
+            for entry in &current_state.entries {
+                plan.files_to_remove.push(entry.filename.clone());
             }
             // Clean up stale stack.md when stack is gone
             plan.remove_stack_md = true;
@@ -500,6 +507,7 @@ pub fn generate_terminal_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PlannedBookmark;
 
     /// Helper to build a minimal SyncChangeView for tests.
     ///
@@ -643,7 +651,10 @@ mod tests {
     #[test]
     fn test_plan_sync_none_stack_no_files() {
         let state = empty_state();
-        let plan = plan_sync(&state, None, 50);
+        // Registry has entries, so the warning fires (unexpected loss, not intentional untrack)
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        let plan = plan_sync(&state, None, 50, &reg);
 
         assert!(plan.files_to_remove.is_empty());
         assert!(plan.files_to_write.is_empty());
@@ -654,10 +665,26 @@ mod tests {
     #[test]
     fn test_plan_sync_none_stack_with_files_warns_bookmark_lost() {
         let state = state_with(&[("01-feat-auth.md", "feat-auth")]);
-        let plan = plan_sync(&state, None, 50);
+        // Registry has entries → this is an unexpected loss, not an intentional untrack.
+        // The warning should fire.
+        let mut reg = PlanRegistry::new();
+        reg.track(PlannedBookmark::new("feat-auth", "aabb"));
+        let plan = plan_sync(&state, None, 50, &reg);
 
         assert_eq!(plan.warnings.len(), 1);
         assert_eq!(plan.warnings[0], SyncWarning::BookmarkLost);
+    }
+
+    #[test]
+    fn test_plan_sync_none_stack_with_files_no_warning_after_untrack() {
+        let state = state_with(&[("01-feat-auth.md", "feat-auth")]);
+        // Empty registry → intentional untrack. No warning, but files should
+        // still be scheduled for removal.
+        let plan = plan_sync(&state, None, 50, &PlanRegistry::new());
+
+        assert!(plan.warnings.is_empty(), "no warning when registry is empty");
+        assert_eq!(plan.files_to_remove, vec!["01-feat-auth.md"]);
+        assert!(plan.remove_stack_md);
     }
 
     #[test]
@@ -668,7 +695,7 @@ mod tests {
             change("bbb", "b", true, false),
             change("ccc", "c", true, false),
         ];
-        let plan = plan_sync(&state, Some(&changes), 2);
+        let plan = plan_sync(&state, Some(&changes), 2, &PlanRegistry::new());
 
         assert!(plan.error.is_some());
         assert!(plan.error.as_ref().unwrap().contains("3 changes (max 2)"));
@@ -683,7 +710,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "desc A", true, false),
             change_with_bookmark("bbb", "fix-login", "desc B", false, true),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert!(plan.error.is_none());
         assert!(plan.clear_error);
@@ -707,7 +734,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "a", true, true),
             change_with_bookmark("ccc", "feat-api", "c", true, false),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert_eq!(plan.files_to_remove, vec!["02-feat-session.md"]);
     }
@@ -720,7 +747,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "a", true, true),
             change_with_bookmark("bbb", "fix-login", "b", true, false),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert_eq!(plan.files_to_rename.len(), 2);
         // feat-auth: 02 → 01
@@ -735,7 +762,7 @@ mod tests {
     fn test_plan_sync_no_rename_when_index_matches() {
         let state = state_with(&[("01-feat-auth.md", "feat-auth")]);
         let changes = vec![change_with_bookmark("aaa", "feat-auth", "a", true, true)];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert!(plan.files_to_rename.is_empty());
     }
@@ -747,7 +774,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "First plan", true, true),
             change_with_bookmark("bbb", "feat-session", "Second plan", false, false),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         let summaries = plan.stack_summaries.as_ref().unwrap();
         // Terminal view preserves 1-line format
@@ -772,7 +799,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "First plan", true, false),   // not WC
             change_with_bookmark("bbb", "feat-session", "Second plan", false, false),  // not WC either
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         // Should fall back to the last plan file
         assert_eq!(
@@ -791,7 +818,7 @@ mod tests {
             change_with_bookmark("aaa", "feat-auth", "First plan", true, true),    // WC is here
             change_with_bookmark("bbb", "feat-session", "Second plan", false, false),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert_eq!(
             plan.symlink_target,
@@ -806,7 +833,7 @@ mod tests {
         let changes = vec![
             change_with_bookmark("aaa", "feat/auth", "Auth feature", true, true),
         ];
-        let plan = plan_sync(&state, Some(&changes), 50);
+        let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new());
 
         assert_eq!(plan.files_to_write.len(), 1);
         assert_eq!(plan.files_to_write[0].filename, "01-feat--auth.md");
