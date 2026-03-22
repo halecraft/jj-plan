@@ -65,6 +65,11 @@ jj stack sync
 
 # Merge approved PRs from the bottom of the stack
 jj stack merge
+
+# Test platform authentication
+jj stack auth github test     # GitHub (via gh CLI or GITHUB_TOKEN)
+jj stack auth gitlab test     # GitLab (via glab CLI or GITLAB_TOKEN)
+jj stack auth gitea test      # Gitea  (via GITEA_TOKEN + GITEA_HOST)
 ```
 
 Every `jj` command you run — `status`, `new`, `edit`, `rebase` — automatically syncs the `.jj-plan/` directory with change descriptions. Plan files are always the source of truth.
@@ -308,7 +313,7 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 | Stack is always visible | `jj status` appends the plan stack summary |
 | Stack is navigable | `jj plan next`/`prev`/`go` for index, change ID, or bookmark-based movement |
 | New plans are structured | Configurable templates with `{{CHANGE_ID}}` and `{{BOOKMARK}}` interpolation |
-| GitHub and GitLab support | Platform auto-detected from git remote URLs |
+| GitHub, GitLab, and Gitea support | Platform auto-detected from git remote URLs |
 
 ## Stack Model
 
@@ -384,3 +389,5 @@ Use `jj plan --help` for the compact terminal summary. Use the docs below when y
 | `GL_TOKEN` | GitLab token (alternative to `GITLAB_TOKEN`) | — |
 | `GH_HOST` | GitHub Enterprise hostname | `github.com` |
 | `GITLAB_HOST` | Self-hosted GitLab hostname | `gitlab.com` |
+| `GITEA_TOKEN` | Gitea personal access token | — |
+| `GITEA_HOST` | Self-hosted Gitea hostname | — |

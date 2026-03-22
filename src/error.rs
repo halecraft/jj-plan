@@ -42,10 +42,13 @@ pub enum JjPlanError {
     #[error("jj-plan: GitLab API error: {0}")]
     GitLabApi(String),
 
+    #[error("jj-plan: Gitea API error: {0}")]
+    GiteaApi(String),
+
     #[error("jj-plan: platform error: {0}")]
     Platform(String),
 
-    #[error("jj-plan: no supported remotes (GitHub/GitLab) found")]
+    #[error("jj-plan: no supported remotes (GitHub/GitLab/Gitea) found")]
     NoSupportedRemotes,
 
     #[error("jj-plan: remote not found: {0}")]

@@ -28,6 +28,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 
 | Module | Lines | Description |
 |---|---|---|
+| `src/lib.rs` | — | Library root, re-exports |
 | `src/main.rs` | 149 | Entry point, command dispatch |
 | `src/error.rs` | 110 | `JjPlanError` enum (~25 variants) |
 | `src/types.rs` | 850 | All domain types: `Bookmark`, `LogEntry`, `Stack`, `PlanRegistry`, PR/platform types, `description_first_line`/`description_is_done` free functions |
@@ -48,20 +49,22 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/platform/mod.rs` | 52 | `PlatformService` async trait |
 | `src/platform/github.rs` | 276 | GitHub implementation (octocrab) |
 | `src/platform/gitlab.rs` | 487 | GitLab implementation (reqwest) |
+| `src/platform/gitea.rs` | — | Gitea implementation (reqwest) |
 | `src/platform/detection.rs` | 137 | URL → platform detection |
 | `src/platform/factory.rs` | 31 | Service construction with auth |
 | `src/auth/mod.rs` | 17 | `AuthSource` enum |
 | `src/auth/github.rs` | 88 | gh CLI + env var token resolution |
 | `src/auth/gitlab.rs` | 110 | glab CLI + env var token resolution |
+| `src/auth/gitea.rs` | — | Gitea env var token resolution |
 | `src/submit/mod.rs` | 13 | Submit engine re-exports |
 | `src/submit/analysis.rs` | 127 | Submission analysis, plan-to-PR content bridge |
 | `src/submit/plan.rs` | 133 | Execution step planning (push/create/retarget) |
 | `src/submit/execute.rs` | 144 | Step execution with progress callbacks |
 | `src/submit/progress.rs` | 85 | `ProgressCallback` trait, `NoopProgress` |
-| `src/merge/mod.rs` | 9 | Merge engine re-exports |
-| `src/merge/plan.rs` | 171 | Pure merge planning (two-pass algorithm) |
-| `src/merge/execute.rs` | 75 | Merge execution via platform API |
-| `src/commands/stack_cmd.rs` | 1041 | `jj stack` dispatch, submit/sync/merge/auth CLI |
+| `src/merge/mod.rs` | 10 | Merge engine re-exports |
+| `src/merge/plan.rs` | 184 | Pure merge planning (intended sequence) |
+| `src/merge/execute.rs` | 334 | Merge execution with just-in-time readiness polling |
+| `src/commands/stack_cmd.rs` | 1160 | `jj stack` dispatch, submit/sync/merge/auth CLI |
 | `src/commands/done.rs` | 315 | `jj plan done` with scratch stripping |
 | `src/commands/describe.rs` | 379 | `jj describe -m` interception |
 | `src/commands/new.rs` | 195 | `jj plan new` bookmark creation |
@@ -72,6 +75,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/commands/untrack.rs` | 88 | `jj plan untrack` |
 | `src/commands/abandon.rs` | 20 | `jj abandon` delegation |
 | `src/commands/mod.rs` | 126 | `jj plan` subcommand dispatch |
+| `tests/gitea_integration.rs` | — | Gitea full lifecycle integration tests |
 
 ---
 
@@ -415,7 +419,7 @@ This design means the registry is loaded once per command and threaded through a
 
 ### `PlatformService` trait
 
-An async trait (via `async_trait`) with 12 methods covering the full PR lifecycle. All methods are now wired into the CLI:
+An async trait (via `async_trait`) with 12 methods covering the full PR lifecycle for GitHub, GitLab, and Gitea. All methods are now wired into the CLI:
 
 | Method | Purpose | Wired via |
 |---|---|---|
@@ -428,7 +432,7 @@ An async trait (via `async_trait`) with 12 methods covering the full PR lifecycl
 | `create_pr_comment(number, body)` | Post comment | `execute_submission` → `AddStackComment` step |
 | `update_pr_comment(number, comment_id, body)` | Edit comment | `execute_submission` → `AddStackComment` step |
 | `config()` | Get platform config | Reserved (forward-looking) |
-| `get_pr_details(number)` | Extended details for merge/description comparison | `create_submission_plan` (when `--update-descriptions`) |
+| `get_pr_details(number)` | Extended details for merge/description comparison (returns `PullRequestDetails`, which includes `head_sha: Option<String>` — used by GitHub's `check_merge_readiness` to query check runs; other platforms leave it as `None`) | `create_submission_plan` (when `--update-descriptions`) |
 | `check_merge_readiness(number)` | Approval + CI + conflict checks | `run_merge_async` |
 | `merge_pr(number, method)` | Perform merge | `run_merge_async` |
 
@@ -439,6 +443,7 @@ Uses `octocrab` (typed GitHub client) for REST and GraphQL operations:
 - **`publish_pr`**: Uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API cannot clear draft status. Fetches the PR's `node_id` via REST, then issues the mutation. Falls back to `gh pr ready` subprocess if GraphQL fails (e.g., classic tokens without GraphQL permissions).
 - **`update_pr_description`**: Uses octocrab's `pulls().update(number).title(...).body(...).send()`.
 - **`convert_pr`**: Maps octocrab PR model to our `PullRequest` type. Uses `base.ref_field` (bare branch name) rather than `base.label` (`owner:branch` format) to ensure correct comparison in the submit plan phase.
+- **`check_merge_readiness`**: Now queries the reviews API (`GET /pulls/{number}/reviews`) and check runs API (`GET /commits/{sha}/check-runs`) instead of hardcoding `is_approved: false` / `ci_passed: false`. Reviews are approved if any has state `APPROVED` and none has `CHANGES_REQUESTED`. CI passes if no check runs exist or all completed runs have `conclusion` of `success`, `skipped`, or `neutral`. Failures to query either API result in a permissive fallback with an uncertainty note.
 
 ### GitLab implementation (`src/platform/gitlab.rs`)
 
@@ -447,9 +452,26 @@ Uses raw `reqwest` against the GitLab v4 REST API with `PRIVATE-TOKEN` authentic
 - **`publish_pr`**: Uses `PUT /merge_requests/:iid { "draft": false }` (supported since GitLab 15.0).
 - **`update_pr_description`**: Uses `PUT /merge_requests/:iid { "title": ..., "description": ... }`.
 
+### Gitea implementation (`src/platform/gitea.rs`)
+
+Uses raw `reqwest` against the Gitea v1 REST API with `Authorization: token {TOKEN}` authentication.
+
+Key Gitea-specific patterns:
+- **Auth header**: `Authorization: token {TOKEN}` (not `PRIVATE-TOKEN` like GitLab).
+- **PR endpoints**: `/repos/{owner}/{repo}/pulls` and `/repos/{owner}/{repo}/pulls/{index}`.
+- **Comment endpoints**: `/repos/{owner}/{repo}/issues/{index}/comments` (create/list) and `/repos/{owner}/{repo}/issues/comments/{id}` (update).
+- **`merge_pr`**: `POST /pulls/{index}/merge` with `{"Do": "squash"}` — note uppercase `Do`. Returns an empty response body; the implementation GETs the PR afterwards to confirm `merged: true` and retrieve `merge_commit_sha`.
+- **`update_pr_base`**: `PATCH /pulls/{index}` with `{"base": "new_branch"}`.
+- **`publish_pr`**: `PATCH /pulls/{index}` with `{"draft": false}` — returns updated PR directly (unlike GitHub's GraphQL requirement).
+- **`check_merge_readiness`**: Single-shot observation (no polling). Queries `/pulls/{index}/reviews` for approval status. If no reviews exist, treats as approved (self-hosted Gitea typically has no required reviews). CI status is assumed passing with an uncertainty note, since Gitea Actions status is not easily available per-PR. Polling for transient `mergeable == false` states (forge still recomputing after retargets/merges) is handled generically by the merge executor's `poll_until_ready`.
+- **`mergeable`**: Gitea reports this synchronously in the PR response, but the value may be stale immediately after graph-changing events. The executor's transient-state polling handles this.
+- **Branch refs**: `base.label` / `head.label` are bare branch names (not `owner:branch` like GitHub).
+
 ### Platform detection (`src/platform/detection.rs`)
 
-Detects GitHub or GitLab from git remote URLs via regex matching on SSH (`git@host:owner/repo.git`) and HTTPS (`https://host/owner/repo.git`) formats. Self-hosted instances are supported via `GH_HOST` and `GITLAB_HOST` environment variables.
+Detects GitHub, GitLab, or Gitea from git remote URLs via regex matching on SSH (`git@host:owner/repo.git`) and HTTPS (`https://host/owner/repo.git`) formats. Self-hosted instances are supported via `GH_HOST`, `GITLAB_HOST`, and `GITEA_HOST` environment variables.
+
+Gitea detection supports `GITEA_HOST` env var and recognises `codeberg.org` as a well-known Gitea instance. For unknown hostnames that don't match any configured platform, `StackContext::new` performs an async probe of `GET /api/v1/version` — if it returns a JSON object with a `"version"` field, the host is classified as Gitea. The `parse_repo_info_as_gitea()` function handles URL parsing for probe-detected instances.
 
 ---
 
@@ -461,8 +483,11 @@ Token resolution follows a priority chain:
 |---|---|
 | GitHub | `gh auth token` → `$GITHUB_TOKEN` → `$GH_TOKEN` |
 | GitLab | `glab auth token --hostname <host>` → `$GITLAB_TOKEN` → `$GL_TOKEN` |
+| Gitea   | `$GITEA_TOKEN` |
 
 CLI tool invocations use `tokio::process::Command` (async subprocess). Token tests validate the token against the platform API (`/user` endpoint for GitLab, octocrab's current user for GitHub).
+
+Gitea has no widely-adopted CLI tool fallback. Host is resolved from the `host` parameter, `GITEA_HOST` env var, or the probe-detected hostname.
 
 ---
 
@@ -522,18 +547,35 @@ Pass 2 is skipped for single-PR stacks (no navigation needed) or when `--no-comm
 
 ## Merge Engine (`src/merge/`)
 
+The merge engine follows the FC/IS (Functional Core / Imperative Shell) pattern:
+- **Planner** (pure function): produces the *intended* merge sequence.
+- **Executor** (imperative shell): owns timing, readiness polling, and failure handling.
+
+This separation is critical because forges (Gitea, GitHub, GitLab) recompute PR mergeable status **asynchronously** after any graph-changing event (PR creation, base retarget, preceding merge). An upfront readiness snapshot goes stale as the executor mutates the graph. The executor therefore assesses readiness **just-in-time** before each merge step.
+
 ### Merge planning (`plan.rs`)
 
-Pure function. Two-pass algorithm:
+Pure function. Accepts `MergeCandidate` pairs (bookmark name + PR number) — no readiness data. Produces the intended sequence:
 
-1. **Pass 1**: Walk segments bottom-to-top. For each:
-   - If PR is approved, CI passing, not draft, no conflicts → `Merge` step.
-   - Otherwise → `Skip` step. All subsequent segments are also skipped (can't merge out of order).
-2. **Pass 2**: After each `Merge` step, insert a `RetargetBase` step for the next PR (retarget to trunk, since the merged PR's branch no longer exists).
+1. For each candidate (bottom of stack first), emit a `Merge` step.
+2. After each `Merge` step (except the last), emit a `RetargetBase` step for the next PR (retarget to trunk, since the merged branch no longer exists on the forge).
+
+The planner does **not** decide feasibility — that changes between planning and execution. There is no `Skip` step; the executor stops on hard blocks at runtime.
 
 ### Merge execution (`execute.rs`)
 
-Processes steps sequentially, stops on first failure or skip. Retarget failures are non-fatal (warning only).
+Processes steps sequentially. Before each `Merge` step:
+
+1. Calls `check_merge_readiness` (single-shot observation — no polling in the platform service itself).
+2. Classifies the result via `classify_readiness` into one of:
+   - **`Ready`** — proceed to merge.
+   - **`Transient`** — only `mergeable == false` with no other blockers (draft, approval, CI). Likely the forge is still recomputing. Polls at 1-second intervals for up to 15 attempts.
+   - **`Blocked`** — real blockers exist (draft, changes requested, CI failure). Stops execution immediately.
+3. If `Transient` polling exhausts retries, attempts the merge anyway (the forge's merge endpoint is the final arbiter).
+
+Retarget failures are non-fatal (warning only) — the next `Merge` step's readiness poll detects if the retarget didn't take effect.
+
+All platform `check_merge_readiness` implementations are single-shot observations. Polling logic lives exclusively in the executor, making it generic across all forges.
 
 ### Post-merge cleanup (in `stack_cmd.rs`)
 
@@ -636,8 +678,11 @@ This ensures the plan file is always the source of truth, even when users type `
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in |
 | `GITHUB_TOKEN` / `GH_TOKEN` | GitHub personal access token | — |
 | `GITLAB_TOKEN` / `GL_TOKEN` | GitLab personal access token | — |
+| `GITEA_TOKEN`              | Gitea personal access token          | —         |
 | `GH_HOST` | GitHub Enterprise hostname | `github.com` |
 | `GITLAB_HOST` | Self-hosted GitLab hostname | `gitlab.com` |
+| `GITEA_HOST`               | Gitea instance hostname              | —         |
+| `GITEA_INTEGRATION`        | Enable Gitea integration tests       | unset     |
 
 ---
 
@@ -682,7 +727,7 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 | `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
 | `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
 | `flush.rs` | 6 | Description comparison, bookmark-based resolution |
-| `platform/detection.rs` | 5 | URL parsing, platform detection |
+| `platform/detection.rs` | 10 | URL parsing, platform detection |
 
 ### Bats integration tests (`./test.sh`)
 
@@ -691,6 +736,17 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 ### PR integration tests
 
 Full integration tests for GitHub/GitLab API calls are deferred — they require either a real account or a mock server. The `--dry-run` flag validates the full local pipeline (stack building → analysis → planning) without network calls.
+
+### Gitea integration tests
+
+Full lifecycle tests against a real Gitea instance, gated behind `GITEA_INTEGRATION=1`:
+
+```sh
+GITEA_INTEGRATION=1 GITEA_HOST=code.halecraft.org GITEA_TOKEN=xxx \
+  cargo test --test gitea_integration -- --test-threads=1
+```
+
+Tests cover: submit lifecycle (create, find, retarget, comments), merge lifecycle (readiness, squash merge, retarget, merge), draft publish lifecycle, and description updates. Each test creates a throwaway private repo and deletes it on completion.
 
 ---
 

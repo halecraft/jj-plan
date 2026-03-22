@@ -1,6 +1,6 @@
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
-use crate::merge::{create_merge_plan, execute_merge, MergeStep, PrInfo};
+use crate::merge::{create_merge_plan, execute_merge, MergeCandidate, MergeStep};
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::save_pr_cache;
@@ -772,7 +772,6 @@ async fn run_merge_async(
             eprintln!("No plans between trunk and working copy.");
             return Ok(0);
         }
-
     };
 
     let narrowed = narrow_segments(&stack, registry);
@@ -781,103 +780,59 @@ async fn run_merge_async(
         return Ok(0);
     }
 
-    // Fetch PR info for all segments
-    let mut pr_info = Vec::new();
+    // Look up PR numbers for each segment (from cache or find_existing_pr).
+    // No readiness assessment here — the executor handles that just-in-time.
+    let mut candidates = Vec::new();
     for seg in &narrowed {
         let bookmark = &seg.bookmark.name;
 
-        // Look up PR from cache
-        if let Some(cached) = ctx.pr_cache.get(bookmark) {
-            match ctx.platform.get_pr_details(cached.number).await {
-                Ok(details) => {
-                    match ctx.platform.check_merge_readiness(cached.number).await {
-                        Ok(readiness) => {
-                            pr_info.push(PrInfo {
-                                bookmark: bookmark.clone(),
-                                details,
-                                readiness,
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: failed to check merge readiness for {bookmark}: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to get PR details for {bookmark}: {e}");
-                }
-            }
+        let pr_number = if let Some(cached) = ctx.pr_cache.get(bookmark) {
+            Some(cached.number)
         } else {
-            // Try to find PR by branch name
             match ctx.platform.find_existing_pr(bookmark).await {
-                Ok(Some(pr)) => {
-                    match ctx.platform.get_pr_details(pr.number).await {
-                        Ok(details) => {
-                            match ctx.platform.check_merge_readiness(pr.number).await {
-                                Ok(readiness) => {
-                                    pr_info.push(PrInfo {
-                                        bookmark: bookmark.clone(),
-                                        details,
-                                        readiness,
-                                    });
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: failed to check merge readiness for {bookmark}: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: failed to get PR details for {bookmark}: {e}");
-                        }
-                    }
-                }
+                Ok(Some(pr)) => Some(pr.number),
                 Ok(None) => {
-                    eprintln!("  {bookmark}: no PR found");
+                    eprintln!("  {bookmark}: no PR found — skipping");
+                    None
                 }
                 Err(e) => {
                     eprintln!("Warning: failed to find PR for {bookmark}: {e}");
+                    None
                 }
             }
+        };
+
+        if let Some(number) = pr_number {
+            candidates.push(MergeCandidate {
+                bookmark: bookmark.clone(),
+                pr_number: number,
+            });
         }
     }
 
-    // Create merge plan
+    if candidates.is_empty() {
+        eprintln!("No PRs found for any bookmarks in the stack.");
+        return Ok(0);
+    }
+
+    // Create merge plan — produces the intended sequence without
+    // readiness assessment. The executor evaluates readiness just-in-time.
     let merge_plan = create_merge_plan(
-        &narrowed,
-        &pr_info,
+        &candidates,
         &ctx.default_branch,
         MergeMethod::Squash,
     );
 
-    if !merge_plan.has_actionable {
-        eprintln!("No PRs are ready to merge.");
-        for step in &merge_plan.steps {
-            if let MergeStep::Skip {
-                bookmark, reason, ..
-            } = step
-            {
-                eprintln!("  {bookmark}: {reason}");
-            }
-        }
-        return Ok(0);
-    }
-
-    // Print plan
+    // Print the intended plan.
     eprintln!("Merge plan:");
     for step in &merge_plan.steps {
         match step {
             MergeStep::Merge {
                 bookmark,
                 pr_number,
-                confidence,
                 ..
             } => {
-                let conf = if *confidence == crate::merge::MergeConfidence::Certain {
-                    ""
-                } else {
-                    " (uncertain)"
-                };
-                eprintln!("  ✓ Merge #{pr_number} ({bookmark}){conf}");
+                eprintln!("  • Merge #{pr_number} ({bookmark})");
             }
             MergeStep::RetargetBase {
                 bookmark,
@@ -886,21 +841,18 @@ async fn run_merge_async(
             } => {
                 eprintln!("    → Retarget #{pr_number} ({bookmark}) base → {new_base}");
             }
-            MergeStep::Skip {
-                bookmark, reason, ..
-            } => {
-                eprintln!("  ✗ Skip {bookmark}: {reason}");
-            }
         }
     }
 
     if dry_run {
         eprintln!();
         eprintln!("Dry run — no merges will be performed.");
+        eprintln!("(Readiness will be checked just-in-time during execution.)");
         return Ok(0);
     }
 
-    // Execute merges
+    // Execute merges — readiness is assessed just-in-time before each step,
+    // with polling for transient forge states.
     eprintln!();
     eprintln!("Executing merges...");
     let merge_result = execute_merge(&merge_plan, ctx.platform.as_ref()).await?;
@@ -1067,8 +1019,47 @@ fn run_auth(args: &[String]) -> Result<i32> {
             eprintln!("Token resolution order: glab CLI → GITLAB_TOKEN → GL_TOKEN");
             Ok(0)
         }
-        (Some(p), _) if p == "github" || p == "gitlab" => {
-            eprintln!("Usage: jj stack auth <github|gitlab> <test|setup>");
+        (Some("gitea"), Some("test")) => {
+            rt.block_on(async {
+                eprintln!("Testing Gitea authentication...");
+                match crate::auth::get_gitea_auth(None).await {
+                    Ok(auth) => {
+                        eprintln!("  Token source: {:?}", auth.source);
+                        eprintln!("  Host: {}", auth.host);
+                        match crate::auth::test_gitea_auth(&auth).await {
+                            Ok(username) => {
+                                eprintln!("  ✓ Authenticated as: {username}");
+                                Ok(0)
+                            }
+                            Err(e) => {
+                                eprintln!("  ✗ Authentication failed: {e}");
+                                Ok(1)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ✗ No authentication found: {e}");
+                        Ok(1)
+                    }
+                }
+            })
+        }
+        (Some("gitea"), Some("setup")) => {
+            eprintln!("Gitea Authentication Setup");
+            eprintln!();
+            eprintln!("Personal Access Token:");
+            eprintln!("  Create a token at: https://<your-host>/user/settings/applications");
+            eprintln!("  Required permissions: repo (read/write)");
+            eprintln!("  Set:  export GITEA_TOKEN=<your-token>");
+            eprintln!();
+            eprintln!("Host configuration:");
+            eprintln!("  export GITEA_HOST=gitea.example.com");
+            eprintln!();
+            eprintln!("Token resolution: GITEA_TOKEN env var");
+            Ok(0)
+        }
+        (Some(p), _) if p == "github" || p == "gitlab" || p == "gitea" => {
+            eprintln!("Usage: jj stack auth <github|gitlab|gitea> <test|setup>");
             Ok(1)
         }
         _ => {
@@ -1157,7 +1148,7 @@ fn print_auth_help() {
     eprintln!();
     eprintln!("Usage: jj stack auth <platform> <action>");
     eprintln!();
-    eprintln!("Platforms: github, gitlab");
+    eprintln!("Platforms: github, gitlab, gitea");
     eprintln!("Actions:   test, setup");
     eprintln!();
     eprintln!("Examples:");
@@ -1165,4 +1156,6 @@ fn print_auth_help() {
     eprintln!("  jj stack auth github setup   Show GitHub setup instructions");
     eprintln!("  jj stack auth gitlab test    Test GitLab authentication");
     eprintln!("  jj stack auth gitlab setup   Show GitLab setup instructions");
+    eprintln!("  jj stack auth gitea test     Test Gitea authentication");
+    eprintln!("  jj stack auth gitea setup    Show Gitea setup instructions");
 }

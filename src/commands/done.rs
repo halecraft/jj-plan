@@ -215,6 +215,9 @@ fn read_description(workspace: &Workspace, target: &str) -> Option<String> {
 }
 
 /// Append `plan-status: ✅` to a description if not already present.
+///
+/// If the description already contains a `plan-status:` line with a different
+/// value (e.g. `🔴`), it is replaced in-place rather than appending a duplicate.
 fn append_done_marker(desc: &str, already_done: bool) -> String {
     if already_done
         || desc.contains("\nplan-status: ✅")
@@ -222,7 +225,27 @@ fn append_done_marker(desc: &str, already_done: bool) -> String {
     {
         desc.to_string()
     } else {
-        format!("{}\n\nplan-status: ✅", desc.trim_end())
+        // Replace any existing `plan-status: <value>` line (e.g. 🔴, 🟡)
+        // rather than appending a second one.
+        let mut found_existing = false;
+        let replaced: String = desc
+            .lines()
+            .map(|line| {
+                if line.starts_with("plan-status:") {
+                    found_existing = true;
+                    "plan-status: ✅"
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if found_existing {
+            replaced
+        } else {
+            format!("{}\n\nplan-status: ✅", desc.trim_end())
+        }
     }
 }
 
@@ -316,4 +339,69 @@ fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
         eprintln!("Would append: plan-status: ✅");
     }
     eprintln!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_append_done_marker_no_existing_status() {
+        let desc = "feat: add something\n\n# Background\n\nSome details.";
+        let result = append_done_marker(desc, false);
+        assert!(result.ends_with("plan-status: ✅"));
+        assert_eq!(result.matches("plan-status:").count(), 1);
+    }
+
+    #[test]
+    fn test_append_done_marker_already_done_flag() {
+        let desc = "feat: add something\n\nplan-status: ✅";
+        let result = append_done_marker(desc, true);
+        assert_eq!(result, desc);
+    }
+
+    #[test]
+    fn test_append_done_marker_already_has_checkmark() {
+        let desc = "feat: add something\n\nplan-status: ✅";
+        let result = append_done_marker(desc, false);
+        assert_eq!(result, desc);
+    }
+
+    #[test]
+    fn test_append_done_marker_replaces_red_circle() {
+        let desc = "feat: add something\n\n# Details\n\nplan-status: 🔴";
+        let result = append_done_marker(desc, false);
+        assert!(result.contains("plan-status: ✅"));
+        assert!(!result.contains("plan-status: 🔴"));
+        assert_eq!(result.matches("plan-status:").count(), 1);
+    }
+
+    #[test]
+    fn test_append_done_marker_replaces_yellow_circle() {
+        let desc = "feat: add something\n\nplan-status: 🟡";
+        let result = append_done_marker(desc, false);
+        assert!(result.contains("plan-status: ✅"));
+        assert!(!result.contains("plan-status: 🟡"));
+        assert_eq!(result.matches("plan-status:").count(), 1);
+    }
+
+    #[test]
+    fn test_append_done_marker_preserves_surrounding_content() {
+        let desc = "feat: title\n\n# Phase 1\n\nDone.\n\nplan-status: 🔴";
+        let result = append_done_marker(desc, false);
+        assert!(result.contains("# Phase 1"));
+        assert!(result.contains("Done."));
+        assert!(result.contains("feat: title"));
+        assert!(result.ends_with("plan-status: ✅"));
+    }
+
+    #[test]
+    fn test_append_done_marker_no_duplicate_when_replacing() {
+        // The exact bug: plan-status: 🔴 exists, append_done_marker should
+        // replace it, not add a second plan-status: ✅ line.
+        let desc = "feat: something\n\nplan-status: 🔴\n";
+        let result = append_done_marker(desc, false);
+        assert_eq!(result.matches("plan-status:").count(), 1,
+            "should have exactly one plan-status line, got: {:?}", result);
+    }
 }

@@ -383,6 +383,7 @@ impl PlatformService for GitLabService {
             is_draft: mr.draft,
             mergeable: Some(mr.merge_status == "can_be_merged"),
             head_ref: mr.source_branch,
+            head_sha: None, // GitLab uses pipeline API for CI, not head SHA
             base_ref: mr.target_branch,
             html_url: mr.web_url,
         })

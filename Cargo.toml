@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["jj", "jujutsu", "vcs", "planning"]
 categories = ["development-tools", "command-line-utilities"]
 
+[lib]
+name = "jj_plan"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jj-plan"
 path = "src/main.rs"
@@ -29,7 +33,7 @@ toml = "0.8"
 toml_edit = "0.24"
 
 # Async runtime (only used by jj stack commands)
-tokio = { version = "1", features = ["rt", "macros", "process"] }
+tokio = { version = "1", features = ["rt", "macros", "process", "time"] }
 
 # HTTP + APIs
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -1,32 +1,10 @@
-mod auth;
-mod commands;
-#[macro_use]
-mod debug;
-mod error;
-mod flush;
-mod markdown;
-mod merge;
-mod platform;
-mod template;
-mod jj_binary;
-mod plan_dir;
-mod plan_file;
-mod plan_registry;
-mod pr_cache;
-mod stack_builder;
-mod stack_context;
-mod stack_render;
-mod submit;
-mod sync;
-mod types;
-mod workspace;
-mod wrap;
-
-use error::JjPlanError;
-use jj_binary::JjBinary;
-use plan_dir::{find_repo_root, resolve_plan_dir};
-use plan_registry::load_registry;
-
+use jj_plan::error::JjPlanError;
+use jj_plan::jj_binary::JjBinary;
+use jj_plan::plan_dir::{find_repo_root, resolve_plan_dir};
+use jj_plan::plan_registry::load_registry;
+use jj_plan::workspace;
+use jj_plan::commands;
+use jj_plan::wrap;
 
 /// Read-only commands that get zero-overhead passthrough via exec.
 /// Note: status/st are NOT here — they get special handling to append stack summary.
@@ -81,7 +59,7 @@ fn main() {
     std::process::exit(exit_code);
 }
 
-fn run(jj: &JjBinary, args: &[String]) -> error::Result<i32> {
+fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
     // Top-level `plan --help` should work even before repo activation checks
     // and should recognize jj-style global options such as `--color`.
     if let commands::help::InvocationKind::PlanHelp(_) =

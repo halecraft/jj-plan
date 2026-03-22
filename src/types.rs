@@ -382,6 +382,7 @@ pub struct GitRemote {
 pub enum Platform {
     GitHub,
     GitLab,
+    Gitea,
 }
 
 impl std::fmt::Display for Platform {
@@ -389,6 +390,7 @@ impl std::fmt::Display for Platform {
         match self {
             Self::GitHub => write!(f, "GitHub"),
             Self::GitLab => write!(f, "GitLab"),
+            Self::Gitea => write!(f, "Gitea"),
         }
     }
 }
@@ -449,6 +451,10 @@ pub struct PullRequestDetails {
     pub is_draft: bool,
     pub mergeable: Option<bool>,
     pub head_ref: String,
+    /// Head commit SHA — used by GitHub's `check_merge_readiness` to query
+    /// check runs for CI status. Other platforms may leave this as `None`.
+    #[serde(default)]
+    pub head_sha: Option<String>,
     pub base_ref: String,
     pub html_url: String,
 }

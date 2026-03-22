@@ -3,6 +3,8 @@
 //! Wraps the octocrab client to provide PR operations against GitHub's API.
 
 use async_trait::async_trait;
+use octocrab::models::pulls::ReviewState;
+use octocrab::params::repos::Commitish;
 use tokio::process::Command;
 
 use crate::error::{JjPlanError, Result};
@@ -74,6 +76,69 @@ impl GitHubService {
             node_id: pr.node_id.clone(),
             is_draft: pr.draft.unwrap_or(false),
         }
+    }
+}
+
+impl GitHubService {
+    /// Check review status for a PR.
+    ///
+    /// Returns `true` if the PR is approved: at least one APPROVED review
+    /// and no CHANGES_REQUESTED reviews. Returns `true` if there are no
+    /// reviews at all (no required reviewers).
+    async fn check_reviews(&self, pr_number: u64) -> Result<bool> {
+        let reviews: Vec<octocrab::models::pulls::Review> = self
+            .client
+            .get(
+                format!(
+                    "/repos/{}/{}/pulls/{}/reviews",
+                    self.config.owner, self.config.repo, pr_number
+                ),
+                None::<&()>,
+            )
+            .await?;
+
+        if reviews.is_empty() {
+            return Ok(true); // No reviews → no required reviewers → approved
+        }
+
+        let any_approved = reviews
+            .iter()
+            .any(|r| r.state == Some(ReviewState::Approved));
+        let any_changes_requested = reviews
+            .iter()
+            .any(|r| r.state == Some(ReviewState::ChangesRequested));
+
+        Ok(any_approved && !any_changes_requested)
+    }
+
+    /// Check CI status for a commit SHA.
+    ///
+    /// Returns `true` if CI passes:
+    /// - No check runs exist (no CI configured), OR
+    /// - All completed check runs have `conclusion == "success"`
+    ///
+    /// In-progress runs are not treated as failures — they produce an
+    /// uncertainty note in the caller.
+    async fn check_ci_status(&self, head_sha: &str) -> Result<bool> {
+        let check_runs = self
+            .client
+            .checks(&self.config.owner, &self.config.repo)
+            .list_check_runs_for_git_ref(Commitish(head_sha.to_string()))
+            .send()
+            .await?;
+
+        if check_runs.total_count == 0 {
+            return Ok(true); // No CI configured
+        }
+
+        let all_completed_ok = check_runs.check_runs.iter().all(|cr| {
+            // A run without a conclusion is still in progress — don't fail on it.
+            cr.conclusion
+                .as_deref()
+                .is_none_or(|c| c == "success" || c == "skipped" || c == "neutral")
+        });
+
+        Ok(all_completed_ok)
     }
 }
 
@@ -284,6 +349,7 @@ impl PlatformService for GitHubService {
             is_draft: pr.draft.unwrap_or(false),
             mergeable: pr.mergeable,
             head_ref: pr.head.ref_field.clone(),
+            head_sha: Some(pr.head.sha.clone()),
             base_ref: pr.base.ref_field.clone(),
             html_url: pr
                 .html_url
@@ -294,7 +360,26 @@ impl PlatformService for GitHubService {
     }
 
     async fn check_merge_readiness(&self, pr_number: u64) -> Result<MergeReadiness> {
-        let details = self.get_pr_details(pr_number).await?;
+        let pr = self.pulls().get(pr_number).await?;
+
+        let details = PullRequestDetails {
+            number: pr.number,
+            title: pr.title.clone().unwrap_or_default(),
+            body: pr.body.clone(),
+            state: PrState::Open,
+            is_draft: pr.draft.unwrap_or(false),
+            mergeable: pr.mergeable,
+            head_ref: pr.head.ref_field.clone(),
+            head_sha: Some(pr.head.sha.clone()),
+            base_ref: pr.base.ref_field.clone(),
+            html_url: pr
+                .html_url
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_default(),
+        };
+
+        let head_sha = pr.head.sha.clone();
         let mut blocking_reasons = Vec::new();
         let mut uncertainties = Vec::new();
 
@@ -308,14 +393,38 @@ impl PlatformService for GitHubService {
             uncertainties.push("mergeable status is unknown".to_string());
         }
 
-        // We cannot cheaply determine approval / CI status from the REST PR
-        // object alone; mark them as uncertain.
-        uncertainties.push("approval status not checked (requires review API)".to_string());
-        uncertainties.push("CI status not checked (requires checks API)".to_string());
+        // ── Check reviews ────────────────────────────────────────────────
+        // List reviews via the REST API. A PR is approved if any review has
+        // state APPROVED and no review has state CHANGES_REQUESTED.
+        let is_approved = match self.check_reviews(pr_number).await {
+            Ok(approved) => approved,
+            Err(e) => {
+                uncertainties.push(format!("could not check reviews: {e}"));
+                true // Permissive fallback — don't block on review API failure
+            }
+        };
+
+        // ── Check CI status ──────────────────────────────────────────────
+        // Query check runs for the head SHA. CI passes if there are no
+        // check runs (no CI configured) or all completed runs succeeded.
+        let ci_passed = match self.check_ci_status(&head_sha).await {
+            Ok(passed) => passed,
+            Err(e) => {
+                uncertainties.push(format!("could not check CI status: {e}"));
+                true // Permissive fallback
+            }
+        };
+
+        if !is_approved {
+            blocking_reasons.push("Not approved (or changes requested)".to_string());
+        }
+        if !ci_passed {
+            blocking_reasons.push("CI checks not passing".to_string());
+        }
 
         Ok(MergeReadiness {
-            is_approved: false,
-            ci_passed: false,
+            is_approved,
+            ci_passed,
             is_mergeable: details.mergeable,
             is_draft: details.is_draft,
             blocking_reasons,
