@@ -79,16 +79,24 @@ Every `jj` command you run — `status`, `new`, `edit`, `rebase` — automatical
 `jj status` appends the plan stack:
 
 ```
-Working copy  (@) : ykvsnxrl 3a7b2c1d Implement session management
-Parent commit (@-): mtzrlpvq 8f2e4a6b Extract auth module
+Working copy  (@) : ykvsnxrl 3a7b2c1d Add API endpoints
+Parent commit (@-): mtzrlpvq 8f2e4a6b Implement session management
 
-Plan stack (.jj-plan/; *=here ✓=done ~=has changes):
-  ✓ 01-feat-auth kpqxywon :: Extract auth module
-  ~ 02-feat-session mtzrlpvq :: Implement session management
-*   03-feat-api ykvsnxrl :: Add API endpoints
+Plan stack (.jj-plan/):
+
+  ◉ feat-api ykvsnxrl (@)
+  │ Add API endpoints
+  │
+  ○ feat-session mtzrlpvq (~)
+  │ Implement session management
+  │
+  ○ feat-auth kpqxywon (✓)
+  │ Extract auth module
+  │
+  ◆ trunk()
 ```
 
-`jj stack` shows the PR-aware visualization:
+`jj stack` shows the same visualization with PR sync status:
 
 ```
   ◉ feat-api ykvsnxrl (@)
@@ -363,8 +371,8 @@ bats jj-plan.bats              # sequential
 - **Template repo**: A jj repo with `.jj-plan/` is created once per run. Each test gets an isolated `cp -r` copy (~2ms).
 - **Direct bats style**: Tests run commands inline — no wrapper functions, no subshells.
 - **Parallel-safe**: Every test operates in its own temp directory. No shared mutable state.
-- **Unit tests**: 200 Rust tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, and platform detection.
-- **Integration tests**: 126 bats tests covering end-to-end CLI behavior, plan file sync, stack display, navigation, abandon recovery, config, templates, and encoded bookmark names.
+- **Unit tests**: 263 Rust tests covering types, stack builder, plan registry, PR cache, sync, flush, markdown processing, plan file operations, platform detection, submit comments, merge planning/execution, template rendering, and CLI parsing.
+- **Integration tests**: 141 bats tests covering end-to-end CLI behavior, plan file sync, stack display, navigation, stack submission, abandon recovery, config, templates, and encoded bookmark names.
 
 ## Documentation
 
@@ -389,5 +397,6 @@ Use `jj plan --help` for the compact terminal summary. Use the docs below when y
 | `GL_TOKEN` | GitLab token (alternative to `GITLAB_TOKEN`) | — |
 | `GH_HOST` | GitHub Enterprise hostname | `github.com` |
 | `GITLAB_HOST` | Self-hosted GitLab hostname | `gitlab.com` |
+| `JJ_PLAN_STACK_PREFIX` | Bookmark prefix for explicit stack boundaries | `stack/` |
 | `GITEA_TOKEN` | Gitea personal access token | — |
 | `GITEA_HOST` | Self-hosted Gitea hostname | — |
