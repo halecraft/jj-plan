@@ -50,7 +50,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/platform/github.rs` | 276 | GitHub implementation (octocrab) |
 | `src/platform/gitlab.rs` | 487 | GitLab implementation (reqwest) |
 | `src/platform/gitea.rs` | — | Gitea implementation (reqwest) |
-| `src/platform/detection.rs` | 137 | URL → platform detection |
+| `src/platform/detection.rs` | 426 | URL → platform detection |
 | `src/platform/factory.rs` | 31 | Service construction with auth |
 | `src/auth/mod.rs` | 17 | `AuthSource` enum |
 | `src/auth/github.rs` | 88 | gh CLI + env var token resolution |
@@ -469,7 +469,7 @@ Key Gitea-specific patterns:
 
 ### Platform detection (`src/platform/detection.rs`)
 
-Detects GitHub, GitLab, or Gitea from git remote URLs via regex matching on SSH (`git@host:owner/repo.git`) and HTTPS (`https://host/owner/repo.git`) formats. Self-hosted instances are supported via `GH_HOST`, `GITLAB_HOST`, and `GITEA_HOST` environment variables.
+Detects GitHub, GitLab, or Gitea from git remote URLs using a URL-parser-first approach with SCP-style fallback. Scheme-based URLs (`ssh://`, `https://`, `git://`) are parsed by `url::Url::parse`, which correctly separates host, port, and path. SCP-style URLs (`git@host:owner/repo.git`) — which are not valid RFC 3986 URIs — fall back to string splitting on the first `:` after `git@`. This handles `ssh://` URLs with non-standard ports (common for self-hosted Gitea, Forgejo, and Gerrit instances) without misinterpreting the port number as part of the repository path. Self-hosted instances are supported via `GH_HOST`, `GITLAB_HOST`, and `GITEA_HOST` environment variables.
 
 Gitea detection supports `GITEA_HOST` env var and recognises `codeberg.org` as a well-known Gitea instance. For unknown hostnames that don't match any configured platform, `StackContext::new` performs an async probe of `GET /api/v1/version` — if it returns a JSON object with a `"version"` field, the host is classified as Gitea. The `parse_repo_info_as_gitea()` function handles URL parsing for probe-detected instances.
 
@@ -727,7 +727,7 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 | `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
 | `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
 | `flush.rs` | 6 | Description comparison, bookmark-based resolution |
-| `platform/detection.rs` | 10 | URL parsing, platform detection |
+| `platform/detection.rs` | 18 | URL parsing, platform detection |
 
 ### Bats integration tests (`./test.sh`)
 
@@ -773,7 +773,6 @@ Tests cover: submit lifecycle (create, find, retarget, comments), merge lifecycl
 | `async-trait` | 0.1 | Async trait support for `PlatformService` |
 | `url` | 2 | URL parsing for platform detection |
 | `urlencoding` | 2 | GitLab project path encoding |
-| `regex` | 1 | Remote URL pattern matching |
 | `base64` | 0.22 | Stack comment encoding |
 
 ### CLI / UX

@@ -42,7 +42,6 @@ octocrab = { version = "0.47", default-features = false, features = ["rustls", "
 # Utilities
 async-trait = "0.1"
 base64 = "0.22"
-regex = "1"
 thiserror = "2"
 url = "2"
 urlencoding = "2"

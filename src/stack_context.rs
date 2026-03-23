@@ -5,7 +5,8 @@
 use crate::error::{JjPlanError, Result};
 
 use crate::platform::{
-    create_platform_service, parse_repo_info, parse_repo_info_as_gitea, PlatformService,
+    create_platform_service, extract_hostname, parse_repo_info, parse_repo_info_as_gitea,
+    PlatformService,
 };
 use crate::pr_cache::{load_pr_cache, PrCache};
 use crate::types::PlanRegistry;
@@ -102,7 +103,7 @@ async fn probe_gitea_fallback(
     url: &str,
 ) -> Result<crate::types::PlatformConfig> {
     // Extract hostname from the remote URL to build the probe URL.
-    let hostname = extract_probe_hostname(url)
+    let hostname = extract_hostname(url)
         .ok_or(JjPlanError::NoSupportedRemotes)?;
 
     let probe_url = format!("https://{hostname}/api/v1/version");
@@ -136,15 +137,3 @@ async fn probe_gitea_fallback(
     parse_repo_info_as_gitea(url)
 }
 
-/// Extract hostname from a git remote URL for probing.
-fn extract_probe_hostname(url: &str) -> Option<String> {
-    if url.starts_with("git@") {
-        return url
-            .strip_prefix("git@")
-            .and_then(|s| s.split(':').next())
-            .map(ToString::to_string);
-    }
-    url::Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(ToString::to_string))
-}

@@ -1923,7 +1923,6 @@ dependencies = [
  "octocrab",
  "owo-colors",
  "pollster",
- "regex",
  "reqwest",
  "serde",
  "serde_json",

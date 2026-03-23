@@ -8,7 +8,7 @@ mod gitea;
 mod github;
 mod gitlab;
 
-pub use detection::{parse_repo_info, parse_repo_info_as_gitea};
+pub use detection::{extract_hostname, parse_repo_info, parse_repo_info_as_gitea};
 pub use factory::create_platform_service;
 pub use gitea::GiteaService;
 pub use github::GitHubService;
