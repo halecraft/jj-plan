@@ -175,6 +175,114 @@ pub fn remove_metadata(input: &str) -> &str {
     body
 }
 
+// ---------------------------------------------------------------------------
+// PlanDocument — unified parse-and-transform facade
+// ---------------------------------------------------------------------------
+
+/// A parsed plan document that provides read accessors and transform methods.
+///
+/// Constructed once from a description string via `PlanDocument::parse()`,
+/// then used at consumer boundaries (done, submit, display) to access
+/// title, metadata, body, and derived transformations without redundant
+/// parsing.
+///
+/// This is a **parsing facade**, not a domain entity. It borrows from the
+/// input string and should be constructed at the point of use, not stored
+/// on long-lived types.
+pub struct PlanDocument<'a> {
+    raw: &'a str,
+    title: &'a str,
+    metadata: BTreeMap<String, String>,
+    body: &'a str,
+}
+
+impl<'a> PlanDocument<'a> {
+    /// Parse a description string into a `PlanDocument`.
+    ///
+    /// Calls `parse_metadata` once and stores the results. The title is
+    /// always line 1 of the input (summary-first metadata format).
+    pub fn parse(input: &'a str) -> Self {
+        let title = input.lines().next().unwrap_or("");
+        let (metadata, body) = parse_metadata(input);
+        Self {
+            raw: input,
+            title,
+            metadata,
+            body,
+        }
+    }
+
+    // -- Read accessors ----------------------------------------------------
+
+    /// Line 1 of the input — the commit summary / plan title.
+    pub fn title(&self) -> &str {
+        self.title
+    }
+
+    /// Whether the metadata `status` field is `✅`.
+    pub fn is_done(&self) -> bool {
+        self.metadata.get("status").is_some_and(|v| v == "✅")
+    }
+
+    /// Full metadata key-value map.
+    pub fn metadata(&self) -> &BTreeMap<String, String> {
+        &self.metadata
+    }
+
+    /// Body content after the `---` separator (or after line 1 if no metadata).
+    pub fn body(&self) -> &str {
+        self.body
+    }
+
+    /// The original unparsed input.
+    pub fn raw(&self) -> &str {
+        self.raw
+    }
+
+    // -- Transform methods -------------------------------------------------
+
+    /// Body with `[scratch]` sections stripped.
+    ///
+    /// Computed on demand, not cached.
+    pub fn body_sans_scratch(&self) -> String {
+        strip_scratch_sections(self.body)
+    }
+
+    /// The complete "mark as done" transformation.
+    ///
+    /// 1. If `!keep_scratch`, strips `[scratch]` sections from the full document.
+    /// 2. Sets metadata `status: ✅`.
+    ///
+    /// Idempotent: if status is already `✅`, still strips scratch (if requested)
+    /// but doesn't double-stamp. Replaces `append_done_marker` entirely.
+    pub fn as_done(&self, keep_scratch: bool) -> String {
+        let base = if keep_scratch {
+            self.raw.to_string()
+        } else {
+            strip_scratch_sections(self.raw)
+        };
+        // Migrate old ---/--- front matter if present
+        let migrated = migrate_old_front_matter(&base);
+        set_metadata_field(&migrated, "status", "✅")
+    }
+
+    /// Extract PR title and body for submission.
+    ///
+    /// Title is `self.title()` (line 1). Body is `self.body()` with
+    /// `[scratch]` sections stripped and trimmed. Returns `None` if the
+    /// title is empty.
+    ///
+    /// Replaces `plan_content_to_pr_parts` entirely.
+    pub fn pr_parts(&self) -> Option<(String, String)> {
+        let title = self.title();
+        if title.trim().is_empty() {
+            return None;
+        }
+        let body = strip_scratch_sections(self.body).trim().to_string();
+        Some((title.to_string(), body))
+    }
+}
+
 /// Migrate old `---`-delimited front matter to summary-first metadata format.
 ///
 /// Old format:
@@ -1362,5 +1470,161 @@ Done.
                 input, new_result, legacy_result
             );
         }
+    }
+
+    // ── PlanDocument unit tests ──────────────────────────────────────
+
+    #[test]
+    fn test_plan_document_parse_with_metadata() {
+        let input = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nSome content.\n";
+        let doc = PlanDocument::parse(input);
+        assert_eq!(doc.title(), "feat: my feature");
+        assert_eq!(doc.metadata().get("status").unwrap(), "🔴");
+        assert_eq!(doc.metadata().get("issue").unwrap(), "MERC-123");
+        assert!(!doc.is_done());
+        assert_eq!(doc.body(), "\n# Background\n\nSome content.\n");
+        assert_eq!(doc.raw(), input);
+    }
+
+    #[test]
+    fn test_plan_document_parse_no_metadata() {
+        let input = "feat: my feature\n\n# Background\n\nSome content.\n";
+        let doc = PlanDocument::parse(input);
+        assert_eq!(doc.title(), "feat: my feature");
+        assert!(doc.metadata().is_empty());
+        assert!(!doc.is_done());
+        assert_eq!(doc.body(), "\n# Background\n\nSome content.\n");
+    }
+
+    #[test]
+    fn test_plan_document_body_sans_scratch() {
+        let input = "feat: title\nstatus: 🔴\n---\n\n# Background\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n\n# Results\n\nAlso visible.\n";
+        let doc = PlanDocument::parse(input);
+        let stripped = doc.body_sans_scratch();
+        assert!(stripped.contains("# Background"), "non-scratch heading preserved");
+        assert!(stripped.contains("Visible."), "non-scratch content preserved");
+        assert!(stripped.contains("# Results"), "post-scratch heading preserved");
+        assert!(stripped.contains("Also visible."), "post-scratch content preserved");
+        assert!(!stripped.contains("[scratch]"), "scratch heading removed");
+        assert!(!stripped.contains("Hidden."), "scratch content removed");
+        // body() still has the scratch section
+        assert!(doc.body().contains("[scratch]"), "body() is unstripped");
+    }
+
+    #[test]
+    fn test_plan_document_empty_input() {
+        let doc = PlanDocument::parse("");
+        assert_eq!(doc.title(), "");
+        assert!(!doc.is_done());
+        assert!(doc.metadata().is_empty());
+        assert!(doc.body().is_empty());
+    }
+
+    #[test]
+    fn test_plan_document_as_done_sets_status() {
+        let input = "feat: title\nstatus: 🔴\n---\n\n# Background\n\nContent.\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("status: ✅"), "status should be ✅");
+        assert!(!result.contains("status: 🔴"), "old status gone");
+        assert!(result.starts_with("feat: title\n"), "title preserved");
+        assert!(result.contains("# Background"), "body preserved");
+    }
+
+    #[test]
+    fn test_plan_document_as_done_idempotent() {
+        let input = "feat: title\nstatus: ✅\n---\n\n# Body\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("status: ✅"));
+        assert_eq!(result.matches("status:").count(), 1, "no duplicate status");
+    }
+
+    #[test]
+    fn test_plan_document_as_done_strips_scratch() {
+        let input = "feat: title\nstatus: 🔴\n---\n\n# Keep\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("status: ✅"), "status set");
+        assert!(result.contains("# Keep"), "non-scratch preserved");
+        assert!(!result.contains("[scratch]"), "scratch stripped");
+        assert!(!result.contains("Hidden."), "scratch content stripped");
+    }
+
+    #[test]
+    fn test_plan_document_as_done_keep_scratch() {
+        let input = "feat: title\nstatus: 🔴\n---\n\n# Notes [scratch]\n\nHidden.\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(true);
+        assert!(result.contains("status: ✅"), "status set");
+        assert!(result.contains("[scratch]"), "scratch preserved with keep_scratch=true");
+        assert!(result.contains("Hidden."), "scratch content preserved");
+    }
+
+    #[test]
+    fn test_plan_document_as_done_creates_metadata() {
+        let input = "feat: title\n\n# Background\n\nSome details.";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.starts_with("feat: title\n"), "title preserved as line 1");
+        assert!(result.contains("status: ✅"), "status created");
+        assert!(result.contains("---\n"), "separator created");
+        assert!(result.contains("# Background"), "body preserved");
+    }
+
+    #[test]
+    fn test_plan_document_pr_parts_basic() {
+        let input = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n\n# Results\n\nFinal.\n";
+        let doc = PlanDocument::parse(input);
+        let (title, body) = doc.pr_parts().unwrap();
+        assert_eq!(title, "feat: my feature");
+        assert!(!body.contains("status:"), "no metadata in PR body");
+        assert!(!body.contains("issue:"), "no metadata in PR body");
+        assert!(!body.contains("[scratch]"), "no scratch in PR body");
+        assert!(!body.contains("Hidden."), "no scratch content in PR body");
+        assert!(body.contains("# Background"), "non-scratch content in PR body");
+        assert!(body.contains("Final."), "non-scratch content in PR body");
+    }
+
+    #[test]
+    fn test_plan_document_pr_parts_empty_title() {
+        let doc = PlanDocument::parse("");
+        assert!(doc.pr_parts().is_none());
+
+        let doc2 = PlanDocument::parse("   \n\nbody");
+        assert!(doc2.pr_parts().is_none());
+    }
+
+    #[test]
+    fn test_plan_document_pr_parts_preserves_magic_words() {
+        let input = "feat: title\nstatus: 🔴\n---\n\nCompletes MERC-123\n\n# Details\n\nWork done.\n";
+        let doc = PlanDocument::parse(input);
+        let (_, body) = doc.pr_parts().unwrap();
+        assert!(body.contains("Completes MERC-123"), "Linear magic words survive");
+    }
+
+    #[test]
+    fn test_plan_document_title_edge_cases() {
+        // Single line, no body
+        let doc = PlanDocument::parse("feat: title");
+        assert_eq!(doc.title(), "feat: title");
+        assert!(doc.body().is_empty());
+        assert!(doc.metadata().is_empty());
+
+        // Body starting with blank line
+        let doc2 = PlanDocument::parse("feat: title\n\nsome body");
+        assert_eq!(doc2.title(), "feat: title");
+        assert_eq!(doc2.body(), "\nsome body");
+
+        // Metadata with no body after separator
+        let doc3 = PlanDocument::parse("feat: title\nstatus: 🔴\n---\n");
+        assert_eq!(doc3.title(), "feat: title");
+        assert_eq!(doc3.metadata().get("status").unwrap(), "🔴");
+        assert_eq!(doc3.body(), "");
+
+        // Body that is only whitespace
+        let doc4 = PlanDocument::parse("feat: title\nstatus: 🔴\n---\n   \n  \n");
+        assert_eq!(doc4.title(), "feat: title");
+        assert!(doc4.pr_parts().unwrap().1.is_empty(), "whitespace-only body should trim to empty");
     }
 }

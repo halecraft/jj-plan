@@ -85,11 +85,11 @@ pub fn description_first_line(desc: &str) -> &str {
 
 /// Whether a description's metadata `status` field is `✅`.
 ///
-/// Reads from parsed metadata only — no substring scanning of body text.
-/// Descriptions without metadata are never considered done.
-pub fn description_is_done(desc: &str) -> bool {
-    let (map, _) = crate::markdown::parse_metadata(desc);
-    map.get("status").is_some_and(|v| v == "✅")
+/// Thin wrapper around `PlanDocument::parse(desc).is_done()`.
+/// Kept for `LogEntry::is_done()` and `SyncChangeView::is_done()` which
+/// don't need a full `PlanDocument` at their call sites.
+pub(crate) fn description_is_done(desc: &str) -> bool {
+    crate::markdown::PlanDocument::parse(desc).is_done()
 }
 
 impl LogEntry {

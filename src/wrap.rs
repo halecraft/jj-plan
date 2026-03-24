@@ -340,7 +340,7 @@ pub struct SyncChangeView {
 }
 
 impl SyncChangeView {
-    /// Whether the description contains `plan-status: ✅`.
+    /// Whether the description's front matter `status` field is `✅`.
     pub fn is_done(&self) -> bool {
         types::description_is_done(&self.description)
     }

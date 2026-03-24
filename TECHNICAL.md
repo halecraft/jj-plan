@@ -284,6 +284,8 @@ Uses a **gather → plan → execute** architecture:
 
 Note: `resolve_and_sync` in `wrap.rs` performs a single GATHER that serves both the sync pipeline (plan file I/O) and the rendering pipeline (terminal + markdown output). It builds the multi-stack, generates `stack.md` content via `format_markdown_with_header`, and passes it to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second GATHER traversal is needed.
 
+`SyncChangeView` remains thin — it stores only the raw description string. Plan-awareness (metadata parsing, `is_done` checks) is accessed on demand via `PlanDocument::parse()` at consumer boundaries, not pre-cached on adapter types. This avoids sync hazards where a cached `metadata` field could desync from the `description` after mutations.
+
 ### Phase 5: Show stack
 
 Display the plan stack using pre-gathered `StackDisplayData` from `resolve_and_sync`. `show_plan_stack` accepts `Option<&StackDisplayData>` — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
@@ -633,15 +635,59 @@ A single-threaded tokio runtime is created per `jj stack` command invocation. Th
 
 ## Markdown Processing (`src/markdown.rs`)
 
-The `strip_scratch_sections()` function removes `[scratch]`-annotated heading sections:
+### Summary-first metadata format
 
-1. Track code fence state (backtick and tilde fences).
-2. Detect ATX headings (`#` through `######`).
-3. When a heading contains `[scratch]` (case-insensitive), start stripping.
-4. Stop stripping when a heading of the same or higher level is encountered.
-5. Headings inside code fences are never treated as section boundaries.
+Plan descriptions use a summary-first metadata format that keeps the commit summary on line 1 (as jj/git expect):
 
-Edge cases handled: multiple scratch sections, nested headings, fence char matching, empty input, entire document as scratch.
+```
+feat: my feature          ← line 1: always the title (shown in jj log, git log, PR titles)
+status: 🔴                ← metadata key: value lines (optional)
+issue: MERC-123
+---                       ← separator
+
+# Background              ← body content
+```
+
+Parsing rules:
+- Line 1 is always the title — never metadata.
+- Lines 2+ are metadata if they match `^[a-z][a-z0-9_-]*: ` (lowercase identifier key). Key restriction prevents false positives from prose lines with colons.
+- The metadata region ends at the first `---` line. If a non-metadata line appears before `---`, there is no metadata.
+- Everything after `---\n` is the body. A `---` later in the body is just a CommonMark thematic break.
+
+Free functions: `parse_metadata()`, `set_metadata_field()`, `remove_metadata()`, `strip_scratch_sections()`.
+
+### `PlanDocument` — unified parse-and-transform facade
+
+`PlanDocument<'a>` parses a description string once and provides both read accessors and transform methods. It borrows from the input string and should be constructed at consumer boundaries (display, done, submit), not stored on long-lived types.
+
+```rust
+let doc = PlanDocument::parse(&description);
+
+// Read accessors (no allocation)
+doc.title()      // → &str — line 1, the commit summary
+doc.is_done()    // → bool — metadata status == ✅
+doc.metadata()   // → &BTreeMap<String, String>
+doc.body()       // → &str — everything after ---
+doc.raw()        // → &str — original input
+
+// Transform methods (allocate new Strings)
+doc.as_done(keep_scratch)  // → String — strip scratch + set status: ✅
+doc.pr_parts()             // → Option<(String, String)> — (title, body) for PR
+doc.body_sans_scratch()    // → String — body with [scratch] sections removed
+```
+
+Three consumer patterns:
+1. **Done path** (`done.rs`): `PlanDocument::parse(desc).as_done(keep_scratch)` → `jj describe -m`.
+2. **Submit path** (`stack_cmd.rs`): `PlanDocument::parse(&content).pr_parts()` → PR title + body.
+3. **Display path** (`stack_render.rs`): `PlanDocument::parse(&tip.description)` → `is_done`, `title`, `metadata` indicators.
+
+`description_is_done()` and `description_first_line()` in `types.rs` remain as thin wrappers for plan-agnostic call sites (`LogEntry`, `SyncChangeView`) that don't need a full `PlanDocument`.
+
+### Scratch section stripping
+
+`strip_scratch_sections()` uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading detection (ATX and setext headings, code fence awareness). The metadata block is extracted first, then the body is parsed through `pulldown-cmark` to identify heading byte ranges. Scratch sections (headings containing `[scratch]`, case-insensitive) are sliced out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
+
+Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, metadata preservation.
 
 ---
 

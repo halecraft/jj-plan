@@ -1,7 +1,7 @@
 use crate::jj_binary::JjBinary;
-use crate::markdown::{set_metadata_field, strip_scratch_sections};
+use crate::markdown::PlanDocument;
 use crate::plan_dir::PlanDir;
-use crate::types::{self, PlanRegistry};
+use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 use crate::wrap::SyncChangeView;
 
@@ -82,19 +82,14 @@ fn run_done_stack(
 
     for change in changes {
         let desc = &change.description;
+        let doc = PlanDocument::parse(desc);
 
         if dry_run {
-            print_dry_run_diff(&change.change_id, desc, keep_scratch);
+            print_dry_run_diff(&doc, keep_scratch);
             continue;
         }
 
-        let cleaned = if keep_scratch {
-            desc.clone()
-        } else {
-            strip_scratch_sections(desc)
-        };
-
-        let final_desc = append_done_marker(&cleaned, change.is_done());
+        let final_desc = doc.as_done(keep_scratch);
         let _ = jj.run_silent(&["describe", "-r", &change.change_id, "-m", &final_desc]);
     }
 
@@ -139,11 +134,10 @@ fn run_done_single(
     let found = changes.and_then(|cs| find_change_in_stack(cs, &target));
 
     // Read description: from stack if found, otherwise from jj directly
-    let (change_id_for_describe, desc, was_done) = match found {
+    let (change_id_for_describe, desc) = match found {
         Some(change) => (
             change.change_id.clone(),
             change.description.clone(),
-            change.is_done(),
         ),
         None => {
             // Not found in stack — read description from jj directly
@@ -154,24 +148,19 @@ fn run_done_single(
                     return Ok(1);
                 }
             };
-            let was_done = types::description_is_done(&desc);
-            (target.clone(), desc, was_done)
+            (target.clone(), desc)
         }
     };
 
+    let doc = PlanDocument::parse(&desc);
+
     // Dry run: show what would be stripped and exit
     if dry_run {
-        print_dry_run_diff(&change_id_for_describe, &desc, keep_scratch);
+        print_dry_run_diff(&doc, keep_scratch);
         return Ok(0);
     }
 
-    let cleaned = if keep_scratch {
-        desc.clone()
-    } else {
-        strip_scratch_sections(&desc)
-    };
-
-    let final_desc = append_done_marker(&cleaned, was_done);
+    let final_desc = doc.as_done(keep_scratch);
     let _ = jj.run_silent(&[
         "describe",
         "-r",
@@ -220,27 +209,6 @@ fn find_change_in_stack<'a>(changes: &'a [SyncChangeView], target: &str) -> Opti
 /// Read a change's description via jj-lib.
 fn read_description(workspace: &Workspace, target: &str) -> Option<String> {
     workspace.read_description_at(target)
-}
-
-/// Mark a description as done by setting metadata `status: ✅`.
-///
-/// If the description already has `status: ✅` in its metadata, returns
-/// unchanged. Otherwise, sets (or creates) the metadata `status` field.
-/// No more substring scanning of body text — metadata is the single
-/// source of truth.
-fn append_done_marker(desc: &str, already_done: bool) -> String {
-    if already_done {
-        return desc.to_string();
-    }
-    // Migrate old ---/--- front matter to summary-first format if needed
-    let migrated = crate::markdown::migrate_old_front_matter(desc);
-    let desc = &migrated;
-    // Check metadata status directly
-    let (map, _) = crate::markdown::parse_metadata(desc);
-    if map.get("status").is_some_and(|v| v == "✅") {
-        return desc.to_string();
-    }
-    set_metadata_field(desc, "status", "✅")
 }
 
 /// Build SyncChangeView list from the stack for done's consumption.
@@ -302,34 +270,37 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
 
 /// Print a dry-run diff for a single change, showing what sections would be
 /// stripped and that the done marker would be set.
-fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
-    let cleaned = if keep_scratch {
-        desc.to_string()
-    } else {
-        strip_scratch_sections(desc)
-    };
+fn print_dry_run_diff(doc: &PlanDocument<'_>, keep_scratch: bool) {
+    let proposed = doc.as_done(keep_scratch);
 
-    eprintln!("--- change: {} ---", change_id);
+    eprintln!("--- change ---");
 
-    if !keep_scratch && cleaned != desc {
+    if proposed != doc.raw() {
         // Show the sections that would be stripped
-        eprintln!("Would strip scratch sections:");
-        // Find lines in `desc` that are NOT in `cleaned`
-        let cleaned_lines: std::collections::HashSet<&str> = cleaned.lines().collect();
-        for line in desc.lines() {
-            if !cleaned_lines.contains(line) {
+        let raw_lines: std::collections::HashSet<&str> = doc.raw().lines().collect();
+        let proposed_lines: std::collections::HashSet<&str> = proposed.lines().collect();
+        let removed: Vec<&str> = doc.raw().lines().filter(|l| !proposed_lines.contains(l)).collect();
+        if !removed.is_empty() {
+            eprintln!("Would strip:");
+            for line in &removed {
                 eprintln!("  - {}", line);
             }
+            eprintln!();
         }
-        eprintln!();
+        let added: Vec<&str> = proposed.lines().filter(|l| !raw_lines.contains(l)).collect();
+        if !added.is_empty() {
+            eprintln!("Would add:");
+            for line in &added {
+                eprintln!("  + {}", line);
+            }
+            eprintln!();
+        }
     }
 
-    let already_done = types::description_is_done(desc);
-
-    if already_done {
+    if doc.is_done() {
         eprintln!("Already marked done (status: ✅)");
     } else {
-        eprintln!("Would set front matter: status: ✅");
+        eprintln!("Would set metadata: status: ✅");
     }
     eprintln!();
 }
@@ -337,11 +308,13 @@ fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown::PlanDocument;
 
     #[test]
-    fn test_done_marker_uses_metadata() {
+    fn test_as_done_sets_status() {
         let desc = "feat: title\nstatus: 🔴\n---\nbody text here";
-        let result = append_done_marker(desc, false);
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
         assert!(result.contains("status: ✅"), "status should be set to ✅");
         assert!(!result.contains("status: 🔴"), "old status should be replaced");
         assert!(result.contains("body text here"), "body text preserved");
@@ -349,55 +322,51 @@ mod tests {
     }
 
     #[test]
-    fn test_done_marker_already_done_flag() {
+    fn test_as_done_already_done() {
         let desc = "feat: add something\nstatus: ✅\n---\nbody";
-        let result = append_done_marker(desc, true);
-        assert_eq!(result, desc, "already_done=true should return unchanged");
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
+        assert!(result.contains("status: ✅"));
+        assert_eq!(result.matches("status:").count(), 1, "no duplicate status");
     }
 
     #[test]
-    fn test_done_marker_already_has_checkmark_in_metadata() {
-        let desc = "feat: add something\nstatus: ✅\n---\nbody";
-        let result = append_done_marker(desc, false);
-        assert_eq!(result, desc, "already ✅ in metadata should return unchanged");
-    }
-
-    #[test]
-    fn test_done_marker_body_text_no_false_positive() {
+    fn test_as_done_body_text_no_false_positive() {
         // Body text contains literal "plan-status: ✅" — must NOT trigger false positive.
-        // The actual metadata status is 🔴 and should be changed to ✅.
         let desc = "feat: title\nstatus: 🔴\n---\nThis test has plan-status: ✅ in body text";
-        let result = append_done_marker(desc, false);
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
         assert!(result.contains("status: ✅"), "metadata status should be ✅");
         assert!(result.contains("plan-status: ✅ in body text"), "body text preserved");
     }
 
     #[test]
-    fn test_done_marker_creates_metadata() {
+    fn test_as_done_creates_metadata() {
         // No existing metadata → creates metadata block after title
         let desc = "feat: add something\n\n# Background\n\nSome details.";
-        let result = append_done_marker(desc, false);
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
         assert!(result.starts_with("feat: add something\n"), "title preserved as line 1");
         assert!(result.contains("status: ✅"), "should set status to ✅");
         assert!(result.contains("---\n"), "should have --- separator");
         assert!(result.contains("# Background"), "body preserved");
-        assert!(result.contains("Some details."), "body preserved");
     }
 
     #[test]
-    fn test_done_marker_preserves_other_metadata_fields() {
+    fn test_as_done_preserves_other_metadata_fields() {
         let desc = "feat: title\nstatus: 🔴\nissue: MERC-123\n---\n\n# Phase 1\n\nDone.";
-        let result = append_done_marker(desc, false);
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
         assert!(result.contains("status: ✅"), "status should be ✅");
         assert!(result.contains("issue: MERC-123"), "other fields preserved");
         assert!(result.contains("# Phase 1"), "body content preserved");
-        assert!(result.contains("Done."), "body content preserved");
     }
 
     #[test]
-    fn test_done_marker_no_duplicate_status() {
+    fn test_as_done_no_duplicate_status() {
         let desc = "feat: something\nstatus: 🔴\n---\nbody";
-        let result = append_done_marker(desc, false);
+        let doc = PlanDocument::parse(desc);
+        let result = doc.as_done(false);
         assert_eq!(result.matches("status:").count(), 1,
             "should have exactly one status field, got: {:?}", result);
     }

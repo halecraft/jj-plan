@@ -628,7 +628,6 @@ pub fn prepare_display_rows(
             let tip = seg.changes.first();
             let is_wc = tip.is_some_and(|c| c.is_working_copy);
             let is_synced = seg.bookmark.is_synced;
-            let is_done = tip.is_some_and(|c| c.is_done());
             let has_changes = tip.is_some_and(|c| !c.is_empty);
 
             let short_change_id = tip
@@ -639,12 +638,12 @@ pub fn prepare_display_rows(
             let change_id_split =
                 tip.and_then(|c| workspace.change_id_with_prefix_split(&c.change_id));
 
-            // Parse metadata from the tip commit's description
-            let metadata = tip
-                .map(|c| {
-                    let (map, _) = crate::markdown::parse_metadata(&c.description);
-                    map
-                })
+            // Parse once via PlanDocument — extracts is_done, title, and metadata
+            let doc = tip.map(|c| crate::markdown::PlanDocument::parse(&c.description));
+            let is_done = doc.as_ref().is_some_and(|d| d.is_done());
+            let metadata = doc
+                .as_ref()
+                .map(|d| d.metadata().clone())
                 .unwrap_or_default();
 
             let mut indicators = Vec::new();
@@ -664,12 +663,12 @@ pub fn prepare_display_rows(
                     indicators.push(format!("PR #{}", cached_pr.number));
                 }
             }
-            // Surface `issue` from front matter metadata as an indicator
+            // Surface `issue` from metadata as an indicator
             if let Some(issue) = metadata.get("issue") {
                 indicators.push(issue.clone());
             }
 
-            let first_line = tip.map(|c| c.first_line().to_string()).unwrap_or_default();
+            let first_line = doc.as_ref().map(|d| d.title().to_string()).unwrap_or_default();
 
             DisplayRow {
                 bookmark_name: bookmark_name.clone(),
