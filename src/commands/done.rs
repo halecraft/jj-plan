@@ -1,14 +1,14 @@
 use crate::jj_binary::JjBinary;
-use crate::markdown::strip_scratch_sections;
+use crate::markdown::{set_metadata_field, strip_scratch_sections};
 use crate::plan_dir::PlanDir;
-use crate::types::PlanRegistry;
+use crate::types::{self, PlanRegistry};
 use crate::workspace::Workspace;
 use crate::wrap::SyncChangeView;
 
 /// Run `jj plan done` — mark one or all plans as done.
 ///
 /// Strips `[scratch]` sections from descriptions (unless `--keep-scratch`)
-/// and appends `plan-status: ✅` to the description.
+/// and sets front matter `status: ✅` in the description.
 ///
 /// ## Flags
 ///
@@ -102,7 +102,9 @@ fn run_done_stack(
         return Ok(0);
     }
 
-    // Reload after describes, then sync and show stack
+    // Sync plan files immediately after describes so the plan files reflect
+    // the new front matter. Without this, any subsequent flush cycle would
+    // read stale plan files and overwrite the jj descriptions.
     workspace.reload();
     crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
 
@@ -152,8 +154,7 @@ fn run_done_single(
                     return Ok(1);
                 }
             };
-            let was_done = desc.starts_with("plan-status: ✅")
-                || desc.contains("\nplan-status: ✅");
+            let was_done = types::description_is_done(&desc);
             (target.clone(), desc, was_done)
         }
     };
@@ -179,15 +180,22 @@ fn run_done_single(
         &final_desc,
     ]);
 
+    // Sync plan files immediately after describe so the plan file reflects
+    // the new front matter. Without this, a subsequent `jj edit` (via the
+    // shell shim's wrap → flush_all) would read the stale plan file and
+    // overwrite the jj description, losing the front matter we just set.
+    workspace.reload();
+    let gathered = crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+
     // If we targeted the working copy (default), advance to the next undone plan.
     // advance_to_next_undone() does its own workspace.reload() + resolve_and_sync(),
     // so skip the outer one to avoid a redundant second stack build + sync cycle.
     if is_default_target {
         advance_to_next_undone(jj, plan_dir, workspace, registry);
     } else {
-        // Explicit target or no advance needed — reload + sync once.
-        workspace.reload();
-        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+        // Explicit target or no advance needed — show the stack
+        // using the display data we already gathered above.
+        crate::wrap::show_plan_stack(plan_dir, gathered.as_ref());
     }
     Ok(0)
 }
@@ -214,39 +222,25 @@ fn read_description(workspace: &Workspace, target: &str) -> Option<String> {
     workspace.read_description_at(target)
 }
 
-/// Append `plan-status: ✅` to a description if not already present.
+/// Mark a description as done by setting metadata `status: ✅`.
 ///
-/// If the description already contains a `plan-status:` line with a different
-/// value (e.g. `🔴`), it is replaced in-place rather than appending a duplicate.
+/// If the description already has `status: ✅` in its metadata, returns
+/// unchanged. Otherwise, sets (or creates) the metadata `status` field.
+/// No more substring scanning of body text — metadata is the single
+/// source of truth.
 fn append_done_marker(desc: &str, already_done: bool) -> String {
-    if already_done
-        || desc.contains("\nplan-status: ✅")
-        || desc.starts_with("plan-status: ✅")
-    {
-        desc.to_string()
-    } else {
-        // Replace any existing `plan-status: <value>` line (e.g. 🔴, 🟡)
-        // rather than appending a second one.
-        let mut found_existing = false;
-        let replaced: String = desc
-            .lines()
-            .map(|line| {
-                if line.starts_with("plan-status:") {
-                    found_existing = true;
-                    "plan-status: ✅"
-                } else {
-                    line
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        if found_existing {
-            replaced
-        } else {
-            format!("{}\n\nplan-status: ✅", desc.trim_end())
-        }
+    if already_done {
+        return desc.to_string();
     }
+    // Migrate old ---/--- front matter to summary-first format if needed
+    let migrated = crate::markdown::migrate_old_front_matter(desc);
+    let desc = &migrated;
+    // Check metadata status directly
+    let (map, _) = crate::markdown::parse_metadata(desc);
+    if map.get("status").is_some_and(|v| v == "✅") {
+        return desc.to_string();
+    }
+    set_metadata_field(desc, "status", "✅")
 }
 
 /// Build SyncChangeView list from the stack for done's consumption.
@@ -307,7 +301,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
 }
 
 /// Print a dry-run diff for a single change, showing what sections would be
-/// stripped and that the done marker would be appended.
+/// stripped and that the done marker would be set.
 fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
     let cleaned = if keep_scratch {
         desc.to_string()
@@ -330,13 +324,12 @@ fn print_dry_run_diff(change_id: &str, desc: &str, keep_scratch: bool) {
         eprintln!();
     }
 
-    let already_done =
-        desc.starts_with("plan-status: ✅") || desc.contains("\nplan-status: ✅");
+    let already_done = types::description_is_done(desc);
 
     if already_done {
-        eprintln!("Already marked done (plan-status: ✅)");
+        eprintln!("Already marked done (status: ✅)");
     } else {
-        eprintln!("Would append: plan-status: ✅");
+        eprintln!("Would set front matter: status: ✅");
     }
     eprintln!();
 }
@@ -346,62 +339,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_append_done_marker_no_existing_status() {
+    fn test_done_marker_uses_metadata() {
+        let desc = "feat: title\nstatus: 🔴\n---\nbody text here";
+        let result = append_done_marker(desc, false);
+        assert!(result.contains("status: ✅"), "status should be set to ✅");
+        assert!(!result.contains("status: 🔴"), "old status should be replaced");
+        assert!(result.contains("body text here"), "body text preserved");
+        assert!(result.starts_with("feat: title\n"), "title preserved as line 1");
+    }
+
+    #[test]
+    fn test_done_marker_already_done_flag() {
+        let desc = "feat: add something\nstatus: ✅\n---\nbody";
+        let result = append_done_marker(desc, true);
+        assert_eq!(result, desc, "already_done=true should return unchanged");
+    }
+
+    #[test]
+    fn test_done_marker_already_has_checkmark_in_metadata() {
+        let desc = "feat: add something\nstatus: ✅\n---\nbody";
+        let result = append_done_marker(desc, false);
+        assert_eq!(result, desc, "already ✅ in metadata should return unchanged");
+    }
+
+    #[test]
+    fn test_done_marker_body_text_no_false_positive() {
+        // Body text contains literal "plan-status: ✅" — must NOT trigger false positive.
+        // The actual metadata status is 🔴 and should be changed to ✅.
+        let desc = "feat: title\nstatus: 🔴\n---\nThis test has plan-status: ✅ in body text";
+        let result = append_done_marker(desc, false);
+        assert!(result.contains("status: ✅"), "metadata status should be ✅");
+        assert!(result.contains("plan-status: ✅ in body text"), "body text preserved");
+    }
+
+    #[test]
+    fn test_done_marker_creates_metadata() {
+        // No existing metadata → creates metadata block after title
         let desc = "feat: add something\n\n# Background\n\nSome details.";
         let result = append_done_marker(desc, false);
-        assert!(result.ends_with("plan-status: ✅"));
-        assert_eq!(result.matches("plan-status:").count(), 1);
+        assert!(result.starts_with("feat: add something\n"), "title preserved as line 1");
+        assert!(result.contains("status: ✅"), "should set status to ✅");
+        assert!(result.contains("---\n"), "should have --- separator");
+        assert!(result.contains("# Background"), "body preserved");
+        assert!(result.contains("Some details."), "body preserved");
     }
 
     #[test]
-    fn test_append_done_marker_already_done_flag() {
-        let desc = "feat: add something\n\nplan-status: ✅";
-        let result = append_done_marker(desc, true);
-        assert_eq!(result, desc);
-    }
-
-    #[test]
-    fn test_append_done_marker_already_has_checkmark() {
-        let desc = "feat: add something\n\nplan-status: ✅";
+    fn test_done_marker_preserves_other_metadata_fields() {
+        let desc = "feat: title\nstatus: 🔴\nissue: MERC-123\n---\n\n# Phase 1\n\nDone.";
         let result = append_done_marker(desc, false);
-        assert_eq!(result, desc);
+        assert!(result.contains("status: ✅"), "status should be ✅");
+        assert!(result.contains("issue: MERC-123"), "other fields preserved");
+        assert!(result.contains("# Phase 1"), "body content preserved");
+        assert!(result.contains("Done."), "body content preserved");
     }
 
     #[test]
-    fn test_append_done_marker_replaces_red_circle() {
-        let desc = "feat: add something\n\n# Details\n\nplan-status: 🔴";
+    fn test_done_marker_no_duplicate_status() {
+        let desc = "feat: something\nstatus: 🔴\n---\nbody";
         let result = append_done_marker(desc, false);
-        assert!(result.contains("plan-status: ✅"));
-        assert!(!result.contains("plan-status: 🔴"));
-        assert_eq!(result.matches("plan-status:").count(), 1);
-    }
-
-    #[test]
-    fn test_append_done_marker_replaces_yellow_circle() {
-        let desc = "feat: add something\n\nplan-status: 🟡";
-        let result = append_done_marker(desc, false);
-        assert!(result.contains("plan-status: ✅"));
-        assert!(!result.contains("plan-status: 🟡"));
-        assert_eq!(result.matches("plan-status:").count(), 1);
-    }
-
-    #[test]
-    fn test_append_done_marker_preserves_surrounding_content() {
-        let desc = "feat: title\n\n# Phase 1\n\nDone.\n\nplan-status: 🔴";
-        let result = append_done_marker(desc, false);
-        assert!(result.contains("# Phase 1"));
-        assert!(result.contains("Done."));
-        assert!(result.contains("feat: title"));
-        assert!(result.ends_with("plan-status: ✅"));
-    }
-
-    #[test]
-    fn test_append_done_marker_no_duplicate_when_replacing() {
-        // The exact bug: plan-status: 🔴 exists, append_done_marker should
-        // replace it, not add a second plan-status: ✅ line.
-        let desc = "feat: something\n\nplan-status: 🔴\n";
-        let result = append_done_marker(desc, false);
-        assert_eq!(result.matches("plan-status:").count(), 1,
-            "should have exactly one plan-status line, got: {:?}", result);
+        assert_eq!(result.matches("status:").count(), 1,
+            "should have exactly one status field, got: {:?}", result);
     }
 }

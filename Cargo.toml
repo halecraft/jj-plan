@@ -23,6 +23,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 jj-lib = { version = "0.38", default-features = false, features = ["git"] }
 pollster = "0.4"
 
+# Markdown parsing (scratch section stripping with byte offsets)
+pulldown-cmark = { version = "0.13", default-features = false }
+
 # Git remote HEAD detection (for default_branch)
 gix = { version = "0.78", default-features = false, features = ["blocking-network-client"] }
 

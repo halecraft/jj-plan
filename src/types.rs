@@ -76,14 +76,20 @@ pub struct LogEntry {
 }
 
 /// First line of a description string, for display in stack summary.
+///
+/// With summary-first metadata format, the title is always line 1 —
+/// no skipping needed.
 pub fn description_first_line(desc: &str) -> &str {
     desc.lines().next().unwrap_or("")
 }
 
-/// Whether a description contains `plan-status: ✅`.
+/// Whether a description's metadata `status` field is `✅`.
+///
+/// Reads from parsed metadata only — no substring scanning of body text.
+/// Descriptions without metadata are never considered done.
 pub fn description_is_done(desc: &str) -> bool {
-    desc.starts_with("plan-status: ✅")
-        || desc.contains("\nplan-status: ✅")
+    let (map, _) = crate::markdown::parse_metadata(desc);
+    map.get("status").is_some_and(|v| v == "✅")
 }
 
 impl LogEntry {
@@ -92,7 +98,7 @@ impl LogEntry {
         description_first_line(&self.description)
     }
 
-    /// Whether the description contains `plan-status: ✅`.
+    /// Whether the description's metadata `status` field is `✅`.
     pub fn is_done(&self) -> bool {
         description_is_done(&self.description)
     }
@@ -577,28 +583,54 @@ mod tests {
     }
 
     #[test]
-    fn test_log_entry_is_done_at_start() {
-        let entry = make_log_entry("plan-status: ✅\nsome content");
+    fn test_log_entry_is_done_metadata() {
+        let entry = make_log_entry("some content\nstatus: ✅\n---\nbody");
         assert!(entry.is_done());
     }
 
     #[test]
-    fn test_log_entry_is_done_after_newline() {
-        let entry = make_log_entry("title\n\nplan-status: ✅");
-        assert!(entry.is_done());
-    }
-
-    #[test]
-    fn test_log_entry_is_not_done() {
+    fn test_log_entry_is_done_no_metadata() {
+        // No metadata → not done (no legacy fallback)
         let entry = make_log_entry("title\n\nsome content");
         assert!(!entry.is_done());
     }
 
     #[test]
-    fn test_log_entry_is_done_inline_does_not_match() {
-        // "plan-status: ✅" must be at start of line, not embedded in text
-        let entry = make_log_entry("title with plan-status: ✅ inline");
+    fn test_log_entry_is_done_body_text_not_false_positive() {
+        // Body text contains literal "plan-status: ✅" — must NOT trigger false positive
+        let entry = make_log_entry("title\nstatus: 🔴\n---\nplan-status: ✅ in body text");
         assert!(!entry.is_done());
+    }
+
+    #[test]
+    fn test_log_entry_is_done_old_style_not_detected() {
+        // Old-style plan-status line without metadata → not done
+        let entry = make_log_entry("title\n\nplan-status: ✅");
+        assert!(!entry.is_done());
+    }
+
+    #[test]
+    fn test_first_line_is_title() {
+        assert_eq!(
+            description_first_line("feat: my feature\nstatus: 🔴\n---\nbody"),
+            "feat: my feature"
+        );
+    }
+
+    #[test]
+    fn test_first_line_no_metadata() {
+        assert_eq!(
+            description_first_line("feat: my feature\n\nbody"),
+            "feat: my feature"
+        );
+    }
+
+    #[test]
+    fn test_first_line_single_line() {
+        assert_eq!(
+            description_first_line("feat: my feature"),
+            "feat: my feature"
+        );
     }
 
     // -----------------------------------------------------------------------

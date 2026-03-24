@@ -14,6 +14,8 @@
 //!   `String`). The `eprintln!` calls in `show_plan_stack()` (in `wrap.rs`) are the
 //!   only side effect.
 
+use std::collections::BTreeMap;
+
 use crate::commands::help::ColorWhen;
 use crate::plan_file::encode_bookmark_for_filename;
 use crate::pr_cache::PrCache;
@@ -266,6 +268,9 @@ pub struct DisplayRow {
     /// Plan filename (e.g. `"01-feat-auth.md"`), for markdown link generation.
     /// `None` in multi-stack mode or when unavailable.
     pub plan_filename: Option<String>,
+    /// Front matter metadata from the plan description (e.g. `status`, `issue`).
+    /// Populated from parsed front matter; empty if no front matter present.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// A prepared stack column for multi-column rendering.
@@ -634,6 +639,14 @@ pub fn prepare_display_rows(
             let change_id_split =
                 tip.and_then(|c| workspace.change_id_with_prefix_split(&c.change_id));
 
+            // Parse metadata from the tip commit's description
+            let metadata = tip
+                .map(|c| {
+                    let (map, _) = crate::markdown::parse_metadata(&c.description);
+                    map
+                })
+                .unwrap_or_default();
+
             let mut indicators = Vec::new();
             if is_wc {
                 indicators.push("@".to_string());
@@ -651,6 +664,10 @@ pub fn prepare_display_rows(
                     indicators.push(format!("PR #{}", cached_pr.number));
                 }
             }
+            // Surface `issue` from front matter metadata as an indicator
+            if let Some(issue) = metadata.get("issue") {
+                indicators.push(issue.clone());
+            }
 
             let first_line = tip.map(|c| c.first_line().to_string()).unwrap_or_default();
 
@@ -665,6 +682,7 @@ pub fn prepare_display_rows(
                     let plan_idx = num_segments - display_idx;
                     Some(format!("{:02}-{}.md", plan_idx, encode_bookmark_for_filename(bookmark_name)))
                 },
+                metadata,
             }
         })
         .collect()
@@ -736,6 +754,7 @@ mod tests {
             },
             first_line: desc.to_string(),
             plan_filename: None,
+            metadata: BTreeMap::new(),
         }
     }
 
@@ -1044,6 +1063,29 @@ mod tests {
         let trunk_idx = output.find("trunk()").unwrap();
         assert!(tests_idx < refactor_idx, "tip should render before trunk");
         assert!(refactor_idx < trunk_idx, "segments should render before trunk");
+    }
+
+    #[test]
+    fn test_display_row_shows_issue_indicator() {
+        let row = DisplayRow {
+            bookmark_name: "feat-auth".to_string(),
+            short_change_id: "abc123".to_string(),
+            change_id_split: None,
+            is_wc: false,
+            indicators: vec!["~".to_string(), "MERC-123".to_string()],
+            first_line: "feat: add auth".to_string(),
+            plan_filename: None,
+            metadata: {
+                let mut m = BTreeMap::new();
+                m.insert("status".to_string(), "🔴".to_string());
+                m.insert("issue".to_string(), "MERC-123".to_string());
+                m
+            },
+        };
+        // The issue indicator should appear in the rendered output
+        let spans = build_node_content(&row);
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert!(text.contains("MERC-123"), "issue indicator should appear in rendered content: {}", text);
     }
 
     #[test]

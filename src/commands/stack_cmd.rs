@@ -283,10 +283,38 @@ impl ProgressCallback for CliProgress {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Pure transformation: extract PR title and body from plan content.
+///
+/// - Title is always line 1 (summary-first metadata format).
+/// - Strips metadata block (not part of PR content).
+/// - Strips `[scratch]` sections from body.
+/// - No I/O — pure function, easily testable.
+fn plan_content_to_pr_parts(content: &str) -> Option<(String, String)> {
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    // Title is always line 1
+    let title = content.lines().next()?.to_string();
+    if title.trim().is_empty() {
+        return None;
+    }
+
+    // Body is everything after the metadata block (or after line 1 if no metadata)
+    let body = crate::markdown::remove_metadata(content);
+
+    // Strip [scratch] sections from the body
+    let body_stripped = crate::markdown::strip_scratch_sections(body);
+
+    // Trimmed body
+    let pr_body = body_stripped.trim().to_string();
+
+    Some((title, pr_body))
+}
+
 /// Extract PR title and body from pre-collected plan file entries.
 ///
-/// This avoids rescanning the plan directory per-segment — the caller
-/// collects plan files once and passes them in.
+/// Thin imperative shell: reads the file, delegates to `plan_content_to_pr_parts`.
 fn plan_file_to_pr_content_from_entries(
     plan_files: &[crate::plan_file::PlanFileEntry],
     plan_dir: &std::path::Path,
@@ -298,34 +326,7 @@ fn plan_file_to_pr_content_from_entries(
 
     let content = std::fs::read_to_string(plan_dir.join(&entry.filename)).ok()?;
 
-    if content.trim().is_empty() {
-        return None;
-    }
-
-    // First line = PR title
-    let mut lines = content.lines();
-    let title = lines.next()?.to_string();
-
-    if title.trim().is_empty() {
-        return None;
-    }
-
-    // Remainder = PR body
-    let body_raw: String = lines.collect::<Vec<_>>().join("\n");
-
-    // Strip [scratch] sections
-    let body_stripped = crate::markdown::strip_scratch_sections(&body_raw);
-
-    // Strip plan-status: ✅ lines
-    let body = body_stripped
-        .lines()
-        .filter(|line| !line.starts_with("plan-status: ✅"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
-
-    Some((title, body))
+    plan_content_to_pr_parts(&content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,4 +1159,62 @@ fn print_auth_help() {
     eprintln!("  jj stack auth gitlab setup   Show GitLab setup instructions");
     eprintln!("  jj stack auth gitea test     Test Gitea authentication");
     eprintln!("  jj stack auth gitea setup    Show Gitea setup instructions");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pr_parts_strips_metadata() {
+        let content = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nSome details.\n";
+        let (title, body) = plan_content_to_pr_parts(content).unwrap();
+        assert_eq!(title, "feat: my feature");
+        assert!(!body.contains("status:"), "metadata fields should not appear in PR body");
+        assert!(!body.contains("issue:"), "metadata fields should not appear in PR body");
+        assert!(body.contains("# Background"), "body content should be preserved");
+    }
+
+    #[test]
+    fn test_pr_parts_strips_scratch() {
+        let content = "feat: my feature\n\n# Background\n\nSome details.\n\n# Notes [scratch]\n\nPrivate notes.\n\n# Results\n\nFinal results.\n";
+        let (title, body) = plan_content_to_pr_parts(content).unwrap();
+        assert_eq!(title, "feat: my feature");
+        assert!(!body.contains("[scratch]"), "scratch sections should be stripped");
+        assert!(!body.contains("Private notes"), "scratch content should be stripped");
+        assert!(body.contains("# Results"), "non-scratch content should be preserved");
+    }
+
+    #[test]
+    fn test_pr_parts_preserves_linear_magic_words() {
+        let content = "feat: my feature\nstatus: 🔴\n---\n\nCompletes MERC-123\n\n# Details\n\nSome work.\n";
+        let (title, body) = plan_content_to_pr_parts(content).unwrap();
+        assert_eq!(title, "feat: my feature");
+        assert!(body.contains("Completes MERC-123"), "Linear magic words must survive to PR body");
+    }
+
+    #[test]
+    fn test_pr_parts_title_is_line_1() {
+        let content = "feat: actual title\nstatus: 🔴\n---\n\nBody text.\n";
+        let (title, _body) = plan_content_to_pr_parts(content).unwrap();
+        assert_eq!(title, "feat: actual title", "title should be line 1");
+    }
+
+    #[test]
+    fn test_pr_parts_empty_content() {
+        assert!(plan_content_to_pr_parts("").is_none());
+        assert!(plan_content_to_pr_parts("   \n\n  ").is_none());
+    }
+
+    #[test]
+    fn test_pr_parts_metadata_and_scratch_combined() {
+        let content = "feat: combined test\nstatus: 🔴\nissue: MERC-456\n---\n\n# Background\n\nVisible content.\n\n# Research [scratch]\n\nHidden research.\n\n# Implementation\n\nVisible impl.\n";
+        let (title, body) = plan_content_to_pr_parts(content).unwrap();
+        assert_eq!(title, "feat: combined test");
+        assert!(!body.contains("status:"), "no front matter in body");
+        assert!(!body.contains("[scratch]"), "no scratch in body");
+        assert!(!body.contains("Hidden research"), "scratch content removed");
+        assert!(body.contains("Visible content."), "non-scratch body preserved");
+        assert!(body.contains("Visible impl."), "non-scratch body preserved");
+    }
 }
