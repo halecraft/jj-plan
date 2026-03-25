@@ -463,9 +463,9 @@ pub fn strip_scratch_sections(input: &str) -> String {
 
             // Find where this section ends
             let mut end = parseable.len();
-            for j in (i + 1)..headings.len() {
-                if headings[j].level <= scratch_level {
-                    end = headings[j].start;
+            for (j, heading) in headings.iter().enumerate().skip(i + 1) {
+                if heading.level <= scratch_level {
+                    end = heading.start;
                     i = j; // continue scanning from this heading
                     break;
                 }

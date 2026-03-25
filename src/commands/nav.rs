@@ -44,7 +44,7 @@ pub fn plan_next(
     if current_idx >= targets.len() - 1 {
         eprintln!("Already at the last plan");
         workspace.reload();
-        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
+        crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
         return Ok(0);
     }
 
@@ -57,7 +57,7 @@ pub fn plan_next(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 
@@ -87,7 +87,7 @@ pub fn plan_prev(
     if current_idx == 0 {
         eprintln!("Already at the first plan");
         workspace.reload();
-        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
+        crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
         return Ok(0);
     }
 
@@ -100,7 +100,7 @@ pub fn plan_prev(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 
@@ -172,7 +172,7 @@ pub fn plan_go(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 

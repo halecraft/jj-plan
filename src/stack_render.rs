@@ -354,7 +354,7 @@ enum GutterMark {
 /// Returns spans like [ColumnConnector("│ "), Marker("○ ")] (2 chars per column).
 fn build_gutter(num_cols: usize, active_col: usize, mark: GutterMark, started: &[bool]) -> Vec<Span> {
     let mut spans = Vec::with_capacity(num_cols);
-    for col in 0..num_cols {
+    for (col, &is_started) in started.iter().enumerate().take(num_cols) {
         if col == active_col {
             match mark {
                 GutterMark::Node => spans.push(Span::new("○ ", Style::ColumnConnector(col))),
@@ -366,7 +366,7 @@ fn build_gutter(num_cols: usize, active_col: usize, mark: GutterMark, started: &
                     spans.push(Span::plain("  "))
                 }
             }
-        } else if started[col] {
+        } else if is_started {
             spans.push(Span::new("│ ", Style::ColumnConnector(col)));
         } else {
             spans.push(Span::plain("  "));
@@ -770,11 +770,10 @@ pub fn prepare_display_rows(
             if is_synced {
                 indicators.push("synced".to_string());
             }
-            if let Some(cache) = pr_cache {
-                if let Some(cached_pr) = cache.get(bookmark_name) {
+            if let Some(cache) = pr_cache
+                && let Some(cached_pr) = cache.get(bookmark_name) {
                     indicators.push(format!("PR #{}", cached_pr.number));
                 }
-            }
             // Surface `issue` from metadata as an indicator
             if let Some(issue) = metadata.get("issue") {
                 indicators.push(issue.clone());

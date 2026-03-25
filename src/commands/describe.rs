@@ -59,12 +59,12 @@ pub fn handle_describe(
             // Fallback for legacy change-ID-named files: try prefix match
             // against the raw filename content (everything between NN- and .md).
             // This handles the migration period where old files still exist.
-            let raw_match = plan_files.iter().find(|e| {
+            
+            plan_files.iter().find(|e| {
                 // The bookmark_name field may contain a decoded legacy change ID
                 change_id.starts_with(&e.bookmark_name)
                     || e.bookmark_name.starts_with(change_id.as_str())
-            });
-            raw_match
+            })
         };
 
         if let Some(entry) = entry {
@@ -224,14 +224,13 @@ fn resolve_bookmark_for_change(workspace: &Workspace, short_change_id: &str) -> 
     // by asking the workspace to resolve the bookmark name as a revset.
     let bookmarks = workspace.local_bookmarks();
     for bm in &bookmarks {
-        if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id) {
-            if bm_short == short_change_id
+        if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id)
+            && (bm_short == short_change_id
                 || short_change_id.starts_with(&bm_short)
-                || bm_short.starts_with(short_change_id)
+                || bm_short.starts_with(short_change_id))
             {
                 return Some(bm.name.clone());
             }
-        }
     }
     None
 }

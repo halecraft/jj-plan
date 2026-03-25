@@ -89,8 +89,7 @@ pub fn load_pr_cache(workspace_root: &Path) -> Result<PrCache> {
     }
 
     let content = fs::read_to_string(&path).map_err(|e| {
-        JjPlanError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        JjPlanError::Io(std::io::Error::other(
             format!("failed to read {}: {e}", path.display()),
         ))
     })?;

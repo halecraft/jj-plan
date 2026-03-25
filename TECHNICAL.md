@@ -35,7 +35,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/workspace.rs` | 1045 | Unified jj-lib wrapper: reads + git write operations |
 | `src/stack_render.rs` | 1075 | Pure stack rendering: Span/Style model, multi-column layout, ANSI/plain/markdown formatting |
 | `src/stack_builder.rs` | 1477 | Stack construction, gap detection, `collect_submission_chain()` |
-| `src/wrap.rs` | 407 | Wrap lifecycle, `resolve_and_sync()`, `resolve_sync_and_show()`, `StackDisplayData`, `SyncChangeView` |
+| `src/wrap.rs` | ~500 | Wrap lifecycle, three-tier sync (`sync_to_disk`, `sync_and_show`, `full_sync_and_show`), `find_stale_bookmarks()`, `StackDisplayData`, `SyncChangeView` |
 | `src/flush.rs` | 298 | Plan file → jj description sync (file is authoritative) |
 | `src/sync.rs` | 587 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
 | `src/plan_file.rs` | 574 | Plan file parsing, bookmark name encoding, legacy migration |
@@ -137,7 +137,7 @@ This range is evaluated via jj-lib's in-process revset engine. The result is wal
 
 ### Single-stack rendering (hot path)
 
-The rendering pipeline (terminal output + `stack.md`) uses the same `build_stack()` result as the sync pipeline. In `resolve_and_sync()`, the stack is built once and forked into two consumers:
+The rendering pipeline (terminal output + `stack.md`) uses the same `build_stack()` result as the sync pipeline. In `sync_to_disk()`, the stack is built once and forked into two consumers:
 
 1. **Sync views** (`stack_to_sync_changes`): Flat list of `SyncChangeView`s for plan file I/O.
 2. **Rendering** (`build_column_from_stack`): Converts the `Stack` into a single `StackColumn` for the Span-based rendering pipeline (`render_stack` → `format_markdown`/`format_ansi`).
@@ -205,7 +205,7 @@ When `build_stack()` receives a `PlanRegistry`, only bookmarks registered in the
 
 ### Auto-cleanup of merged stacks
 
-After every mutating command (via `wrap()`), `auto_cleanup_merged_stacks()` scans for explicit stacks whose base change ID is an ancestor of `trunk()`. These stacks have been fully merged — their plans are untracked from the registry and their base bookmarks are deleted automatically.
+After every mutating command (via `wrap()`), `auto_cleanup_merged_stacks()` scans for explicit stacks whose base change ID is an ancestor of `trunk()`. These stacks have been fully merged — their plans are untracked from the registry and their base bookmarks are deleted automatically. The function loads the registry once, accumulates all bookmark names to untrack across all merged stacks, then applies mutations in a single post-loop pass (untrack + save + delete base bookmarks). A final `sync_to_disk` call ensures plan files are cleaned up immediately.
 
 **Important**: Change IDs stored in the registry (`PlannedBookmark.change_id`) use standard hex encoding (`commit.change_id().hex()`). jj revsets require reverse-hex encoding. Any code embedding registry change IDs into revsets must convert via `Workspace::short_change_id_from_hex()` first.
 
@@ -258,7 +258,13 @@ args[1] match:
 
 ## Flush/Sync Lifecycle
 
-The wrap lifecycle is the core mechanism that keeps plan files and jj descriptions in sync.
+The wrap lifecycle is the core mechanism that keeps plan files and jj descriptions in sync. The `wrap()` function in `src/wrap.rs` orchestrates 6 phases for every mutating command:
+
+1. **Flush** — plan file → jj description (`flush_all`)
+2. **Run** — execute the real jj command
+3. **Reload** — `workspace.reload()`
+4. **Full sync & show** — stale-bookmark cleanup + legacy migration + sync + display (`full_sync_and_show`)
+5. **Auto-cleanup** — remove merged stacks (`auto_cleanup_merged_stacks`)
 
 ### Phase 1: Flush (`src/flush.rs`)
 
@@ -281,7 +287,26 @@ The real `jj` command runs with inherited stdio. Its exit code is captured.
 
 `workspace.reload()` refreshes the cached `Arc<ReadonlyRepo>` to reflect the command's mutations.
 
-### Phase 4: Sync (`src/sync.rs`)
+### Phase 4: Full sync & show (`full_sync_and_show`)
+
+This phase is handled by `full_sync_and_show()`, the batteries-included sync function for user-facing command paths. It performs four sub-steps:
+
+1. **Detect stale bookmarks** (`find_stale_bookmarks`, pure): identify registry entries whose bookmarks no longer exist in jj (e.g. deleted by `jj abandon`). Untrack and save if any found.
+2. **Migrate legacy filenames** (`plan_file::migrate_legacy_filenames`): rename old change-ID-based filenames to bookmark-named files.
+3. **Sync to disk** (`sync_to_disk`): build the @-relative stack, fork into sync views + rendering, call `sync::sync()`.
+4. **Show stack** (`show_plan_stack`): render the stack visualization to the terminal.
+
+### Three-tier sync functions
+
+`wrap.rs` provides three sync functions, each a strict superset of the one below:
+
+| Function | Does | Used by |
+|---|---|---|
+| `sync_to_disk(plan_dir, workspace, registry) → Option<StackDisplayData>` | Build stack, sync plan files, return display data. No registry mutations or stderr output. | Internal paths needing display data (`auto_cleanup_merged_stacks`, `run_merge_async`, `run_done_single`) |
+| `sync_and_show(plan_dir, workspace, registry, format)` | `sync_to_disk` + `show_plan_stack`. | Internal re-sync paths where stale-bookmark detection is not needed (`run_stack_untrack`, `run_untrack`) |
+| `full_sync_and_show(plan_dir, workspace, registry, format)` | Stale-bookmark cleanup + legacy migration + `sync_and_show`. | User-facing command paths after mutations (`wrap`, `dispatch_stack`, `plan_next/prev/go`, `run_done`, `run_new`, `run_track`) |
+
+### Sync internals (`src/sync.rs`)
 
 **Direction:** jj description → plan file.
 
@@ -296,20 +321,20 @@ Uses a **gather → plan → execute** architecture:
    - File summary for `stack.md` (received as opaque `Option<&str>` from the caller — sync writes but does not generate this content).
 3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`.
 
-Note: `resolve_and_sync` in `wrap.rs` builds the @-relative stack once via `build_current_stack()` and forks it into two consumers: `stack_to_sync_changes()` for plan file sync and `build_column_from_stack()` for rendering. The rendered `stack.md` content is passed to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second traversal is needed. `build_multi_stack()` is never called on this path.
+Note: `sync_to_disk` in `wrap.rs` builds the @-relative stack once via `build_current_stack()` and forks it into two consumers: `stack_to_sync_changes()` for plan file sync and `build_column_from_stack()` for rendering. The rendered `stack.md` content is passed to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second traversal is needed. `build_multi_stack()` is never called on this path.
 
 `SyncChangeView` remains thin — it stores only the raw description string. Plan-awareness (metadata parsing, `is_done` checks) is accessed on demand via `PlanDocument::parse()` at consumer boundaries, not pre-cached on adapter types. This avoids sync hazards where a cached `metadata` field could desync from the `description` after mutations.
 
 ### Phase 5: Show stack
 
-Display the plan stack using pre-gathered `StackDisplayData` from `resolve_and_sync`. `show_plan_stack` accepts `Option<&StackDisplayData>` and a `StackFormat` parameter — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
+Display the plan stack using pre-gathered `StackDisplayData` from `sync_to_disk`. `show_plan_stack` accepts `Option<&StackDisplayData>` and a `StackFormat` parameter — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
 
 Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack(columns, format)` in `stack_render.rs`. The `StackFormat` enum controls layout density:
 
 - **`Compact`** (default for terminal): 1 line per plan — description appended inline on the node line. No `│` connector lines, no blank spacers, no leading blank line.
 - **`Regular`** (default for `stack.md`): 3 lines per plan — node line, `│` description line, blank spacer. This is the original pre-compact format.
 
-`resolve_and_sync` hardcodes `StackFormat::Regular` for its `stack.md` rendering call. The format parameter is threaded from `main.rs` (where `resolved_stack_format()` reads `JJ_PLAN_STACK_FORMAT` once) through `wrap`, `dispatch_plan`, `dispatch_stack`, and all sub-command functions to `show_plan_stack` and `render_stack`. `jj stack --format=compact|regular` overrides the env-derived default for that invocation via `parse_stack_dispatch_args`.
+`sync_to_disk` hardcodes `StackFormat::Regular` for its `stack.md` rendering call. The format parameter is threaded from `main.rs` (where `resolved_stack_format()` reads `JJ_PLAN_STACK_FORMAT` once) through `wrap`, `dispatch_plan`, `dispatch_stack`, and all sub-command functions to `show_plan_stack` and `render_stack`. `jj stack --format=compact|regular` overrides the env-derived default for that invocation via `parse_stack_dispatch_args`.
 
 #### Terminal view (printed to stderr)
 
@@ -399,7 +424,7 @@ At registration time (`jj plan new`, `jj plan track`), the `PlanRegistry::would_
 
 ### Legacy migration
 
-Files matching the old `NN-CHANGEID.md` pattern (8+ chars of `[k-z]` reverse-hex) are automatically renamed to the new format during `resolve_and_sync()`.
+Files matching the old `NN-CHANGEID.md` pattern (8+ chars of `[k-z]` reverse-hex) are automatically renamed to the new format during `full_sync_and_show()`.
 
 ---
 
@@ -615,11 +640,12 @@ All platform `check_merge_readiness` implementations are single-shot observation
 
 ### Post-merge cleanup (in `stack_cmd.rs`)
 
-After successful merges:
-1. Remove merged bookmarks from PR cache.
-2. Delete merged local bookmarks via `workspace.delete_bookmark()`.
-3. Remove merged plan files from `.jj-plan/`.
-4. Fetch updated trunk via `workspace.git_fetch()`.
+After successful merges, `run_merge_async` performs cleanup in two passes to avoid interleaving registry mutation with workspace mutation:
+
+1. **Registry + cache pass**: For each merged bookmark, `pr_cache.remove()` + `registry_mut.untrack()`. Save registry and cache once after the loop.
+2. **Bookmark deletion pass**: For each merged bookmark, `workspace.delete_bookmark()`.
+3. **Fetch**: `workspace.git_fetch()` to get updated trunk.
+4. **Sync**: `sync_to_disk()` to remove orphaned plan files — plan file cleanup is delegated to `sync::sync()` rather than done manually. This matches the pattern used by `auto_cleanup_merged_stacks`.
 
 ---
 

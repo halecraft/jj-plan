@@ -287,7 +287,7 @@ pub fn run_new(
     }
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }
@@ -320,11 +320,10 @@ fn inherit_stack_from_parent(workspace: &Workspace, registry: &PlanRegistry) -> 
 
     // Check if any of the parent's bookmarks are tracked with a stack value
     for bm_name in &parent_entry.local_bookmarks {
-        if let Some(planned) = registry.get(bm_name) {
-            if planned.stack.is_some() {
+        if let Some(planned) = registry.get(bm_name)
+            && planned.stack.is_some() {
                 return planned.stack.clone();
             }
-        }
     }
 
     None

@@ -111,6 +111,7 @@ impl SubmissionPlan {
 /// Stack comment steps are NOT emitted here — they require PR numbers
 /// from freshly-created PRs, so they are added in a second pass after
 /// execution. See `run_submit_async` in `stack_cmd.rs`.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_submission_plan(
     analysis: &SubmissionAnalysis,
     platform: &dyn PlatformService,
@@ -147,8 +148,8 @@ pub async fn create_submission_plan(
 
             // Check if description needs updating (requires fetching full PR details
             // because find_existing_pr returns PullRequest which has no body field).
-            if update_descriptions {
-                if let Some((_, plan_title, plan_body)) =
+            if update_descriptions
+                && let Some((_, plan_title, plan_body)) =
                     pr_content.iter().find(|(b, _, _)| b == bookmark)
                 {
                     let details = platform.get_pr_details(pr.number).await?;
@@ -163,7 +164,6 @@ pub async fn create_submission_plan(
                         });
                     }
                 }
-            }
 
             // Check if draft PR should be published.
             // Only publish PRs that were already drafts — don't publish PRs

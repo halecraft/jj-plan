@@ -116,7 +116,7 @@ pub fn run_track(
     eprintln!("Tracking plan: {} (jj:{})", bookmark_name, bookmark.change_id);
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }

@@ -114,7 +114,7 @@ fn group_bookmarks_by_ancestry(
     let n = bookmark_commit_ids.len();
     let mut parent_uf: Vec<usize> = (0..n).collect();
 
-    fn find(parent: &mut Vec<usize>, mut x: usize) -> usize {
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
         while parent[x] != x {
             parent[x] = parent[parent[x]];
             x = parent[x];
@@ -122,7 +122,7 @@ fn group_bookmarks_by_ancestry(
         x
     }
 
-    fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
+    fn union(parent: &mut [usize], a: usize, b: usize) {
         let ra = find(parent, a);
         let rb = find(parent, b);
         if ra != rb {
@@ -147,11 +147,10 @@ fn group_bookmarks_by_ancestry(
                 continue;
             }
             // If this commit is another bookmark (not ourselves), union
-            if let Some(&j) = commit_to_bm_idx.get(cid) {
-                if j != i {
+            if let Some(&j) = commit_to_bm_idx.get(cid)
+                && j != i {
                     union(&mut parent_uf, i, j);
                 }
-            }
             // Walk parents that are in our commit map
             if let Some(entry) = commit_map.get(cid) {
                 for parent_cid in &entry.parents {

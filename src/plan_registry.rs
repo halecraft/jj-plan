@@ -89,8 +89,8 @@ pub fn save_registry(workspace_root: &Path, registry: &PlanRegistry) {
     let path = dir.join(REGISTRY_FILE);
 
     // Ensure directory exists
-    if !dir.exists() {
-        if let Err(e) = fs::create_dir_all(&dir) {
+    if !dir.exists()
+        && let Err(e) = fs::create_dir_all(&dir) {
             eprintln!(
                 "jj-plan: warning: failed to create {}: {}",
                 dir.display(),
@@ -98,7 +98,6 @@ pub fn save_registry(workspace_root: &Path, registry: &PlanRegistry) {
             );
             return;
         }
-    }
 
     // Serialize with version
     let mut registry_to_save = registry.clone();

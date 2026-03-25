@@ -24,18 +24,16 @@ pub fn generate_stack_comment(
     chain: &[(String, u64, String)], // (bookmark, pr_number, title)
     current_bookmark: &str,
 ) -> String {
-    let mut lines = Vec::new();
-
-    // Marker (invisible in rendered markdown)
-    lines.push(STACK_COMMENT_MARKER.to_string());
-
-    // Header
-    lines.push("### Stack".to_string());
-    lines.push(String::new());
-
-    // Table header
-    lines.push("| | PR | Plan |".to_string());
-    lines.push("|---|---|---|".to_string());
+    let mut lines = vec![
+        // Marker (invisible in rendered markdown)
+        STACK_COMMENT_MARKER.to_string(),
+        // Header
+        "### Stack".to_string(),
+        String::new(),
+        // Table header
+        "| | PR | Plan |".to_string(),
+        "|---|---|---|".to_string(),
+    ];
 
     // Table rows (1-indexed, trunk-to-tip order)
     for (i, (bookmark, pr_number, title)) in chain.iter().enumerate() {

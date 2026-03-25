@@ -361,12 +361,8 @@ fn scan_leading_globals(args: &[String]) -> Option<(Option<ColorWhen>, usize)> {
 
         match arg {
             "--color" => {
-                let Some(value) = args.get(idx + 1) else {
-                    return None;
-                };
-                let Some(parsed) = ColorWhen::parse(value) else {
-                    return None;
-                };
+                let value = args.get(idx + 1)?;
+                let parsed = ColorWhen::parse(value)?;
                 color_override = Some(parsed);
                 idx += 2;
             }

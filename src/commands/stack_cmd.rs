@@ -128,8 +128,11 @@ pub fn dispatch_stack(
     if parsed.show_all {
         crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
         workspace.reload();
-        // Sync plan files for current stack first (so plan dir is up to date)
-        let _ = crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+        // Sync plan files for current stack first (so plan dir is up to date).
+        // Uses full_sync_and_show for stale-bookmark cleanup, but the
+        // single-stack display it produces is immediately followed by the
+        // multi-stack display from show_all_stacks.
+        crate::wrap::full_sync_and_show(plan_dir, workspace, registry, effective_format);
         show_all_stacks(plan_dir, workspace, registry, effective_format);
         return Ok(0);
     }
@@ -139,7 +142,7 @@ pub fn dispatch_stack(
             // Bare `jj stack` — flush pending edits, sync plan files, then show visualization.
             crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
             workspace.reload();
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, effective_format);
+            crate::wrap::full_sync_and_show(plan_dir, workspace, registry, effective_format);
             Ok(0)
         }
         Some("submit") => run_submit(workspace, &args[1..], registry),
@@ -231,11 +234,10 @@ fn run_stack_untrack(
     plan_registry::save_registry(&repo_root, &registry_mut);
 
     // 6. Delete the stack base bookmark if one exists
-    if let Some(ref bb) = base_bookmark {
-        if let Err(e) = workspace.delete_bookmark(bb) {
+    if let Some(ref bb) = base_bookmark
+        && let Err(e) = workspace.delete_bookmark(bb) {
             eprintln!("jj stack untrack: warning: failed to delete bookmark '{}': {}", bb, e);
         }
-    }
 
     // 7. Show summary
     eprintln!("Untracked {} plan(s):", plan_names.len());
@@ -249,7 +251,7 @@ fn run_stack_untrack(
     // 8. Sync and show updated state
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }
@@ -505,10 +507,11 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
         })?;
 
     rt.block_on(async {
-        run_submit_async(workspace, &repo_root, &registry, &target, remote_override, dry_run, draft, update_descriptions, publish, no_comments).await
+        run_submit_async(workspace, &repo_root, registry, &target, remote_override, dry_run, draft, update_descriptions, publish, no_comments).await
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_submit_async(
     workspace: &mut Workspace,
     repo_root: &std::path::Path,
@@ -610,13 +613,12 @@ async fn run_submit_async(
             })
             .collect();
 
-        if !push_bookmarks.is_empty() {
-            if let Err(e) = workspace.git_fetch_bookmarks(&ctx.remote_name, &push_bookmarks) {
+        if !push_bookmarks.is_empty()
+            && let Err(e) = workspace.git_fetch_bookmarks(&ctx.remote_name, &push_bookmarks) {
                 // Fetch failure is non-fatal — push may still succeed if
                 // tracking state happens to be correct.
                 eprintln!("Warning: pre-push fetch failed: {e}");
             }
-        }
     }
 
     // Execute — use NoopProgress for dry-run to avoid duplicating messages
@@ -631,11 +633,10 @@ async fn run_submit_async(
     let result = execute_submission(&plan, workspace, ctx.platform.as_ref(), &mut pr_cache, progress, dry_run).await?;
 
     // Save PR cache if we made changes
-    if !dry_run && (!result.created.is_empty() || !result.updated.is_empty()) {
-        if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
+    if !dry_run && (!result.created.is_empty() || !result.updated.is_empty())
+        && let Err(e) = save_pr_cache(repo_root, &pr_cache) {
             eprintln!("Warning: failed to save PR cache: {e}");
         }
-    }
 
     // --- Pass 2: Stack comments ---
     // Comment steps depend on PR numbers from freshly-created PRs,
@@ -728,11 +729,10 @@ async fn run_submit_async(
     if !result.published.is_empty() {
         eprintln!("Published {} PR(s)", result.published.len());
     }
-    if let Some(ref cr) = comment_result {
-        if !cr.comments.is_empty() {
+    if let Some(ref cr) = comment_result
+        && !cr.comments.is_empty() {
             eprintln!("Updated {} stack comment(s)", cr.comments.len());
         }
-    }
     if !result.errors.is_empty() {
         eprintln!("Errors:");
         for err in &result.errors {
@@ -740,14 +740,13 @@ async fn run_submit_async(
         }
         return Ok(1);
     }
-    if let Some(ref cr) = comment_result {
-        if !cr.errors.is_empty() {
+    if let Some(ref cr) = comment_result
+        && !cr.errors.is_empty() {
             eprintln!("Comment errors:");
             for err in &cr.errors {
                 eprintln!("  {err}");
             }
         }
-    }
 
     Ok(0)
 }
@@ -958,31 +957,26 @@ async fn run_merge_async(
             merge_result.merged_bookmarks.join(", ")
         );
 
-        // Post-merge cleanup
+        // Post-merge cleanup: registry + cache mutations first, then bookmark deletions.
+        // Plan file removal is handled by sync::sync() via the sync_to_disk call below.
         let mut pr_cache = ctx.pr_cache;
-        // Untrack merged bookmarks from the registry (fixes orphan entries in plans.toml)
         let mut registry_mut = crate::plan_registry::load_registry(repo_root);
         for bookmark in &merge_result.merged_bookmarks {
             pr_cache.remove(bookmark);
             registry_mut.untrack(bookmark);
-
-            // Delete local bookmark
-            if let Err(e) = workspace.delete_bookmark(bookmark) {
-                eprintln!("Warning: failed to delete bookmark {bookmark}: {e}");
-            }
-
-            // Remove plan file
-            let plan_dir = repo_root.join(".jj-plan");
-            let plan_files = crate::plan_file::collect_plan_files(&plan_dir, &registry_mut);
-            if let Some(entry) = plan_files.iter().find(|f| f.bookmark_name == *bookmark) {
-                let _ = std::fs::remove_file(plan_dir.join(&entry.filename));
-            }
         }
         crate::plan_registry::save_registry(repo_root, &registry_mut);
 
-        // Save updated PR cache
         if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
             eprintln!("Warning: failed to save PR cache: {e}");
+        }
+
+        // Delete local bookmarks (separate pass — avoids interleaving
+        // registry mutation with workspace mutation).
+        for bookmark in &merge_result.merged_bookmarks {
+            if let Err(e) = workspace.delete_bookmark(bookmark) {
+                eprintln!("Warning: failed to delete bookmark {bookmark}: {e}");
+            }
         }
 
         // Fetch to get updated trunk
@@ -991,6 +985,14 @@ async fn run_merge_async(
             eprintln!("Warning: failed to fetch after merge: {e}");
         } else {
             workspace.reload();
+        }
+
+        // Sync plan files: removes orphaned plan files for the just-untracked
+        // bookmarks and updates stack.md. Without this, cleanup would be
+        // deferred to the next command's sync cycle.
+        let plan_dir = crate::plan_dir::resolve_plan_dir(Some(repo_root));
+        if let Some(ref pd) = plan_dir {
+            let _ = crate::wrap::sync_to_disk(pd, workspace, &registry_mut);
         }
     }
 

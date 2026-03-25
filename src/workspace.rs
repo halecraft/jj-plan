@@ -428,7 +428,7 @@ impl Workspace {
     pub fn resolve_change_id(&self, target: &str) -> Option<String> {
         let commits = self.evaluate_revset(target)?;
         let commit = commits.first()?;
-        Some(short_change_id(&self.repo, &commit))
+        Some(short_change_id(&self.repo, commit))
     }
 
     /// Check whether a commit identified by a revset target exists.
@@ -448,7 +448,7 @@ impl Workspace {
         let revset_str = format!("children({}) ~ {}", change_id, change_id);
         let commits = self.evaluate_revset(&revset_str)?;
         let commit = commits.last()?; // reversed = parents first, so last is earliest child
-        Some(short_change_id(&self.repo, &commit))
+        Some(short_change_id(&self.repo, commit))
     }
 
     // -----------------------------------------------------------------------
@@ -539,11 +539,10 @@ impl Workspace {
     /// Get the default branch name by checking remote HEAD first, then common names.
     pub fn default_branch(&self) -> String {
         // Try to detect from git remote HEAD
-        if let Ok(git_repo) = git::get_git_repo(self.repo.store()) {
-            if let Some((branch, _)) = detect_default_branch_from_remote(&git_repo) {
+        if let Ok(git_repo) = git::get_git_repo(self.repo.store())
+            && let Some((branch, _)) = detect_default_branch_from_remote(&git_repo) {
                 return branch;
             }
-        }
 
         // Fall back to checking local bookmarks for common names
         let view = self.repo.view();
@@ -954,26 +953,26 @@ pub fn select_remote(
 #[derive(Debug)]
 #[allow(dead_code)] // Variants hold jj-lib errors for type-safe From impls; inner fields used only via Debug.
 enum OpResolveError {
-    OpHeadResolution(jj_lib::op_heads_store::OpHeadResolutionError),
-    OpHeadsStore(jj_lib::op_heads_store::OpHeadsStoreError),
-    OpStore(jj_lib::op_store::OpStoreError),
+    HeadResolution(jj_lib::op_heads_store::OpHeadResolutionError),
+    HeadsStore(jj_lib::op_heads_store::OpHeadsStoreError),
+    Store(jj_lib::op_store::OpStoreError),
 }
 
 impl From<jj_lib::op_heads_store::OpHeadResolutionError> for OpResolveError {
     fn from(e: jj_lib::op_heads_store::OpHeadResolutionError) -> Self {
-        Self::OpHeadResolution(e)
+        Self::HeadResolution(e)
     }
 }
 
 impl From<jj_lib::op_heads_store::OpHeadsStoreError> for OpResolveError {
     fn from(e: jj_lib::op_heads_store::OpHeadsStoreError) -> Self {
-        Self::OpHeadsStore(e)
+        Self::HeadsStore(e)
     }
 }
 
 impl From<jj_lib::op_store::OpStoreError> for OpResolveError {
     fn from(e: jj_lib::op_store::OpStoreError) -> Self {
-        Self::OpStore(e)
+        Self::Store(e)
     }
 }
 
@@ -1003,13 +1002,11 @@ fn build_minimal_config(repo_root: &Path) -> Option<StackedConfig> {
 
     // Load repo-level config if it exists (may contain revset-aliases.trunk())
     let repo_config_path = repo_root.join(".jj").join("repo").join("config.toml");
-    if repo_config_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&repo_config_path) {
-            if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+    if repo_config_path.is_file()
+        && let Ok(content) = std::fs::read_to_string(&repo_config_path)
+            && let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
                 config.add_layer(ConfigLayer::with_data(ConfigSource::Repo, doc));
             }
-        }
-    }
 
     // Load user config (~/.jjconfig.toml or XDG equivalent)
     if let Some(user_config) = load_user_config() {
@@ -1022,22 +1019,19 @@ fn build_minimal_config(repo_root: &Path) -> Option<StackedConfig> {
 /// Attempt to load the user's jj config file.
 fn load_user_config() -> Option<ConfigLayer> {
     // Check JJ_CONFIG env var first
-    if let Ok(path) = std::env::var("JJ_CONFIG") {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+    if let Ok(path) = std::env::var("JJ_CONFIG")
+        && let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
                 return Some(ConfigLayer::with_data(ConfigSource::User, doc));
             }
-        }
-    }
 
     // Standard locations: ~/.jjconfig.toml
     if let Some(home) = home_dir() {
         let path = home.join(".jjconfig.toml");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
                 return Some(ConfigLayer::with_data(ConfigSource::User, doc));
             }
-        }
     }
 
     // XDG: $XDG_CONFIG_HOME/jj/config.toml
@@ -1047,11 +1041,10 @@ fn load_user_config() -> Option<ConfigLayer> {
         .or_else(|| home_dir().map(|h| h.join(".config")));
     if let Some(xdg) = xdg_config {
         let path = xdg.join("jj").join("config.toml");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {
                 return Some(ConfigLayer::with_data(ConfigSource::User, doc));
             }
-        }
     }
 
     None

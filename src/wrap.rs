@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
@@ -7,7 +9,7 @@ use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 use crate::sync;
 
-/// Pre-gathered display data returned by `resolve_and_sync` for reuse by
+/// Pre-gathered display data returned by `sync_to_disk` for reuse by
 /// `show_plan_stack`. Avoids a second GATHER traversal of the repository.
 pub struct StackDisplayData {
     pub columns: Vec<StackColumn>,
@@ -40,27 +42,16 @@ pub fn wrap(
     let status = jj.run_inherit_strings(args)?;
     let exit_code = status.code().unwrap_or(1);
 
-    // 3-5. Reload repo, re-resolve stack, sync plan files
+    // 3-5. Reload repo, untrack stale bookmarks, migrate legacy filenames,
+    //      sync plan files, show stack
     workspace.reload();
-    let gathered = resolve_and_sync(plan_dir, workspace, registry);
+    full_sync_and_show(plan_dir, workspace, registry, format);
 
-    // 6. Display the plan stack
-    show_plan_stack(plan_dir, gathered.as_ref(), format);
-
-    // 7. Auto-cleanup merged stacks (registry + base bookmarks behind trunk)
+    // 6. Auto-cleanup merged stacks (registry + base bookmarks behind trunk)
     auto_cleanup_merged_stacks(workspace, plan_dir);
 
     Ok(exit_code)
 }
-
-/// Canonical post-mutation sync: build stack → sync plan files.
-///
-/// This is the single entry point for "re-read jj state and update plan files
-/// after a mutation". Does NOT display anything — callers that want to show
-/// the stack should follow up with `show_plan_stack()`.
-///
-/// Callers must call `workspace.reload()` after CLI mutations before
-/// calling this.
 
 /// Auto-cleanup stacks whose base change is behind trunk (fully merged).
 ///
@@ -72,16 +63,15 @@ pub fn wrap(
 /// are cleaned up automatically without user intervention.
 pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir) {
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-    let registry = plan_registry::load_registry(&repo_root);
+    let mut registry = plan_registry::load_registry(&repo_root);
 
     // Collect unique explicit stack IDs (standard hex change IDs of stack bases)
     let mut stack_ids: Vec<String> = Vec::new();
     for bm in &registry.bookmarks {
-        if let Some(ref sid) = bm.stack {
-            if !stack_ids.contains(sid) {
+        if let Some(ref sid) = bm.stack
+            && !stack_ids.contains(sid) {
                 stack_ids.push(sid.clone());
             }
-        }
     }
 
     if stack_ids.is_empty() {
@@ -89,7 +79,11 @@ pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir)
     }
 
     let stack_prefix = plan_dir::stack_prefix();
-    let mut cleaned_any = false;
+
+    // Accumulate all mutations across merged stacks, then apply once.
+    let mut bookmarks_to_untrack: Vec<String> = Vec::new();
+    let mut base_bookmarks_to_delete: Vec<String> = Vec::new();
+    let mut cleaned_stack_names: Vec<String> = Vec::new();
 
     for stack_id in &stack_ids {
         // Convert standard hex change ID to reverse-hex for use in revsets.
@@ -111,7 +105,7 @@ pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir)
             continue;
         }
 
-        // This stack has been fully merged — clean it up
+        // This stack has been fully merged — collect its plans for cleanup
         let plans = registry.plans_in_stack(Some(stack_id));
         if plans.is_empty() {
             continue;
@@ -129,94 +123,83 @@ pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir)
             .map(|b| b.name.strip_prefix(&stack_prefix).unwrap_or(&b.name).to_string())
             .unwrap_or_else(|| plan_names.first().cloned().unwrap_or_default());
 
-        // Untrack all plans in this stack
-        let mut registry_mut = plan_registry::load_registry(&repo_root);
-        for name in &plan_names {
-            registry_mut.untrack(name);
-        }
-        plan_registry::save_registry(&repo_root, &registry_mut);
+        bookmarks_to_untrack.extend(plan_names);
 
-        // Delete the stack base bookmark if one exists.
-        // Scope to the bookmark whose change_id matches this stack_id.
-        let base_bm: Option<String> = workspace
+        // Collect the stack base bookmark for deletion (if one exists).
+        if let Some(base_bm) = workspace
             .local_bookmarks()
             .iter()
             .find(|b| b.name.starts_with(&stack_prefix) && b.change_id == *stack_id)
-            .map(|b| b.name.clone());
-
-        if let Some(ref bb) = base_bm {
-            let _ = workspace.delete_bookmark(bb);
+            .map(|b| b.name.clone())
+        {
+            base_bookmarks_to_delete.push(base_bm);
         }
 
-        eprintln!("jj-plan: auto-cleaned stack '{}' (merged to trunk)", stack_name);
-        cleaned_any = true;
+        cleaned_stack_names.push(stack_name);
     }
 
-    if cleaned_any {
-        // Re-sync after cleanup so plan files reflect the updated registry.
-        // The return value (display data) is intentionally discarded — this
-        // is a background cleanup, not a user-facing display path.
-        workspace.reload();
-        let post_registry = plan_registry::load_registry(&repo_root);
-        let _ = resolve_and_sync(plan_dir, workspace, &post_registry);
+    if bookmarks_to_untrack.is_empty() {
+        return;
     }
+
+    // Apply all mutations once: untrack plans, save registry, delete base bookmarks.
+    for name in &bookmarks_to_untrack {
+        registry.untrack(name);
+    }
+    plan_registry::save_registry(&repo_root, &registry);
+
+    for bb in &base_bookmarks_to_delete {
+        let _ = workspace.delete_bookmark(bb);
+    }
+
+    for stack_name in &cleaned_stack_names {
+        eprintln!("jj-plan: auto-cleaned stack '{}' (merged to trunk)", stack_name);
+    }
+
+    // Re-sync after cleanup so plan files reflect the updated registry.
+    // Uses sync_to_disk (not full_sync_and_show) because stale bookmarks
+    // were just cleaned — no stale check needed.
+    workspace.reload();
+    let _ = sync_to_disk(plan_dir, workspace, &registry);
 }
 
-pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) -> Option<StackDisplayData> {
-    debug_log!("resolve_and_sync(plan_dir={:?})", plan_dir.path);
+// ---------------------------------------------------------------------------
+// Pure function: identify stale registry entries
+// ---------------------------------------------------------------------------
 
-    let max_stack_size = crate::plan_dir::plan_max();
-
-    // Auto-untrack registry entries whose bookmarks no longer exist in jj.
-    // When `jj abandon` deletes a bookmark (the default behavior without
-    // --retain-bookmarks), the registry entry becomes stale. Clean it up
-    // so the plan file disappears on the next sync cycle.
-    let all_bookmarks = workspace.local_bookmarks();
-    let live_bookmark_names: std::collections::HashSet<&str> = all_bookmarks
-        .iter()
-        .map(|b| b.name.as_str())
-        .collect();
-
-    let stale: Vec<String> = registry
+/// Pure: identify registry entries whose bookmarks no longer exist in jj.
+///
+/// Returns the names of bookmarks that are tracked in the registry but
+/// absent from the live bookmark set. The caller decides whether to
+/// untrack them and persist the change.
+pub fn find_stale_bookmarks(
+    registry: &PlanRegistry,
+    live_bookmark_names: &HashSet<&str>,
+) -> Vec<String> {
+    registry
         .bookmarks
         .iter()
         .filter(|b| !live_bookmark_names.contains(b.name.as_str()))
         .map(|b| b.name.clone())
-        .collect();
+        .collect()
+}
 
-    if !stale.is_empty() {
-        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-        let mut registry_mut = plan_registry::load_registry(&repo_root);
-        for name in &stale {
-            registry_mut.untrack(name);
-        }
-        plan_registry::save_registry(&repo_root, &registry_mut);
-        eprintln!(
-            "jj-plan: auto-untracked {} abandoned bookmark(s): {}",
-            stale.len(),
-            stale.join(", ")
-        );
-    }
+// ---------------------------------------------------------------------------
+// Sync tier 1: sync_to_disk — pure resolve + sync, no side effects
+// ---------------------------------------------------------------------------
 
-    // Migrate any legacy change-ID-based filenames to bookmark-named files.
-    // This must happen before gather_current_state() in sync so the rest of
-    // the pipeline sees only bookmark-named files.
-    crate::plan_file::migrate_legacy_filenames(&plan_dir.path, |legacy_change_id| {
-        // Resolve the short reverse-hex change ID to a bookmark name.
-        // We compare the short ID from the filename against each bookmark's
-        // change_id resolved to short form via the workspace.
-        for bm in &all_bookmarks {
-            if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id) {
-                if bm_short == legacy_change_id
-                    || legacy_change_id.starts_with(&bm_short)
-                    || bm_short.starts_with(legacy_change_id)
-                {
-                    return Some(bm.name.clone());
-                }
-            }
-        }
-        None
-    });
+/// Build the stack, sync plan files to disk, return display data.
+///
+/// This is the lowest-level sync function. It performs no registry mutations
+/// and no stderr output beyond debug logging. Side effects are limited to
+/// plan file I/O via `sync::sync()`.
+///
+/// Callers that need stale-bookmark cleanup or legacy filename migration
+/// should use `full_sync_and_show` instead.
+pub fn sync_to_disk(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) -> Option<StackDisplayData> {
+    debug_log!("sync_to_disk(plan_dir={:?})", plan_dir.path);
+
+    let max_stack_size = crate::plan_dir::plan_max();
 
     // Build the @-relative stack once — single source of truth for both
     // plan file sync and rendering.
@@ -260,12 +243,96 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
     display_data
 }
 
+// ---------------------------------------------------------------------------
+// Sync tier 2: sync_and_show — sync_to_disk + display
+// ---------------------------------------------------------------------------
+
+/// Sync plan files to disk and display the stack.
+///
+/// Lite convenience wrapper for internal re-sync paths (post-untrack,
+/// post-cleanup) where stale-bookmark detection is not needed.
+///
+/// For user-facing command paths that follow mutations, use
+/// `full_sync_and_show` instead.
+pub fn sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry, format: StackFormat) {
+    let gathered = sync_to_disk(plan_dir, workspace, registry);
+    show_plan_stack(plan_dir, gathered.as_ref(), format);
+}
+
+// ---------------------------------------------------------------------------
+// Sync tier 3: full_sync_and_show — stale cleanup + migration + sync + show
+// ---------------------------------------------------------------------------
+
+/// Full post-mutation sync: untrack stale bookmarks, migrate legacy
+/// filenames, sync plan files to disk, show stack.
+///
+/// This is the batteries-included function for user-facing command paths.
+/// It handles all the lifecycle steps that `wrap()` performs after a
+/// mutating command:
+///
+/// 1. Detect and untrack stale registry entries (abandoned bookmarks)
+/// 2. Migrate legacy change-ID-based filenames to bookmark-named files
+/// 3. Build the stack, sync plan files, render display data
+/// 4. Show the stack visualization
+pub fn full_sync_and_show(
+    plan_dir: &PlanDir,
+    workspace: &Workspace,
+    registry: &PlanRegistry,
+    format: StackFormat,
+) {
+    // 1. Detect and untrack stale registry entries.
+    let all_bookmarks = workspace.local_bookmarks();
+    let live_bookmark_names: HashSet<&str> = all_bookmarks
+        .iter()
+        .map(|b| b.name.as_str())
+        .collect();
+
+    let stale = find_stale_bookmarks(registry, &live_bookmark_names);
+
+    if !stale.is_empty() {
+        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+        let mut registry_mut = plan_registry::load_registry(&repo_root);
+        for name in &stale {
+            registry_mut.untrack(name);
+        }
+        plan_registry::save_registry(&repo_root, &registry_mut);
+        eprintln!(
+            "jj-plan: auto-untracked {} abandoned bookmark(s): {}",
+            stale.len(),
+            stale.join(", ")
+        );
+    }
+
+    // 2. Migrate legacy change-ID-based filenames to bookmark-named files.
+    // This must happen before gather_current_state() in sync so the rest of
+    // the pipeline sees only bookmark-named files.
+    crate::plan_file::migrate_legacy_filenames(&plan_dir.path, |legacy_change_id| {
+        for bm in &all_bookmarks {
+            if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id)
+                && (bm_short == legacy_change_id
+                    || legacy_change_id.starts_with(&bm_short)
+                    || bm_short.starts_with(legacy_change_id))
+                {
+                    return Some(bm.name.clone());
+                }
+        }
+        None
+    });
+
+    // 3-4. Sync plan files to disk and show the stack.
+    sync_and_show(plan_dir, workspace, registry, format);
+}
+
+// ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+
 /// Display the plan stack using pre-gathered display data.
 ///
 /// This is the single rendering entry point for all command paths.
-/// Call after `resolve_and_sync()` with the returned `StackDisplayData`.
+/// Call after `sync_to_disk()` with the returned `StackDisplayData`.
 ///
-/// Pipeline: PLAN → EXECUTE (GATHER already done by `resolve_and_sync`)
+/// Pipeline: PLAN → EXECUTE (GATHER already done by `sync_to_disk`)
 /// - PLAN:   `stack_render::render_stack()` → `Vec<Vec<Span>>`
 /// - EXECUTE: `format_ansi()` or `format_plain()` → `eprintln!`
 pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>, format: StackFormat) {
@@ -296,16 +363,6 @@ pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>, form
     for line in &formatted {
         eprintln!("{}", line);
     }
-}
-
-/// Convenience: resolve + sync + show in one call.
-///
-/// Most command sites just need to do all three steps. Sites that need
-/// the intermediate `StackDisplayData` can call `resolve_and_sync` and
-/// `show_plan_stack` separately.
-pub fn resolve_sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry, format: StackFormat) {
-    let gathered = resolve_and_sync(plan_dir, workspace, registry);
-    show_plan_stack(plan_dir, gathered.as_ref(), format);
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.
@@ -513,5 +570,32 @@ mod tests {
         };
         let registry = make_registry(&["hotfix"]);
         assert_eq!(derive_stack_name(&stack, &registry), "hotfix");
+    }
+
+    // -- find_stale_bookmarks tests --
+
+    #[test]
+    fn find_stale_bookmarks_detects_abandoned() {
+        let registry = make_registry(&["feat-x"]);
+        let live: HashSet<&str> = HashSet::from(["feat-y", "feat-z"]);
+        let stale = find_stale_bookmarks(&registry, &live);
+        assert_eq!(stale, vec!["feat-x"]);
+    }
+
+    #[test]
+    fn find_stale_bookmarks_none_stale() {
+        let registry = make_registry(&["feat-a", "feat-b"]);
+        let live: HashSet<&str> = HashSet::from(["feat-a", "feat-b", "feat-c"]);
+        let stale = find_stale_bookmarks(&registry, &live);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn find_stale_bookmarks_multiple_stale() {
+        let registry = make_registry(&["keep", "gone-1", "gone-2"]);
+        let live: HashSet<&str> = HashSet::from(["keep", "other"]);
+        let mut stale = find_stale_bookmarks(&registry, &live);
+        stale.sort();
+        assert_eq!(stale, vec!["gone-1", "gone-2"]);
     }
 }

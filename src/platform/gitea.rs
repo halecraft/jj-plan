@@ -466,9 +466,8 @@ impl PlatformService for GiteaService {
             blocking_reasons.push("Has merge conflicts".to_string());
         }
 
-        let mut uncertainties = Vec::new();
         // Gitea doesn't expose CI status per-PR easily — note the uncertainty.
-        uncertainties.push("CI status not checked (Gitea Actions status not available per-PR)".to_string());
+        let uncertainties = vec!["CI status not checked (Gitea Actions status not available per-PR)".to_string()];
 
         Ok(MergeReadiness {
             is_approved,

@@ -114,7 +114,7 @@ pub fn is_legacy_filename(name: &str) -> bool {
         return false;
     };
     // Legacy change IDs are 8+ chars of only [k-z] (reverse-hex alphabet)
-    extracted.len() >= 8 && extracted.bytes().all(|b| b >= b'k' && b <= b'z')
+    extracted.len() >= 8 && extracted.bytes().all(|b| (b'k'..=b'z').contains(&b))
 }
 
 /// Migrate legacy change-ID-based plan filenames to bookmark-named filenames.
