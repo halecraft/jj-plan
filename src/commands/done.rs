@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::markdown::PlanDocument;
 use crate::plan_dir::PlanDir;
+use crate::stack_render::StackFormat;
 use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 use crate::wrap::SyncChangeView;
@@ -19,7 +20,7 @@ use crate::wrap::SyncChangeView;
 ///
 /// When marking a single plan done (the default), if the target is the
 /// working copy (`@`), automatically advances to the next undone plan.
-pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &mut Workspace, registry: &PlanRegistry) -> crate::error::Result<i32> {
+pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &mut Workspace, registry: &PlanRegistry, format: StackFormat) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
     // ------------------------------------------------------------------
@@ -52,9 +53,9 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &
     // 4. Dispatch: --stack or single plan
     // ------------------------------------------------------------------
     if do_stack {
-        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, workspace, registry)
+        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, workspace, registry, format)
     } else {
-        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, workspace, registry)
+        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, workspace, registry, format)
     }
 }
 
@@ -71,6 +72,7 @@ fn run_done_stack(
     dry_run: bool,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     let changes = match changes {
         Some(c) => c,
@@ -101,7 +103,7 @@ fn run_done_stack(
     // the new front matter. Without this, any subsequent flush cycle would
     // read stale plan files and overwrite the jj descriptions.
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
 
     // --stack marks everything done, suggest starting a new stack
     eprintln!();
@@ -126,6 +128,7 @@ fn run_done_single(
     dry_run: bool,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     let target = target_id.clone().unwrap_or_else(|| "@".to_string());
     let is_default_target = target_id.is_none(); // targeting working copy
@@ -180,11 +183,11 @@ fn run_done_single(
     // advance_to_next_undone() does its own workspace.reload() + resolve_and_sync(),
     // so skip the outer one to avoid a redundant second stack build + sync cycle.
     if is_default_target {
-        advance_to_next_undone(jj, plan_dir, workspace, registry);
+        advance_to_next_undone(jj, plan_dir, workspace, registry, format);
     } else {
         // Explicit target or no advance needed — show the stack
         // using the display data we already gathered above.
-        crate::wrap::show_plan_stack(plan_dir, gathered.as_ref());
+        crate::wrap::show_plan_stack(plan_dir, gathered.as_ref(), format);
     }
     Ok(0)
 }
@@ -225,7 +228,7 @@ fn build_sync_views_for_done(workspace: &Workspace, registry: &PlanRegistry) -> 
 /// Re-resolves the stack once (after the describe mutation), then searches
 /// forward (with wraparound) for the next undone change. After `jj edit`,
 /// calls `resolve_and_sync()` exactly once to update plan files.
-fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace, registry: &PlanRegistry) {
+fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace, registry: &PlanRegistry, format: StackFormat) {
     // Re-resolve the stack once after the describe
     workspace.reload();
     let changes = build_sync_views_for_done(workspace, registry);
@@ -234,7 +237,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
         Some(c) => c,
         None => {
             // No stack resolved — still sync to pick up the done marker.
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
             return;
         }
     };
@@ -244,7 +247,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
         Some(idx) => idx,
         None => {
             // Can't determine position — sync what we have.
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
             return;
         }
     };
@@ -258,11 +261,11 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
         Some(change) => {
             let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
             workspace.reload();
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
         }
         None => {
             // All done — still sync to pick up the done marker we just wrote.
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
             eprintln!("All plans in stack are done 🎉");
         }
     }

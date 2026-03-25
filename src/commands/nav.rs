@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::stack_render::StackFormat;
 use crate::types::{PlanRegistry, Stack, StackResult};
 use crate::workspace::Workspace;
 
@@ -23,6 +24,7 @@ pub fn plan_next(
     plan_dir: &PlanDir,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
@@ -42,7 +44,7 @@ pub fn plan_next(
     if current_idx >= targets.len() - 1 {
         eprintln!("Already at the last plan");
         workspace.reload();
-        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
         return Ok(0);
     }
 
@@ -55,7 +57,7 @@ pub fn plan_next(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 
@@ -65,6 +67,7 @@ pub fn plan_prev(
     plan_dir: &PlanDir,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
@@ -84,7 +87,7 @@ pub fn plan_prev(
     if current_idx == 0 {
         eprintln!("Already at the first plan");
         workspace.reload();
-        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+        crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
         return Ok(0);
     }
 
@@ -97,7 +100,7 @@ pub fn plan_prev(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 
@@ -114,6 +117,7 @@ pub fn plan_go(
     target: &str,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // 1. Flush pending edits
     crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
@@ -168,7 +172,7 @@ pub fn plan_go(
 
     // 5. Reload + Sync + show stack
     workspace.reload();
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, format);
     Ok(0)
 }
 

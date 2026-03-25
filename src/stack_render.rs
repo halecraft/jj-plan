@@ -58,6 +58,19 @@ pub enum Style {
     Warning,
 }
 
+/// Stack visualization format.
+///
+/// Controls how many lines each plan occupies in the rendered output.
+/// - `Compact`: 1 line per plan (node + description inline). Default for terminal.
+/// - `Regular`: 3 lines per plan (node, `│` description, spacer). Default for `stack.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackFormat {
+    /// One line per plan: marker + bookmark + change ID + indicators + description.
+    Compact,
+    /// Three lines per plan: node line, `│` description line, blank spacer.
+    Regular,
+}
+
 /// A span of text with a semantic style.
 ///
 /// The rendering pipeline produces `Vec<Vec<Span>>` (lines of spans).
@@ -402,12 +415,18 @@ fn build_node_content(row: &DisplayRow) -> Vec<Span> {
 // Rendering (PLAN phase — pure)
 // ---------------------------------------------------------------------------
 
-/// Render a single-stack column (no gutter, identical to pre-multi-column output).
+/// Render a single-stack column (no gutter).
+///
+/// - `Regular`: 3 lines per plan (node, `│` description, spacer). Identical to pre-compact output.
+/// - `Compact`: 1 line per plan (description appended to node line). No leading blank, no spacers.
 ///
 /// Returns `Vec<Vec<Span>>` — one inner vec per output line.
-fn render_single_column(column: &StackColumn) -> Vec<Vec<Span>> {
+fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Span>> {
     let mut lines: Vec<Vec<Span>> = Vec::new();
-    lines.push(vec![]); // leading blank line
+
+    if format == StackFormat::Regular {
+        lines.push(vec![]); // leading blank line (Regular only)
+    }
 
     for (i, row) in column.rows.iter().enumerate() {
         // Node line: "  {marker} {bookmark_name} {short_change_id} {indicator_str}"
@@ -424,25 +443,39 @@ fn render_single_column(column: &StackColumn) -> Vec<Vec<Span>> {
             Span::plain(" "),
         ];
         node_line.extend(build_node_content(row));
-        lines.push(node_line);
 
-        // Description line
-        if !row.first_line.is_empty() {
-            lines.push(vec![
-                Span::plain("  "),
-                Span::new("│", Style::Connector),
-                Span::plain(" "),
-                Span::plain(&row.first_line),
-            ]);
-        }
+        match format {
+            StackFormat::Compact => {
+                // Append description inline on the node line
+                if !row.first_line.is_empty() {
+                    node_line.push(Span::plain(" "));
+                    node_line.push(Span::plain(&row.first_line));
+                }
+                lines.push(node_line);
+                // No spacer between segments in compact mode
+            }
+            StackFormat::Regular => {
+                lines.push(node_line);
 
-        // Spacer between segments (not after last)
-        if i < column.rows.len() - 1 {
-            lines.push(vec![Span::plain("  "), Span::new("│", Style::Connector)]);
+                // Description line
+                if !row.first_line.is_empty() {
+                    lines.push(vec![
+                        Span::plain("  "),
+                        Span::new("│", Style::Connector),
+                        Span::plain(" "),
+                        Span::plain(&row.first_line),
+                    ]);
+                }
+
+                // Spacer between segments (not after last)
+                if i < column.rows.len() - 1 {
+                    lines.push(vec![Span::plain("  "), Span::new("│", Style::Connector)]);
+                }
+            }
         }
     }
 
-    // Gap warnings
+    // Gap warnings (same for both formats)
     if !column.gaps.is_empty() {
         let total: usize = column.gaps.iter().map(|g| g.unbookmarked.len()).sum();
         lines.push(vec![]);
@@ -464,24 +497,42 @@ fn render_single_column(column: &StackColumn) -> Vec<Vec<Span>> {
     }
 
     // Trunk
-    lines.push(vec![Span::plain("  "), Span::new("│", Style::Connector)]);
-    lines.push(vec![
-        Span::plain("  "),
-        Span::new("◆", Style::TrunkMarker),
-        Span::plain(" trunk()"),
-    ]);
-    lines.push(vec![]);
+    match format {
+        StackFormat::Compact => {
+            // No │ connector before trunk in compact mode
+            lines.push(vec![
+                Span::plain("  "),
+                Span::new("◆", Style::TrunkMarker),
+                Span::plain(" trunk()"),
+            ]);
+        }
+        StackFormat::Regular => {
+            lines.push(vec![Span::plain("  "), Span::new("│", Style::Connector)]);
+            lines.push(vec![
+                Span::plain("  "),
+                Span::new("◆", Style::TrunkMarker),
+                Span::plain(" trunk()"),
+            ]);
+            lines.push(vec![]);
+        }
+    }
 
     lines
 }
 
 /// Render multi-column graph with gutter.
 ///
-/// Each stack gets rendered sequentially with a gutter showing all columns.
-fn render_multi_column(columns: &[StackColumn]) -> Vec<Vec<Span>> {
+/// - `Regular`: description on separate line with gutter continuation, spacers between segments.
+/// - `Compact`: description appended to node line, no spacers between segments within a column.
+///
+/// Stack headers and trunk merge are the same in both formats.
+fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<Span>> {
     let num_cols = columns.len();
     let mut lines: Vec<Vec<Span>> = Vec::new();
-    lines.push(vec![]); // leading blank line
+
+    if format == StackFormat::Regular {
+        lines.push(vec![]); // leading blank line (Regular only)
+    }
 
     for (col_idx, column) in columns.iter().enumerate() {
         // Stack header
@@ -505,25 +556,39 @@ fn render_multi_column(columns: &[StackColumn]) -> Vec<Vec<Span>> {
             let mut node_line = vec![Span::plain("  ")];
             node_line.extend(build_gutter(num_cols, col_idx, mark));
             node_line.extend(build_node_content(row));
-            lines.push(node_line);
 
-            // Description line
-            if !row.first_line.is_empty() {
-                let mut desc_line = vec![Span::plain("  ")];
-                desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
-                desc_line.push(Span::plain(format!("  {}", row.first_line)));
-                lines.push(desc_line);
-            }
+            match format {
+                StackFormat::Compact => {
+                    // Append description inline on the node line
+                    if !row.first_line.is_empty() {
+                        node_line.push(Span::plain(" "));
+                        node_line.push(Span::plain(&row.first_line));
+                    }
+                    lines.push(node_line);
+                    // No spacer between segments in compact mode
+                }
+                StackFormat::Regular => {
+                    lines.push(node_line);
 
-            // Spacer between segments (not after last)
-            if row_idx < column.rows.len() - 1 {
-                let mut spacer_line = vec![Span::plain("  ")];
-                spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
-                lines.push(spacer_line);
+                    // Description line
+                    if !row.first_line.is_empty() {
+                        let mut desc_line = vec![Span::plain("  ")];
+                        desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+                        desc_line.push(Span::plain(format!("  {}", row.first_line)));
+                        lines.push(desc_line);
+                    }
+
+                    // Spacer between segments (not after last)
+                    if row_idx < column.rows.len() - 1 {
+                        let mut spacer_line = vec![Span::plain("  ")];
+                        spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+                        lines.push(spacer_line);
+                    }
+                }
             }
         }
 
-        // Gap warnings
+        // Gap warnings (same for both formats)
         if !column.gaps.is_empty() {
             let total_unbookmarked: usize =
                 column.gaps.iter().map(|g| g.unbookmarked.len()).sum();
@@ -555,7 +620,7 @@ fn render_multi_column(columns: &[StackColumn]) -> Vec<Vec<Span>> {
             }
         }
 
-        // Spacer between stacks
+        // Spacer between stacks (same for both formats)
         if col_idx < num_cols - 1 {
             let mut spacer_line = vec![Span::plain("  ")];
             spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
@@ -574,7 +639,10 @@ fn render_multi_column(columns: &[StackColumn]) -> Vec<Vec<Span>> {
         Span::new("◆", Style::TrunkMarker),
         Span::plain(" trunk()"),
     ]);
-    lines.push(vec![]);
+
+    if format == StackFormat::Regular {
+        lines.push(vec![]); // trailing blank line (Regular only)
+    }
 
     lines
 }
@@ -586,16 +654,17 @@ fn render_multi_column(columns: &[StackColumn]) -> Vec<Vec<Span>> {
 /// - Empty input returns empty `Vec` (caller handles empty-state messaging).
 /// - Single column dispatches to `render_single_column` (no gutter).
 /// - Multiple columns dispatches to `render_multi_column` (with gutter).
+/// - `format` controls layout density: `Compact` (1 line/plan) vs `Regular` (3 lines/plan).
 ///
 /// Trunk (`◆ trunk()`) is always included in the output.
-pub fn render_stack(columns: &[StackColumn]) -> Vec<Vec<Span>> {
+pub fn render_stack(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<Span>> {
     if columns.is_empty() {
         return vec![];
     }
     if columns.len() == 1 {
-        render_single_column(&columns[0])
+        render_single_column(&columns[0], format)
     } else {
-        render_multi_column(columns)
+        render_multi_column(columns, format)
     }
 }
 
@@ -833,7 +902,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col]));
+        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         // Should have ○ markers (not ◉ since neither is WC)
@@ -862,7 +931,7 @@ mod tests {
     #[test]
     fn single_stack_shows_working_copy_marker() {
         let col = make_column("feat", vec![make_row("feat-api", "Feature API", true)]);
-        let lines = format_plain(&render_stack(&[col]));
+        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         assert!(
@@ -883,7 +952,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols));
+        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
         assert!(
@@ -908,7 +977,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols));
+        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
         // The auth column (col 0) should show ○ with a │ gutter for col 1
@@ -936,7 +1005,7 @@ mod tests {
             make_column("b", vec![make_row("b1", "B", false)]),
             make_column("c", vec![make_row("c1", "C", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols));
+        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
         assert!(
@@ -947,7 +1016,7 @@ mod tests {
 
     #[test]
     fn empty_stacks_returns_empty() {
-        let result = render_stack(&[]);
+        let result = render_stack(&[], StackFormat::Regular);
         assert!(result.is_empty(), "empty input should return empty Vec");
     }
 
@@ -966,7 +1035,7 @@ mod tests {
             make_column("medium", vec![make_row("m-1", "M1", true)]),
             make_column("small", vec![make_row("s-1", "S1", false)]),
         ];
-        let lines = format_plain(&render_stack(&cols));
+        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
 
         // Find the line indices of each stack header
         let largest_idx = lines
@@ -1001,7 +1070,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", true)],
         );
-        let lines = format_plain(&render_stack(&[col]));
+        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         assert!(
@@ -1016,7 +1085,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", false)],
         );
-        let lines = format_ansi(&render_stack(&[col]));
+        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         // Should contain ANSI codes for markers and bookmark names
@@ -1037,7 +1106,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", true)],
         );
-        let lines = format_ansi(&render_stack(&[col]));
+        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         // ◉ should get bold green escape
@@ -1054,7 +1123,7 @@ mod tests {
         row.short_change_id = "kpqxywon".to_string();
 
         let col = make_column("test", vec![row]);
-        let lines = format_ansi(&render_stack(&[col]));
+        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         // Prefix should get bright magenta
@@ -1079,7 +1148,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col]));
+        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
         // Verify the structural elements are all present and in order
@@ -1134,7 +1203,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols));
+        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
         // Both columns should include the change ID
@@ -1180,7 +1249,7 @@ mod tests {
             gaps: vec![],
         };
 
-        let rendered = render_stack(&[col]);
+        let rendered = render_stack(&[col], StackFormat::Regular);
         let md_lines = format_markdown(&rendered);
         let md_output = md_lines.join("\n");
 
@@ -1192,6 +1261,169 @@ mod tests {
         assert!(
             md_output.contains("[feat-auth](./01-feat-auth.md)"),
             "single-stack markdown should link feat-auth to its plan file"
+        );
+    }
+
+    // -- Compact format tests ------------------------------------------------
+
+    #[test]
+    fn compact_single_column_one_line_per_plan() {
+        let col = make_column(
+            "auth",
+            vec![
+                make_row("auth-tests", "Add tests", true),
+                make_row("auth-refactor", "Refactor auth", false),
+            ],
+        );
+        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Should NOT have │ description lines
+        assert!(
+            !output.contains("│ Add tests"),
+            "compact should not have separate description line: {output}"
+        );
+        assert!(
+            !output.contains("│ Refactor auth"),
+            "compact should not have separate description line: {output}"
+        );
+        // Should NOT have blank spacer lines between segments (│ alone on a line)
+        // In compact mode there should be no "  │" lines at all
+        for line in &lines {
+            let trimmed = line.trim();
+            assert!(
+                trimmed != "│",
+                "compact should not have bare │ spacer lines: {output}"
+            );
+        }
+        // Should still have trunk
+        assert!(output.contains("◆ trunk()"), "should show trunk");
+        // Trunk should NOT be preceded by │ connector
+        let trunk_idx = lines.iter().position(|l| l.contains("◆ trunk()")).unwrap();
+        if trunk_idx > 0 {
+            assert!(
+                !lines[trunk_idx - 1].contains("│"),
+                "compact trunk should not have │ connector above it: {output}"
+            );
+        }
+        // No leading blank line
+        assert!(
+            !lines[0].is_empty(),
+            "compact should not have leading blank line"
+        );
+    }
+
+    #[test]
+    fn regular_single_column_matches_existing() {
+        // Regression test: Regular mode must produce the same 3-line layout
+        let col = make_column(
+            "auth",
+            vec![
+                make_row("auth-tests", "Add tests", true),
+                make_row("auth-refactor", "Refactor auth", false),
+            ],
+        );
+        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let output = lines.join("\n");
+
+        // Must have │ description lines
+        assert!(output.contains("│ Add tests"), "regular must have description line");
+        assert!(output.contains("│ Refactor auth"), "regular must have description line");
+        // Must have │ spacer between segments
+        assert!(output.contains("◉ auth-tests"), "should show auth-tests");
+        assert!(output.contains("○ auth-refactor"), "should show auth-refactor");
+        // Must have │ connector before trunk
+        let trunk_idx = lines.iter().position(|l| l.contains("◆ trunk()")).unwrap();
+        assert!(
+            lines[trunk_idx - 1].contains("│"),
+            "regular trunk should have │ connector above it"
+        );
+        // Leading blank line
+        assert!(
+            lines[0].is_empty(),
+            "regular should have leading blank line"
+        );
+        // Trailing blank line
+        assert!(
+            lines.last().unwrap().is_empty(),
+            "regular should have trailing blank line"
+        );
+    }
+
+    #[test]
+    fn compact_includes_description_on_node_line() {
+        let col = make_column(
+            "feat",
+            vec![make_row("feat-api", "Add API endpoints", true)],
+        );
+        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Description should appear on the same line as the bookmark
+        assert!(
+            output.contains("feat-api abcd1234 (@) Add API endpoints"),
+            "compact should have description on same line as bookmark: {output}"
+        );
+    }
+
+    #[test]
+    fn compact_multi_column_no_spacers() {
+        let cols = vec![
+            make_column(
+                "auth",
+                vec![
+                    make_row("auth-tests", "Add tests", false),
+                    make_row("auth-refactor", "Refactor auth", false),
+                ],
+            ),
+            make_column(
+                "dashboard",
+                vec![make_row("dash-api", "Dashboard API", true)],
+            ),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Should NOT have separate description lines (with double-space indent after gutter)
+        assert!(
+            !output.contains("  Add tests\n"),
+            "compact multi-column should not have separate description line"
+        );
+        // Descriptions should be inline on node lines
+        assert!(
+            output.contains("auth-tests abcd1234 Add tests"),
+            "compact multi-column should have description inline: {output}"
+        );
+        assert!(
+            output.contains("dash-api abcd1234 (@) Dashboard API"),
+            "compact multi-column should have description inline: {output}"
+        );
+        // Stack headers should still be present
+        assert!(output.contains("stack: auth"), "should show auth stack header");
+        assert!(output.contains("stack: dashboard"), "should show dashboard stack header");
+        // Trunk merge should still be present
+        assert!(output.contains("├─╯"), "should show trunk merge");
+        assert!(output.contains("◆ trunk()"), "should show trunk");
+        // No leading blank line
+        assert!(
+            !lines[0].is_empty(),
+            "compact multi-column should not have leading blank line"
+        );
+    }
+
+    #[test]
+    fn compact_empty_description_no_trailing_space() {
+        let mut row = make_row("feat-api", "", false);
+        row.first_line = String::new();
+        let col = make_column("feat", vec![row]);
+        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+
+        // Find the node line
+        let node_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
+        // Should not end with a trailing space from the missing description
+        assert!(
+            !node_line.ends_with(' '),
+            "node line should not have trailing space when description is empty: '{node_line}'"
         );
     }
 }

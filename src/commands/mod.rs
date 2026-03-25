@@ -12,6 +12,7 @@ pub mod untrack;
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::stack_render::StackFormat;
 use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
@@ -34,6 +35,7 @@ pub fn dispatch_plan(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> Result<i32> {
     // args[0] is "plan", args[1] is the subcommand (if present)
     let subcommand = args.get(1).map(|s| s.as_str());
@@ -61,24 +63,24 @@ pub fn dispatch_plan(
         }
 
         Some("new") => {
-            new::run_new(jj, plan_dir, sub_args, workspace, registry)
+            new::run_new(jj, plan_dir, sub_args, workspace, registry, format)
         }
         Some("track") => {
-            track::run_track(jj, plan_dir, sub_args, workspace, registry)
+            track::run_track(jj, plan_dir, sub_args, workspace, registry, format)
         }
         Some("untrack") => {
-            untrack::run_untrack(jj, plan_dir, sub_args, workspace, registry)
+            untrack::run_untrack(jj, plan_dir, sub_args, workspace, registry, format)
         }
         Some("done") => {
-            done::run_done(jj, plan_dir, sub_args, workspace, registry)
+            done::run_done(jj, plan_dir, sub_args, workspace, registry, format)
         }
 
-        Some("next") => nav::plan_next(jj, plan_dir, workspace, registry),
-        Some("prev") => nav::plan_prev(jj, plan_dir, workspace, registry),
+        Some("next") => nav::plan_next(jj, plan_dir, workspace, registry, format),
+        Some("prev") => nav::plan_prev(jj, plan_dir, workspace, registry, format),
         Some("go") => {
             let target = args.get(2).map(|s| s.as_str());
             match target {
-                Some(t) => nav::plan_go(jj, plan_dir, t, workspace, registry),
+                Some(t) => nav::plan_go(jj, plan_dir, t, workspace, registry, format),
                 None => {
                     eprintln!("jj plan go: missing target (index, bookmark name, or change ID)");
                     Ok(1)

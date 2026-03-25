@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use crate::stack_render::StackFormat;
+
 /// Discover the jj repo root by walking up from `cwd` looking for `.jj/`.
 ///
 /// This replaces the `jj root` subprocess call (~15ms) with a pure
@@ -110,6 +112,20 @@ pub fn stack_prefix() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "stack/".to_string())
+}
+
+/// Read `JJ_PLAN_STACK_FORMAT` from the environment.
+///
+/// Returns `Compact` when unset or unrecognized (the terminal default).
+/// Returns `Regular` when set to `"regular"`.
+///
+/// This is the GATHER-phase reader — called once at the shell boundary
+/// in `main.rs`, then threaded as data through the call chain.
+pub fn resolved_stack_format() -> StackFormat {
+    match std::env::var("JJ_PLAN_STACK_FORMAT").ok().as_deref() {
+        Some("regular") => StackFormat::Regular,
+        _ => StackFormat::Compact,
+    }
 }
 
 /// Read JJ_PLAN_MAX from the environment, defaulting to 50.

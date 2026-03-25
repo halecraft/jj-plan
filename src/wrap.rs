@@ -2,7 +2,7 @@ use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::load_pr_cache;
-use crate::stack_render::{self, StackColumn};
+use crate::stack_render::{self, StackColumn, StackFormat};
 use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 use crate::sync;
@@ -31,6 +31,7 @@ pub fn wrap(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // 1. Flush all local plan file edits to jj descriptions
     crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
@@ -44,7 +45,7 @@ pub fn wrap(
     let gathered = resolve_and_sync(plan_dir, workspace, registry);
 
     // 6. Display the plan stack
-    show_plan_stack(plan_dir, gathered.as_ref());
+    show_plan_stack(plan_dir, gathered.as_ref(), format);
 
     // 7. Auto-cleanup merged stacks (registry + base bookmarks behind trunk)
     auto_cleanup_merged_stacks(workspace, plan_dir);
@@ -244,7 +245,7 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             match stack_render::build_column_from_stack(stack, &stack_name, registry, workspace, pr_cache.as_ref()) {
                 Some(column) => {
                     let columns = vec![column];
-                    let rendered = stack_render::render_stack(&columns);
+                    let rendered = stack_render::render_stack(&columns, StackFormat::Regular);
                     let md_content = stack_render::format_markdown_with_header(&rendered);
                     (Some(md_content), Some(StackDisplayData { columns }))
                 }
@@ -267,7 +268,7 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
 /// Pipeline: PLAN → EXECUTE (GATHER already done by `resolve_and_sync`)
 /// - PLAN:   `stack_render::render_stack()` → `Vec<Vec<Span>>`
 /// - EXECUTE: `format_ansi()` or `format_plain()` → `eprintln!`
-pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>) {
+pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>, format: StackFormat) {
     let data = match data {
         Some(d) => d,
         None => {
@@ -278,7 +279,7 @@ pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>) {
     };
 
     // PLAN
-    let rendered = stack_render::render_stack(&data.columns);
+    let rendered = stack_render::render_stack(&data.columns, format);
 
     // EXECUTE
     let color = stack_render::should_color();
@@ -302,9 +303,9 @@ pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>) {
 /// Most command sites just need to do all three steps. Sites that need
 /// the intermediate `StackDisplayData` can call `resolve_and_sync` and
 /// `show_plan_stack` separately.
-pub fn resolve_sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+pub fn resolve_sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry, format: StackFormat) {
     let gathered = resolve_and_sync(plan_dir, workspace, registry);
-    show_plan_stack(plan_dir, gathered.as_ref());
+    show_plan_stack(plan_dir, gathered.as_ref(), format);
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.

@@ -278,9 +278,21 @@ Show the current stack visualization with bookmark structure, sync status, PR st
 
 ```
 jj stack
+jj stack --format=compact       # explicit compact (default)
+jj stack --format=regular       # verbose 3-line-per-plan format
+jj stack --format regular       # same, with separate arg
 ```
 
-**Output:**
+**Output (compact format — default):**
+
+```
+  ◉ feat-api ykvsnxrl (@) Add API endpoints
+  ○ feat-session mtzrlpvq (synced, PR #43) Implement session management
+  ○ feat-auth kpqxywon (synced, PR #42, ✓) Extract auth module
+  ◆ trunk()
+```
+
+**Output (regular format):**
 
 ```
   ◉ feat-api ykvsnxrl (@)
@@ -294,6 +306,8 @@ jj stack
   │
   ◆ trunk()
 ```
+
+The compact format (1 line per plan) is the default for all terminal output (`jj status`, `jj stack`, etc.). The regular format (3 lines per plan) is always used for `stack.md`. Override the terminal default with `--format=regular` or the `JJ_PLAN_STACK_FORMAT` environment variable.
 
 This is the same view shown in `jj status` and written to `.jj-plan/stack.md`. To see all stacks across the repo, use `jj stack --all`.
 
@@ -322,6 +336,8 @@ Show all registered stacks across the repo, regardless of working copy position.
 
 ```
 jj stack --all
+jj stack --all --format=regular    # verbose format (flag order doesn't matter)
+jj stack --format=regular --all    # same
 ```
 
 **Multi-stack output (column layout):**
@@ -678,6 +694,20 @@ Maximum stack size before refusing to sync. Prevents accidental sync of enormous
 ```sh
 export JJ_PLAN_MAX=100         # allow up to 100 plans (default: 50)
 ```
+
+### `JJ_PLAN_STACK_FORMAT`
+
+Terminal stack visualization format. Controls how many lines each plan occupies in `jj status`, `jj stack`, and other terminal output.
+
+```sh
+export JJ_PLAN_STACK_FORMAT=regular    # verbose 3-line-per-plan format
+export JJ_PLAN_STACK_FORMAT=compact    # 1-line-per-plan (default)
+```
+
+- **`compact`** (default): Description appended inline on the node line. No `│` connector lines or spacers.
+- **`regular`**: Node line, `│` description line, blank spacer — the original format.
+
+`stack.md` always uses the regular format regardless of this setting. The `jj stack --format=compact|regular` flag overrides this env var for a single invocation.
 
 ### `JJ_PLAN_STACK_PREFIX`
 

@@ -1864,3 +1864,78 @@ EOF
   # Should show the normal single-column format
   [[ "$output" == *"trunk()"* ]]
 }
+
+# =============================================================================
+# Compact format
+# =============================================================================
+
+@test "jj status uses compact format by default" {
+  jj describe -m "Refactor auth"
+  jj plan new step-1; jj describe -m "Extract module"
+  run jj status
+  [[ "$status" -eq 0 ]]
+  # Plan description should be on the same line as the bookmark name (compact)
+  [[ "$output" == *"start "* ]]
+  [[ "$output" == *" Refactor auth"* ]]
+  [[ "$output" == *" Extract module"* ]]
+  # Should NOT have │ description lines (the regular format connector)
+  [[ "$output" != *"│ Refactor auth"* ]]
+  [[ "$output" != *"│ Extract module"* ]]
+}
+
+@test "stack.md uses regular format with description on separate line" {
+  jj describe -m "Refactor auth"
+  jj plan new step-1; jj describe -m "Extract module"
+  # Trigger a sync so stack.md is written
+  run jj status
+  [[ "$status" -eq 0 ]]
+  # stack.md should use regular format (│ connector before description)
+  stack_content=$(cat .jj-plan/stack.md)
+  [[ "$stack_content" == *"│ Refactor auth"* ]]
+  [[ "$stack_content" == *"│ Extract module"* ]]
+}
+
+@test "jj stack --format=regular produces multi-line output" {
+  jj describe -m "Refactor auth"
+  jj plan new step-1; jj describe -m "Extract module"
+  run jj stack --format=regular
+  [[ "$status" -eq 0 ]]
+  # Regular format should have │ description lines
+  [[ "$output" == *"│ Refactor auth"* ]]
+  [[ "$output" == *"│ Extract module"* ]]
+}
+
+@test "jj stack --all --format=regular works with flag order independence" {
+  jj describe -m "Refactor auth"
+  run jj stack --all --format=regular
+  [[ "$status" -eq 0 ]]
+  # Should have regular format with │ description lines
+  [[ "$output" == *"│ Refactor auth"* ]]
+  # Reversed order should also work
+  run jj stack --format=regular --all
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"│ Refactor auth"* ]]
+}
+
+@test "jj stack --format=compact explicitly produces compact output" {
+  jj describe -m "Refactor auth"
+  run jj stack --format=compact
+  [[ "$status" -eq 0 ]]
+  # Compact: description on same line, no │ connector
+  [[ "$output" != *"│ Refactor auth"* ]]
+  [[ "$output" == *" Refactor auth"* ]]
+}
+
+@test "jj stack --format=bogus shows error" {
+  run jj stack --format=bogus
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *"unknown format"* ]]
+}
+
+@test "JJ_PLAN_STACK_FORMAT=regular env var overrides default" {
+  jj describe -m "Refactor auth"
+  JJ_PLAN_STACK_FORMAT=regular run jj stack
+  [[ "$status" -eq 0 ]]
+  # Env var set to regular should produce │ description lines
+  [[ "$output" == *"│ Refactor auth"* ]]
+}

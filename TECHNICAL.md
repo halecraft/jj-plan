@@ -301,13 +301,27 @@ Note: `resolve_and_sync` in `wrap.rs` builds the @-relative stack once via `buil
 
 ### Phase 5: Show stack
 
-Display the plan stack using pre-gathered `StackDisplayData` from `resolve_and_sync`. `show_plan_stack` accepts `Option<&StackDisplayData>` — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
+Display the plan stack using pre-gathered `StackDisplayData` from `resolve_and_sync`. `show_plan_stack` accepts `Option<&StackDisplayData>` and a `StackFormat` parameter — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
 
-Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack` in `stack_render.rs`:
+Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack(columns, format)` in `stack_render.rs`. The `StackFormat` enum controls layout density:
+
+- **`Compact`** (default for terminal): 1 line per plan — description appended inline on the node line. No `│` connector lines, no blank spacers, no leading blank line.
+- **`Regular`** (default for `stack.md`): 3 lines per plan — node line, `│` description line, blank spacer. This is the original pre-compact format.
+
+`resolve_and_sync` hardcodes `StackFormat::Regular` for its `stack.md` rendering call. The format parameter is threaded from `main.rs` (where `resolved_stack_format()` reads `JJ_PLAN_STACK_FORMAT` once) through `wrap`, `dispatch_plan`, `dispatch_stack`, and all sub-command functions to `show_plan_stack` and `render_stack`. `jj stack --format=compact|regular` overrides the env-derived default for that invocation via `parse_stack_dispatch_args`.
 
 #### Terminal view (printed to stderr)
 
-Graph visualization with semantic indicators:
+Graph visualization with semantic indicators. **Compact format** (default):
+
+```
+  ◉ feat-api kpqxywon (@, ~) Add API endpoints
+  ○ feat-session mtzrlpvq (~) Implement session management
+  ○ feat-auth lonpswlw (✓) Extract auth module
+  ◆ trunk()
+```
+
+**Regular format** (`JJ_PLAN_STACK_FORMAT=regular` or `jj stack --format=regular`):
 
 ```
   ◉ feat-api kpqxywon (@, ~)
@@ -733,6 +747,7 @@ This ensures the plan file is always the source of truth, even when users type `
 | `JJ_PLAN_DEBUG` | Enable diagnostic logging to stderr (any value) | unset |
 | `JJ_PLAN_DIR` | Override plan directory path | `.jj-plan/` → `.jj-plans/` |
 | `JJ_PLAN_MAX` | Max stack size before refusing to sync | `50` |
+| `JJ_PLAN_STACK_FORMAT` | Terminal stack format: `compact` or `regular` | `compact` |
 | `JJ_PLAN_STACK_PREFIX` | Prefix for stack base bookmarks | `stack/` |
 | `JJ_PLAN_TEMPLATE` | Override plan template file path | `.jj-plan/template.md` → built-in |
 | `GITHUB_TOKEN` / `GH_TOKEN` | GitHub personal access token | — |

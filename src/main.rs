@@ -1,6 +1,6 @@
 use jj_plan::error::JjPlanError;
 use jj_plan::jj_binary::JjBinary;
-use jj_plan::plan_dir::{find_repo_root, resolve_plan_dir};
+use jj_plan::plan_dir::{find_repo_root, resolve_plan_dir, resolved_stack_format};
 use jj_plan::plan_registry::load_registry;
 use jj_plan::workspace;
 use jj_plan::commands;
@@ -110,26 +110,30 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
     // Load plan registry once — all command paths receive this reference.
     let registry = load_registry(&repo_root);
 
+    // GATHER: read stack format preference once at the shell boundary.
+    // This is threaded as data through the entire call chain (FC/IS).
+    let format = resolved_stack_format();
+
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace, &registry);
+        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace, &registry, format);
     }
 
     // Special handling for "stack" subcommand (PR operations)
     if subcommand == "stack" {
-        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace, &registry);
+        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace, &registry, format);
     }
 
     // Special handling for "abandon" — recover stack bookmark if lost
     if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace, &registry);
+        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace, &registry, format);
     }
 
     // Special handling for "describe" — intercept -m to write to plan file first
     if subcommand == "describe" {
-        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace, &registry);
+        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace, &registry, format);
     }
 
     // All other commands: wrap lifecycle (flush → command → reload → sync → show)
-    wrap::wrap(&plan_dir, jj, args, &mut workspace, &registry)
+    wrap::wrap(&plan_dir, jj, args, &mut workspace, &registry, format)
 }

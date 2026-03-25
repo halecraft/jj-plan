@@ -6,6 +6,7 @@ use crate::plan_registry;
 use crate::pr_cache::save_pr_cache;
 use crate::stack_builder::{build_multi_stack, build_stack, collect_submission_chain, find_submit_target, narrow_segments};
 use crate::stack_context::StackContext;
+use crate::stack_render::StackFormat;
 use crate::submit::{
     analyze_submission, comments, create_submission_plan, execute_submission,
     ExecutionStep, NoopProgress, SubmissionPlan,
@@ -16,48 +17,136 @@ use crate::workspace::Workspace;
 
 use async_trait::async_trait;
 
+// ---------------------------------------------------------------------------
+// Dispatch-level argument parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed dispatch-level arguments for `jj stack`.
+///
+/// Separates flags (`--help`, `--all`, `--format`) from the positional
+/// subcommand so that flag order doesn't matter and combined flags
+/// (e.g. `jj stack --all --format=regular`) work correctly.
+struct StackDispatchArgs<'a> {
+    /// The first positional argument (subcommand name), if any.
+    subcommand: Option<&'a str>,
+    /// Whether `--help` or `-h` was present.
+    show_help: bool,
+    /// Whether `--all` was present.
+    show_all: bool,
+    /// The value of `--format=X` or `--format X`, if present.
+    format_override: Option<&'a str>,
+}
+
+/// Parse dispatch-level arguments from the full `jj stack ...` arg list.
+///
+/// Scans `args[1..]` (skipping `"stack"` at index 0), classifying each
+/// token as a known dispatch flag, a known dispatch option, or a positional.
+/// The first positional becomes `subcommand`. Unknown flags (e.g. `--dry-run`)
+/// are ignored here — they are passed through to sub-command handlers.
+fn parse_stack_dispatch_args(args: &[String]) -> StackDispatchArgs<'_> {
+    let mut subcommand: Option<&str> = None;
+    let mut show_help = false;
+    let mut show_all = false;
+    let mut format_override: Option<&str> = None;
+
+    let mut i = 1; // skip args[0] which is "stack"
+    while i < args.len() {
+        let arg = args[i].as_str();
+
+        match arg {
+            "--help" | "-h" => show_help = true,
+            "--all" => show_all = true,
+            "--format" => {
+                // --format VALUE (separate args)
+                if i + 1 < args.len() {
+                    i += 1;
+                    format_override = Some(args[i].as_str());
+                }
+            }
+            _ if arg.starts_with("--format=") => {
+                // --format=VALUE (equals form)
+                format_override = Some(&arg["--format=".len()..]);
+            }
+            _ if arg.starts_with('-') => {
+                // Unknown flag — skip (will be passed to sub-command handler)
+            }
+            _ => {
+                // First positional = subcommand
+                if subcommand.is_none() {
+                    subcommand = Some(arg);
+                }
+                // Subsequent positionals are ignored at dispatch level
+            }
+        }
+
+        i += 1;
+    }
+
+    StackDispatchArgs {
+        subcommand,
+        show_help,
+        show_all,
+        format_override,
+    }
+}
+
 /// Dispatch `jj stack <subcommand>` to the appropriate handler.
 ///
 /// `args` is the full argument list starting with "stack".
 /// For example: `["stack", "submit"]` or `["stack", "--help"]`.
+///
+/// `format` is the env-derived default (`resolved_stack_format()`).
+/// A `--format=X` flag in `args` takes precedence.
 pub fn dispatch_stack(
     jj: &JjBinary,
     plan_dir: &PlanDir,
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> Result<i32> {
-    let subcommand = args.get(1).map(|s| s.as_str());
+    let parsed = parse_stack_dispatch_args(args);
 
-    // Help handling — only on explicit --help/-h
-    if matches!(subcommand, Some("--help" | "-h")) {
+    // Resolve effective format: --format flag overrides env-derived default
+    let effective_format = match parsed.format_override {
+        Some("regular") => StackFormat::Regular,
+        Some("compact") => StackFormat::Compact,
+        Some(unknown) => {
+            eprintln!("jj stack: unknown format '{}' (expected 'compact' or 'regular')", unknown);
+            return Ok(1);
+        }
+        None => format,
+    };
+
+    // Help handling
+    if parsed.show_help {
         print_stack_help();
         return Ok(0);
     }
 
-    // --all flag: show all stacks across the repo (parsed before subcommand match)
-    if matches!(subcommand, Some("--all")) {
+    // --all flag: show all stacks across the repo
+    if parsed.show_all {
         crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
         workspace.reload();
         // Sync plan files for current stack first (so plan dir is up to date)
         let _ = crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
-        show_all_stacks(plan_dir, workspace, registry);
+        show_all_stacks(plan_dir, workspace, registry, effective_format);
         return Ok(0);
     }
 
-    match subcommand {
+    match parsed.subcommand {
         None => {
             // Bare `jj stack` — flush pending edits, sync plan files, then show visualization.
             crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
             workspace.reload();
-            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry);
+            crate::wrap::resolve_sync_and_show(plan_dir, workspace, registry, effective_format);
             Ok(0)
         }
         Some("submit") => run_submit(workspace, &args[1..], registry),
         Some("sync") => run_sync(workspace, &args[1..], registry),
         Some("merge") => run_merge(workspace, &args[1..], registry),
         Some("auth") => run_auth(&args[1..]),
-        Some("untrack") => run_stack_untrack(jj, plan_dir, &args[1..], workspace, registry),
+        Some("untrack") => run_stack_untrack(jj, plan_dir, &args[1..], workspace, registry, effective_format),
         Some(unknown) => {
             eprintln!("jj stack: unknown subcommand '{}'", unknown);
             eprintln!();
@@ -84,6 +173,7 @@ fn run_stack_untrack(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> Result<i32> {
     let dry_run = has_flag(args, "--dry-run");
 
@@ -159,7 +249,7 @@ fn run_stack_untrack(
     // 8. Sync and show updated state
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }
@@ -1060,7 +1150,7 @@ fn run_auth(args: &[String]) -> Result<i32> {
 /// This is the `jj stack --all` entry point. Uses `build_multi_stack` to
 /// discover all registered plan bookmarks, groups them, and renders a
 /// multi-column visualization.
-fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry, format: StackFormat) {
     use crate::pr_cache::load_pr_cache;
     use crate::stack_render;
 
@@ -1074,7 +1164,7 @@ fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanReg
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
     let pr_cache = load_pr_cache(&repo_root).ok();
     let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
-    let rendered = stack_render::render_stack(&columns);
+    let rendered = stack_render::render_stack(&columns, format);
 
     let color = stack_render::should_color();
     let formatted = if color {
@@ -1099,7 +1189,7 @@ fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanReg
 fn print_stack_help() {
     eprintln!("jj stack — stack-oriented PR operations");
     eprintln!();
-    eprintln!("Usage: jj stack [SUBCOMMAND]");
+    eprintln!("Usage: jj stack [SUBCOMMAND] [OPTIONS]");
     eprintln!();
     eprintln!("When run without a subcommand, displays the current stack with");
     eprintln!("bookmark structure, sync status, and PR status.");
@@ -1113,6 +1203,7 @@ fn print_stack_help() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --all               Show all stacks across the repo");
+    eprintln!("  --format=FORMAT     Output format: 'compact' (default) or 'regular'");
     eprintln!("  --help, -h          Show this help message");
 }
 
@@ -1188,6 +1279,120 @@ fn print_auth_help() {
 mod tests {
     use super::*;
     use crate::markdown::PlanDocument;
+
+    /// Helper to create a Vec<String> from string slices.
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -- parse_stack_dispatch_args tests -------------------------------------
+
+    #[test]
+    fn parse_bare_stack() {
+        let a = args(&["stack"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.subcommand.is_none());
+        assert!(!parsed.show_help);
+        assert!(!parsed.show_all);
+        assert!(parsed.format_override.is_none());
+    }
+
+    #[test]
+    fn parse_stack_help_long() {
+        let a = args(&["stack", "--help"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.show_help);
+    }
+
+    #[test]
+    fn parse_stack_help_short() {
+        let a = args(&["stack", "-h"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.show_help);
+    }
+
+    #[test]
+    fn parse_stack_all() {
+        let a = args(&["stack", "--all"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.show_all);
+        assert!(parsed.subcommand.is_none());
+    }
+
+    #[test]
+    fn parse_stack_format_equals() {
+        let a = args(&["stack", "--format=regular"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.format_override, Some("regular"));
+        assert!(parsed.subcommand.is_none());
+    }
+
+    #[test]
+    fn parse_stack_format_separate() {
+        let a = args(&["stack", "--format", "regular"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.format_override, Some("regular"));
+        assert!(parsed.subcommand.is_none());
+    }
+
+    #[test]
+    fn parse_stack_all_and_format() {
+        let a = args(&["stack", "--all", "--format=compact"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.show_all);
+        assert_eq!(parsed.format_override, Some("compact"));
+    }
+
+    #[test]
+    fn parse_stack_submit_with_flag() {
+        let a = args(&["stack", "submit", "--dry-run"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.subcommand, Some("submit"));
+        assert!(!parsed.show_help);
+        assert!(!parsed.show_all);
+    }
+
+    #[test]
+    fn parse_stack_format_before_subcommand() {
+        let a = args(&["stack", "--format=regular", "submit"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.subcommand, Some("submit"));
+        assert_eq!(parsed.format_override, Some("regular"));
+    }
+
+    #[test]
+    fn parse_stack_format_separate_before_subcommand() {
+        let a = args(&["stack", "--format", "regular", "submit"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.subcommand, Some("submit"));
+        assert_eq!(parsed.format_override, Some("regular"));
+    }
+
+    #[test]
+    fn parse_stack_all_format_reversed_order() {
+        let a = args(&["stack", "--format=regular", "--all"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.show_all);
+        assert_eq!(parsed.format_override, Some("regular"));
+    }
+
+    #[test]
+    fn parse_stack_unknown_flags_ignored() {
+        let a = args(&["stack", "--dry-run", "submit"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert_eq!(parsed.subcommand, Some("submit"));
+        assert!(!parsed.show_help);
+        assert!(!parsed.show_all);
+        assert!(parsed.format_override.is_none());
+    }
+
+    #[test]
+    fn parse_stack_format_without_value() {
+        // --format at end without a value — format_override stays None
+        let a = args(&["stack", "--format"]);
+        let parsed = parse_stack_dispatch_args(&a);
+        assert!(parsed.format_override.is_none());
+    }
 
     #[test]
     fn test_pr_parts_strips_metadata() {

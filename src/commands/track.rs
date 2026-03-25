@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_registry;
+use crate::stack_render::StackFormat;
 use crate::types::{PlanRegistry, PlannedBookmark};
 use crate::workspace::Workspace;
 
@@ -29,6 +30,7 @@ pub fn run_track(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args: bookmark name (required positional)
@@ -114,7 +116,7 @@ pub fn run_track(
     eprintln!("Tracking plan: {} (jj:{})", bookmark_name, bookmark.change_id);
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }

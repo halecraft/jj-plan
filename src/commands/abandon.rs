@@ -1,5 +1,6 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
+use crate::stack_render::StackFormat;
 use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
@@ -17,7 +18,8 @@ pub fn run_abandon(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // Standard lifecycle: flush → command → reload → sync → show
-    crate::wrap::wrap(plan_dir, jj, args, workspace, registry)
+    crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
 }

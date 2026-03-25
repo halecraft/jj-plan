@@ -1,6 +1,7 @@
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
+use crate::stack_render::StackFormat;
 use crate::template;
 use crate::types::{LogEntry, PlanRegistry, PlannedBookmark};
 use crate::workspace::Workspace;
@@ -26,6 +27,7 @@ pub fn run_new(
     args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
+    format: StackFormat,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args: bookmark name (required positional) + jj new flags
@@ -285,7 +287,7 @@ pub fn run_new(
     }
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry);
+    crate::wrap::resolve_sync_and_show(plan_dir, workspace, &post_registry, format);
 
     Ok(0)
 }
