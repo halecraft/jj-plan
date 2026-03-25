@@ -108,7 +108,8 @@ Added in jj:zypnnqyt. Adapted from ryu's `JjWorkspace` for jj-lib 0.38:
 | `git_remotes()` | List all git remotes with URLs (via gix) |
 | `default_branch()` | Detect default branch from remote HEAD, fallback to main/master/trunk |
 | `git_fetch(remote)` | Fetch + import refs + rebase descendants |
-| `git_push(bookmark, remote)` | Export refs + push + update tracking ref |
+| `git_fetch_bookmarks(remote, bookmarks)` | Fetch only named bookmarks (uses `StringExpression::union_all` of `exact()`) — used by submit for pre-push tracking-ref refresh |
+| `git_push(bookmark, remote)` → `PushOutcome` | Export refs + push + conditionally update tracking ref. Returns `PushOutcome::Success`, `Rejected { reason }` (lease failure), or `RemoteRejected { reason }` (server hooks/branch protection). On rejection, the tracking ref is **not** updated — preserving jj's accurate view of the remote and preventing cascading lease failures. |
 | `rebase_bookmark_onto_trunk(bookmark)` | Resolve trunk/bookmark via revset, use `move_commits` |
 | `delete_bookmark(bookmark)` | Set local bookmark target to absent |
 
@@ -549,8 +550,10 @@ For each segment in the chain:
 
 ### Phase 3: Execution (`execute.rs`)
 
+**Pre-push fetch.** Before executing the plan, `run_submit_async` collects all bookmark names from `Push` steps and calls `workspace.git_fetch_bookmarks(remote, &bookmarks)`. This refreshes the local remote-tracking refs so that `git_push`'s `--force-with-lease` check uses up-to-date expectations. Fetch failure is non-fatal (logged as a warning) — the push may still succeed if tracking state happens to be correct.
+
 Processes steps sequentially:
-- `Push`: `workspace.git_push(bookmark, remote)`
+- `Push`: `workspace.git_push(bookmark, remote)` — returns `PushOutcome`. On `Rejected` or `RemoteRejected`, the error is reported via `PushStatus::Failed` with an actionable message (e.g., "try `jj git fetch` to refresh tracking state") and added to `result.errors`. The tracking ref is not corrupted.
 - `CreatePr`: `platform.create_pr_with_options(...)`
 - `UpdateBase`: `platform.update_pr_base(number, new_base)`
 - `UpdateDescription`: `platform.update_pr_description(number, title, body)`

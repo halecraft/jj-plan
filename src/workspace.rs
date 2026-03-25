@@ -37,9 +37,9 @@ use jj_lib::backend::ChangeId;
 use jj_lib::commit::Commit;
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::git::{
-    self, GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitRefUpdate,
-    GitSettings, GitSidebandLineTerminator, GitSubprocessCallback, expand_fetch_refspecs,
-    export_refs,
+    self, GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitPushStats,
+    GitRefUpdate, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback,
+    expand_fetch_refspecs, export_refs,
 };
 use jj_lib::hex_util::encode_reverse_hex;
 use jj_lib::object_id::ObjectId as _;
@@ -69,6 +69,39 @@ use crate::types::{Bookmark, GitRemote, LogEntry};
 pub struct Workspace {
     workspace: jj_lib::workspace::Workspace,
     repo: Arc<ReadonlyRepo>,
+}
+
+/// Outcome of a `git_push` operation.
+///
+/// Distinguishes between successful pushes, lease-failure rejections
+/// (local tracking ref doesn't match remote), and remote-side rejections
+/// (branch protection, server hooks, etc.). Hard failures (no such remote,
+/// export failure) are returned as `Err(JjPlanError)` instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The ref was accepted by the remote.
+    Success,
+    /// The ref was rejected due to a lease failure (local expectation of
+    /// remote state didn't match reality). Typically means a fetch is needed
+    /// to refresh the tracking ref before retrying.
+    Rejected { reason: String },
+    /// The ref was rejected by the remote server (branch protection rules,
+    /// server-side hooks, etc.).
+    RemoteRejected { reason: String },
+}
+
+/// Pure decision function: should the local remote-tracking ref be updated
+/// after a push?
+///
+/// Only returns `true` when the ref appears in `stats.pushed`. If the ref
+/// was rejected (lease failure or remote rejection), the tracking ref must
+/// NOT be updated — doing so would corrupt jj's view of the remote and
+/// cause cascading lease failures on subsequent pushes.
+pub fn should_update_tracking(stats: &GitPushStats, qualified_ref: &str) -> bool {
+    stats
+        .pushed
+        .iter()
+        .any(|name| AsRef::<str>::as_ref(name) == qualified_ref)
 }
 
 /// No-op callback for git subprocess operations.
@@ -587,12 +620,103 @@ impl Workspace {
         Ok(())
     }
 
+    /// Fetch specific bookmarks from a git remote.
+    ///
+    /// Like `git_fetch` but restricted to the named bookmarks, avoiding the
+    /// overhead of fetching every remote ref. Used by `jj stack submit` to
+    /// refresh tracking state before pushing.
+    pub fn git_fetch_bookmarks(
+        &mut self,
+        remote: &str,
+        bookmarks: &[&str],
+    ) -> std::result::Result<(), JjPlanError> {
+        if bookmarks.is_empty() {
+            return Ok(());
+        }
+
+        // Reload to get fresh state before write
+        self.reload();
+
+        let settings = build_minimal_settings()?;
+        let git_settings = GitSettings::from_settings(&settings)
+            .map_err(|e| JjPlanError::Config(format!("Invalid git settings: {e}")))?;
+
+        let mut tx = self.repo.start_transaction();
+
+        let import_options = GitImportOptions {
+            auto_local_bookmark: git_settings.auto_local_bookmark,
+            abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+            remote_auto_track_bookmarks: std::iter::once((
+                RemoteNameBuf::from(remote),
+                StringMatcher::all(),
+            ))
+            .collect(),
+        };
+
+        let mut fetch = GitFetch::new(
+            tx.repo_mut(),
+            git_settings.to_subprocess_options(),
+            &import_options,
+        )
+        .map_err(|e| JjPlanError::Git(format!("Failed to create fetch: {e}")))?;
+
+        // Build a union of exact bookmark expressions instead of all().
+        let bookmark_expr = StringExpression::union_all(
+            bookmarks
+                .iter()
+                .map(|b| StringExpression::exact(*b))
+                .collect(),
+        );
+
+        let remote_name = RemoteName::new(remote);
+        let refspecs = expand_fetch_refspecs(
+            remote_name,
+            GitFetchRefExpression {
+                bookmark: bookmark_expr,
+                tag: StringExpression::none(),
+            },
+        )
+        .map_err(|e| JjPlanError::Git(format!("Failed to expand refspecs: {e}")))?;
+
+        let mut callback = NoopGitCallback;
+        fetch
+            .fetch(remote_name, refspecs, &mut callback, None, None)
+            .map_err(|e| JjPlanError::Git(format!("Failed to fetch: {e}")))?;
+
+        fetch
+            .import_refs()
+            .map_err(|e| JjPlanError::Git(format!("Failed to import refs: {e}")))?;
+
+        // Rebase descendants if there were any rewrites from the import
+        if tx.repo().has_rewrites() {
+            tx.repo_mut()
+                .rebase_descendants()
+                .map_err(|e| JjPlanError::Git(format!("Failed to rebase descendants: {e}")))?;
+        }
+
+        let names = bookmarks.join(", ");
+        let new_repo = tx
+            .commit(format!("fetch [{names}] from {remote}"))
+            .map_err(|e| JjPlanError::Git(format!("Failed to commit fetch: {e}")))?;
+        self.repo = new_repo;
+
+        Ok(())
+    }
+
     /// Push a bookmark to a remote.
+    ///
+    /// Returns `Ok(PushOutcome::Success)` when the ref was accepted,
+    /// `Ok(PushOutcome::Rejected{..})` on lease failure (stale tracking ref),
+    /// `Ok(PushOutcome::RemoteRejected{..})` on server-side rejection
+    /// (branch protection, hooks), or `Err` on hard failures.
+    ///
+    /// On rejection, the local remote-tracking ref is NOT updated, preserving
+    /// jj's accurate view of the remote state.
     pub fn git_push(
         &mut self,
         bookmark: &str,
         remote: &str,
-    ) -> std::result::Result<(), JjPlanError> {
+    ) -> std::result::Result<PushOutcome, JjPlanError> {
         // Reload to get fresh state before write
         self.reload();
 
@@ -631,14 +755,15 @@ impl Workspace {
             )));
         }
 
+        let qualified_name = format!("refs/heads/{bookmark}");
         let update = GitRefUpdate {
-            qualified_name: format!("refs/heads/{bookmark}").into(),
+            qualified_name: qualified_name.clone().into(),
             expected_current_target,
             new_target,
         };
 
         let mut callback = NoopGitCallback;
-        git::push_updates(
+        let stats = git::push_updates(
             tx.repo().base_repo().as_ref(),
             git_settings.to_subprocess_options(),
             remote_name,
@@ -647,20 +772,53 @@ impl Workspace {
         )
         .map_err(|e| JjPlanError::Git(format!("Failed to push: {e}")))?;
 
-        // Update the remote tracking ref
-        let new_remote_ref = RemoteRef {
-            target: target.clone(),
-            state: RemoteRefState::Tracked,
-        };
-        tx.repo_mut()
-            .set_remote_bookmark(remote_symbol, new_remote_ref);
+        // Check for rejections BEFORE updating tracking refs.
+        // Lease failure: local expected_current_target didn't match remote.
+        if let Some(reason) = stats
+            .rejected
+            .iter()
+            .find(|(name, _)| AsRef::<str>::as_ref(name) == qualified_name)
+            .map(|(_, reason)| {
+                reason
+                    .clone()
+                    .unwrap_or_else(|| "lease failure (stale tracking ref)".to_string())
+            })
+        {
+            // Do NOT update tracking ref — our view of the remote is stale,
+            // and we must not overwrite it with incorrect state.
+            return Ok(PushOutcome::Rejected { reason });
+        }
 
-        let new_repo = tx
-            .commit(format!("push {bookmark} to {remote}"))
-            .map_err(|e| JjPlanError::Git(format!("Failed to commit push: {e}")))?;
-        self.repo = new_repo;
+        // Remote rejection: server-side hooks, branch protection, etc.
+        if let Some(reason) = stats
+            .remote_rejected
+            .iter()
+            .find(|(name, _)| AsRef::<str>::as_ref(name) == qualified_name)
+            .map(|(_, reason)| {
+                reason
+                    .clone()
+                    .unwrap_or_else(|| "rejected by remote".to_string())
+            })
+        {
+            return Ok(PushOutcome::RemoteRejected { reason });
+        }
 
-        Ok(())
+        // Only update the remote tracking ref when the push actually landed.
+        if should_update_tracking(&stats, &qualified_name) {
+            let new_remote_ref = RemoteRef {
+                target: target.clone(),
+                state: RemoteRefState::Tracked,
+            };
+            tx.repo_mut()
+                .set_remote_bookmark(remote_symbol, new_remote_ref);
+
+            let new_repo = tx
+                .commit(format!("push {bookmark} to {remote}"))
+                .map_err(|e| JjPlanError::Git(format!("Failed to commit push: {e}")))?;
+            self.repo = new_repo;
+        }
+
+        Ok(PushOutcome::Success)
     }
 
     /// Rebase a bookmark and its descendants onto trunk.
@@ -1048,4 +1206,87 @@ fn timestamp_to_datetime(timestamp: &jj_lib::backend::Timestamp) -> chrono::Date
         .timestamp_millis_opt(timestamp.timestamp.0)
         .single()
         .unwrap_or_else(chrono::Utc::now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jj_lib::git::GitPushStats;
+    use jj_lib::ref_name::GitRefNameBuf;
+
+    #[test]
+    fn push_outcome_variants_are_constructible() {
+        let success = PushOutcome::Success;
+        let rejected = PushOutcome::Rejected {
+            reason: "stale lease".into(),
+        };
+        let remote_rejected = PushOutcome::RemoteRejected {
+            reason: "branch protection".into(),
+        };
+
+        assert_eq!(success, PushOutcome::Success);
+        assert!(matches!(rejected, PushOutcome::Rejected { .. }));
+        assert!(matches!(remote_rejected, PushOutcome::RemoteRejected { .. }));
+    }
+
+    fn make_stats(
+        pushed: &[&str],
+        rejected: &[(&str, Option<&str>)],
+        remote_rejected: &[(&str, Option<&str>)],
+    ) -> GitPushStats {
+        GitPushStats {
+            pushed: pushed.iter().map(|s| GitRefNameBuf::from(*s)).collect(),
+            rejected: rejected
+                .iter()
+                .map(|(name, reason)| {
+                    (GitRefNameBuf::from(*name), reason.map(|r| r.to_string()))
+                })
+                .collect(),
+            remote_rejected: remote_rejected
+                .iter()
+                .map(|(name, reason)| {
+                    (GitRefNameBuf::from(*name), reason.map(|r| r.to_string()))
+                })
+                .collect(),
+            unexported_bookmarks: vec![],
+        }
+    }
+
+    #[test]
+    fn should_update_tracking_true_when_pushed() {
+        let stats = make_stats(&["refs/heads/feat-auth"], &[], &[]);
+        assert!(should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
+
+    #[test]
+    fn should_update_tracking_false_when_not_in_pushed() {
+        let stats = make_stats(&["refs/heads/other"], &[], &[]);
+        assert!(!should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
+
+    #[test]
+    fn should_update_tracking_false_when_rejected() {
+        let stats = make_stats(
+            &[],
+            &[("refs/heads/feat-auth", Some("stale"))],
+            &[],
+        );
+        assert!(!should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
+
+    #[test]
+    fn should_update_tracking_false_when_remote_rejected() {
+        let stats = make_stats(
+            &[],
+            &[],
+            &[("refs/heads/feat-auth", Some("protected branch"))],
+        );
+        assert!(!should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
+
+    #[test]
+    fn should_update_tracking_false_when_empty_stats() {
+        let stats = make_stats(&[], &[], &[]);
+        assert!(!should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
 }

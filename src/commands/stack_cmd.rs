@@ -597,6 +597,28 @@ async fn run_submit_async(
         eprintln!("Dry run — no changes will be made:");
     }
 
+    // Pre-push fetch: refresh tracking refs for bookmarks we're about to push.
+    // This ensures `expected_current_target` reflects the remote's actual state,
+    // preventing stale-lease failures from `--force-with-lease`.
+    if !dry_run {
+        let push_bookmarks: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ExecutionStep::Push { bookmark } => Some(bookmark.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        if !push_bookmarks.is_empty() {
+            if let Err(e) = workspace.git_fetch_bookmarks(&ctx.remote_name, &push_bookmarks) {
+                // Fetch failure is non-fatal — push may still succeed if
+                // tracking state happens to be correct.
+                eprintln!("Warning: pre-push fetch failed: {e}");
+            }
+        }
+    }
+
     // Execute — use NoopProgress for dry-run to avoid duplicating messages
     // (dry-run output comes from execute_submission's own dry-run branch).
     let noop = NoopProgress;

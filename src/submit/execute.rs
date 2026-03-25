@@ -9,7 +9,7 @@ use crate::pr_cache::PrCache;
 use crate::submit::plan::{ExecutionStep, SubmissionPlan};
 use crate::submit::progress::{Phase, ProgressCallback, PushStatus};
 use crate::types::PullRequest;
-use crate::workspace::Workspace;
+use crate::workspace::{PushOutcome, Workspace};
 
 /// Result of submission execution.
 #[derive(Debug, Default)]
@@ -126,11 +126,30 @@ pub async fn execute_submission(
                     .await?;
 
                 match workspace.git_push(bookmark, &plan.remote) {
-                    Ok(()) => {
+                    Ok(PushOutcome::Success) => {
                         progress
                             .on_bookmark_push(bookmark, PushStatus::Success)
                             .await?;
                         result.pushed.push(bookmark.clone());
+                    }
+                    Ok(PushOutcome::Rejected { reason }) => {
+                        let msg = format!(
+                            "Push rejected for {bookmark}: {reason} \
+                             (try `jj git fetch` to refresh tracking state)"
+                        );
+                        progress
+                            .on_bookmark_push(bookmark, PushStatus::Failed(msg.clone()))
+                            .await?;
+                        result.errors.push(msg);
+                    }
+                    Ok(PushOutcome::RemoteRejected { reason }) => {
+                        let msg = format!(
+                            "Push rejected by remote for {bookmark}: {reason}"
+                        );
+                        progress
+                            .on_bookmark_push(bookmark, PushStatus::Failed(msg.clone()))
+                            .await?;
+                        result.errors.push(msg);
                     }
                     Err(e) => {
                         let msg = format!("Failed to push {bookmark}: {e}");
