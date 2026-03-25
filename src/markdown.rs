@@ -1,176 +1,212 @@
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
-// Metadata parsing (summary-first format)
+// Metadata parsing (Obsidian-style callout block format)
 // ---------------------------------------------------------------------------
 
-/// Check if a line looks like a metadata key: `^[a-z][a-z0-9_-]*:\s`.
+/// Check if a line (after stripping `> ` prefix) looks like a metadata key.
 ///
-/// This prevents false positives from prose lines with colons
-/// (e.g. "Note: this is important" — `Note` starts with uppercase).
-fn is_metadata_key_line(line: &str) -> bool {
+/// Pattern: `^[a-z][a-z0-9_-]*: ` (lowercase key, colon, space, value).
+/// This prevents false positives from prose lines with colons.
+fn is_callout_metadata_line(line: &str) -> bool {
     let bytes = line.as_bytes();
-    if bytes.is_empty() {
+    if bytes.is_empty() || !bytes[0].is_ascii_lowercase() {
         return false;
     }
-    // First char must be lowercase ascii letter
-    if !bytes[0].is_ascii_lowercase() {
-        return false;
-    }
-    // Find the colon
     let colon_pos = match line.find(':') {
         Some(p) => p,
         None => return false,
     };
-    // Everything before the colon must be [a-z0-9_-]
     if !line[..colon_pos]
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     {
         return false;
     }
-    // Must have a space (or end of line) after the colon
     let after_colon = &line[colon_pos + 1..];
     after_colon.is_empty() || after_colon.starts_with(' ')
 }
 
-/// Extract summary-first metadata from a plan description.
+/// Check if a line is a `> [!plan]` callout opener (case-insensitive on `plan`).
+fn is_callout_opener(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    if !trimmed.starts_with("> [!") {
+        return false;
+    }
+    let after_prefix = &trimmed[4..];
+    let close_bracket = match after_prefix.find(']') {
+        Some(p) => p,
+        None => return false,
+    };
+    let tag = &after_prefix[..close_bracket];
+    tag.eq_ignore_ascii_case("plan")
+}
+
+/// Extract Obsidian-style callout metadata from a plan description.
 ///
 /// Format:
 /// ```text
 /// feat: my feature          ← line 1: always the title
-/// status: 🔴                ← metadata key: value lines
-/// issue: MERC-123
-/// ---                       ← separator
+///
+/// > [!plan]                 ← callout opener (case-insensitive)
+/// > status: 🔴              ← metadata key: value lines
+/// > issue: MERC-123
 ///
 /// # Background              ← body
 /// ```
 ///
-/// Returns a map of key-value pairs and the body slice (everything after
-/// the `---` separator). If no metadata block is found, returns an empty
-/// map and everything after line 1 as the body.
+/// Returns a map of key-value pairs and the body (input with the title line
+/// and callout block lines removed). If no `> [!plan]` block is found,
+/// returns an empty map and everything after line 1 as the body.
 ///
 /// Parsing rules:
 /// - Line 1 is always the title — never metadata.
-/// - Starting at line 2, scan for lines matching `^[a-z][a-z0-9_-]*: `.
-/// - The metadata region ends at the first `---` line.
-/// - If a non-metadata line is encountered before `---`, there is no
-///   metadata — the entire description after line 1 is body.
-/// - Key names restricted to `[a-z][a-z0-9_-]*` to prevent false positives.
-pub fn parse_metadata(input: &str) -> (BTreeMap<String, String>, &str) {
-    // Need at least a title line
-    let first_newline = match input.find('\n') {
-        Some(pos) => pos,
-        None => return (BTreeMap::new(), ""), // single line, no body
-    };
-
-    let after_title = &input[first_newline + 1..];
-
-    // Scan metadata lines: contiguous key: value lines terminated by ---
-    let mut map = BTreeMap::new();
-    let mut cursor = 0; // byte offset within after_title
-
-    for line in after_title.lines() {
-        if line == "---" {
-            // Found the separator — body starts after "---\n"
-            let sep_end = cursor + 3; // skip "---"
-            let body_start = if first_newline + 1 + sep_end < input.len() {
-                // Skip the \n after ---
-                first_newline + 1 + sep_end + 1
-            } else {
-                input.len()
-            };
-            let body = &input[body_start..];
-            return (map, body);
-        }
-
-        if !is_metadata_key_line(line) {
-            // Non-metadata line before --- → no metadata block
-            // Body is everything after line 1
-            return (BTreeMap::new(), after_title);
-        }
-
-        // Parse key: value
-        let colon_pos = line.find(':').unwrap(); // safe: is_metadata_key_line checks this
-        let key = &line[..colon_pos];
-        let value = line[colon_pos + 1..].trim();
-        map.insert(key.to_string(), value.to_string());
-
-        cursor += line.len() + 1; // +1 for the \n
+/// - Scan all lines (after title) for `> [!plan]` (the callout opener).
+/// - Read subsequent `> key: value` lines. The block ends at the first line
+///   that doesn't start with `> ` or doesn't match `key: value` pattern.
+/// - Blank lines before/after the callout block do not affect parsing.
+/// - Body is everything outside the title line and the callout block lines.
+pub fn parse_metadata(input: &str) -> (BTreeMap<String, String>, String) {
+    let title_end = input.find('\n').unwrap_or(input.len());
+    if title_end == input.len() {
+        return (BTreeMap::new(), String::new()); // single line, no body
     }
 
-    // Reached end of input without finding --- → no metadata
-    // (all lines looked like metadata keys but no separator)
-    (BTreeMap::new(), after_title)
-}
+    let after_title = &input[title_end + 1..];
+    let lines: Vec<&str> = after_title.lines().collect();
 
-/// Set a metadata field, creating the metadata block if it doesn't exist.
-///
-/// If the key already exists, its value is replaced. If no metadata block
-/// exists, inserts `key: value\n---\n` after line 1. All other content is
-/// preserved byte-for-byte.
-pub fn set_metadata_field(input: &str, key: &str, value: &str) -> String {
-    let first_newline = match input.find('\n') {
-        Some(pos) => pos,
+    // Find the callout opener line index
+    let opener_idx = match lines.iter().position(|l| is_callout_opener(l)) {
+        Some(idx) => idx,
         None => {
-            // Single line (title only) — append metadata + separator
-            return format!("{}\n{}: {}\n---\n", input, key, value);
+            // No callout block — body is everything after title
+            return (BTreeMap::new(), after_title.to_string());
         }
     };
 
-    let title_line = &input[..first_newline];
-    let after_title = &input[first_newline + 1..];
+    // Collect metadata lines: lines after the opener that start with "> "
+    // and whose content (after "> ") matches the key: value pattern.
+    let mut map = BTreeMap::new();
+    let mut block_end = opener_idx + 1; // exclusive index past last callout line
 
-    // Check if there's an existing metadata block
-    let (existing_map, _) = parse_metadata(input);
-
-    if existing_map.is_empty() {
-        // No existing metadata — insert key: value + --- after title
-        return format!("{}\n{}: {}\n---\n{}", title_line, key, value, after_title);
+    for line in &lines[opener_idx + 1..] {
+        if let Some(content) = line.strip_prefix("> ")
+            && is_callout_metadata_line(content) {
+                let colon_pos = content.find(':').unwrap();
+                let key = &content[..colon_pos];
+                let value = content[colon_pos + 1..].trim();
+                map.insert(key.to_string(), value.to_string());
+                block_end += 1;
+                continue;
+            }
+        break; // non-metadata line ends the block
     }
 
-    // Has existing metadata — rebuild the metadata lines
-    // Find the --- separator position in after_title
-    let mut cursor = 0;
-    let mut meta_lines: Vec<String> = Vec::new();
-    let mut found = false;
-    let mut body_after_sep = "";
-
-    for line in after_title.lines() {
-        if line == "---" {
-            let sep_end = cursor + 3;
-            let rest_start = if sep_end < after_title.len() {
-                sep_end + 1 // skip \n after ---
-            } else {
-                after_title.len()
-            };
-            body_after_sep = &after_title[rest_start..];
-            break;
+    // Build body: lines outside the callout block (opener..block_end)
+    let mut body = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i >= opener_idx && i < block_end {
+            continue; // skip callout block lines
         }
-        // This is a metadata line — replace or keep
-        let colon_pos = line.find(':').unwrap();
-        let existing_key = &line[..colon_pos];
-        if existing_key == key {
-            meta_lines.push(format!("{}: {}", key, value));
-            found = true;
-        } else {
-            meta_lines.push(line.to_string());
-        }
-        cursor += line.len() + 1;
+        body.push_str(line);
+        body.push('\n');
+    }
+    // Preserve trailing content: if after_title didn't end with \n,
+    // the last line wouldn't have gotten an extra \n from lines().
+    // But .lines() strips trailing newlines, so we need to be careful.
+    // Trim at most one trailing \n that we may have over-added.
+    if !after_title.ends_with('\n') && body.ends_with('\n') {
+        body.pop();
     }
 
-    if !found {
-        meta_lines.push(format!("{}: {}", key, value));
-    }
-
-    format!("{}\n{}\n---\n{}", title_line, meta_lines.join("\n"), body_after_sep)
+    (map, body)
 }
 
-/// Return the body of a document with the metadata block removed.
+/// Set a metadata field in a callout block, creating the block if needed.
 ///
-/// If there is no metadata, returns everything after line 1.
-/// If there is metadata, returns everything after the `---` separator.
-pub fn remove_metadata(input: &str) -> &str {
+/// If a `> [!plan]` block exists, replaces or appends the key within it.
+/// If no callout block exists, inserts one after the title line.
+/// All other content is preserved byte-for-byte.
+pub fn set_metadata_field(input: &str, key: &str, value: &str) -> String {
+    let title_end = input.find('\n').unwrap_or(input.len());
+    if title_end == input.len() {
+        // Single line (title only) — append callout block
+        return format!("{}\n\n> [!plan]\n> {}: {}\n", input, key, value);
+    }
+
+    let title_line = &input[..title_end];
+    let after_title = &input[title_end + 1..];
+    let lines: Vec<&str> = after_title.lines().collect();
+
+    // Find the callout opener
+    let opener_idx = lines.iter().position(|l| is_callout_opener(l));
+
+    match opener_idx {
+        Some(idx) => {
+            // Callout exists — find its metadata lines, replace or append key
+            let mut meta_lines: Vec<String> = Vec::new();
+            let mut found = false;
+            let mut block_end = idx + 1;
+
+            for line in &lines[idx + 1..] {
+                if let Some(content) = line.strip_prefix("> ")
+                    && is_callout_metadata_line(content) {
+                        let colon_pos = content.find(':').unwrap();
+                        let existing_key = &content[..colon_pos];
+                        if existing_key == key {
+                            meta_lines.push(format!("> {}: {}", key, value));
+                            found = true;
+                        } else {
+                            meta_lines.push((*line).to_string());
+                        }
+                        block_end += 1;
+                        continue;
+                    }
+                break;
+            }
+
+            if !found {
+                meta_lines.push(format!("> {}: {}", key, value));
+            }
+
+            // Rebuild: title + lines before callout + opener + meta lines + lines after callout
+            let mut result = String::with_capacity(input.len() + 32);
+            result.push_str(title_line);
+            result.push('\n');
+            for line in &lines[..idx] {
+                result.push_str(line);
+                result.push('\n');
+            }
+            result.push_str(lines[idx]); // opener line
+            result.push('\n');
+            for ml in &meta_lines {
+                result.push_str(ml);
+                result.push('\n');
+            }
+            for line in &lines[block_end..] {
+                result.push_str(line);
+                result.push('\n');
+            }
+            // Match original trailing newline behavior
+            if !after_title.ends_with('\n') && result.ends_with('\n') {
+                result.pop();
+            }
+            result
+        }
+        None => {
+            // No callout block — insert one after title line
+            format!(
+                "{}\n\n> [!plan]\n> {}: {}\n\n{}",
+                title_line, key, value, after_title
+            )
+        }
+    }
+}
+
+/// Return the input with the callout block and title removed.
+///
+/// If there is no callout, returns everything after line 1.
+pub fn remove_metadata(input: &str) -> String {
     let (_, body) = parse_metadata(input);
     body
 }
@@ -186,26 +222,26 @@ pub fn remove_metadata(input: &str) -> &str {
 /// title, metadata, body, and derived transformations without redundant
 /// parsing.
 ///
-/// This is a **parsing facade**, not a domain entity. It borrows from the
-/// input string and should be constructed at the point of use, not stored
-/// on long-lived types.
-pub struct PlanDocument<'a> {
-    raw: &'a str,
-    title: &'a str,
+/// This is a **parsing facade**, not a domain entity. It owns its data
+/// and should be constructed at the point of use, not stored on long-lived
+/// types.
+pub struct PlanDocument {
+    raw: String,
+    title: String,
     metadata: BTreeMap<String, String>,
-    body: &'a str,
+    body: String,
 }
 
-impl<'a> PlanDocument<'a> {
+impl PlanDocument {
     /// Parse a description string into a `PlanDocument`.
     ///
     /// Calls `parse_metadata` once and stores the results. The title is
-    /// always line 1 of the input (summary-first metadata format).
-    pub fn parse(input: &'a str) -> Self {
-        let title = input.lines().next().unwrap_or("");
+    /// always line 1 of the input.
+    pub fn parse(input: &str) -> Self {
+        let title = input.lines().next().unwrap_or("").to_string();
         let (metadata, body) = parse_metadata(input);
         Self {
-            raw: input,
+            raw: input.to_string(),
             title,
             metadata,
             body,
@@ -216,7 +252,7 @@ impl<'a> PlanDocument<'a> {
 
     /// Line 1 of the input — the commit summary / plan title.
     pub fn title(&self) -> &str {
-        self.title
+        &self.title
     }
 
     /// Whether the metadata `status` field is `✅`.
@@ -229,14 +265,14 @@ impl<'a> PlanDocument<'a> {
         &self.metadata
     }
 
-    /// Body content after the `---` separator (or after line 1 if no metadata).
+    /// Body content (everything outside title line and callout block).
     pub fn body(&self) -> &str {
-        self.body
+        &self.body
     }
 
     /// The original unparsed input.
     pub fn raw(&self) -> &str {
-        self.raw
+        &self.raw
     }
 
     // -- Transform methods -------------------------------------------------
@@ -245,25 +281,23 @@ impl<'a> PlanDocument<'a> {
     ///
     /// Computed on demand, not cached.
     pub fn body_sans_scratch(&self) -> String {
-        strip_scratch_sections(self.body)
+        strip_scratch_sections(&self.body)
     }
 
     /// The complete "mark as done" transformation.
     ///
     /// 1. If `!keep_scratch`, strips `[scratch]` sections from the full document.
-    /// 2. Sets metadata `status: ✅`.
+    /// 2. Sets metadata `status: ✅` in the callout block.
     ///
     /// Idempotent: if status is already `✅`, still strips scratch (if requested)
-    /// but doesn't double-stamp. Replaces `append_done_marker` entirely.
+    /// but doesn't double-stamp.
     pub fn as_done(&self, keep_scratch: bool) -> String {
         let base = if keep_scratch {
-            self.raw.to_string()
+            self.raw.clone()
         } else {
-            strip_scratch_sections(self.raw)
+            strip_scratch_sections(&self.raw)
         };
-        // Migrate old ---/--- front matter if present
-        let migrated = migrate_old_front_matter(&base);
-        set_metadata_field(&migrated, "status", "✅")
+        set_metadata_field(&base, "status", "✅")
     }
 
     /// Extract PR title and body for submission.
@@ -271,96 +305,14 @@ impl<'a> PlanDocument<'a> {
     /// Title is `self.title()` (line 1). Body is `self.body()` with
     /// `[scratch]` sections stripped and trimmed. Returns `None` if the
     /// title is empty.
-    ///
-    /// Replaces `plan_content_to_pr_parts` entirely.
     pub fn pr_parts(&self) -> Option<(String, String)> {
         let title = self.title();
         if title.trim().is_empty() {
             return None;
         }
-        let body = strip_scratch_sections(self.body).trim().to_string();
+        let body = strip_scratch_sections(&self.body).trim().to_string();
         Some((title.to_string(), body))
     }
-}
-
-/// Migrate old `---`-delimited front matter to summary-first metadata format.
-///
-/// Old format:
-/// ```text
-/// ---
-/// status: 🔴
-/// ---
-/// feat: my feature
-/// ```
-///
-/// New format:
-/// ```text
-/// feat: my feature
-/// status: 🔴
-/// ---
-/// ```
-///
-/// If the input doesn't start with `---\n`, returns it unchanged.
-/// If the old front matter has no body (no real title after it), returns unchanged.
-pub fn migrate_old_front_matter(input: &str) -> String {
-    if !input.starts_with("---\n") {
-        return input.to_string();
-    }
-
-    let after_open = &input[4..]; // skip "---\n"
-
-    // Find closing "---" delimiter
-    let (fm_end, body_start_in_after_open) = if after_open.starts_with("---\n") {
-        (0, 4)
-    } else if after_open == "---" {
-        (0, 3)
-    } else if let Some(pos) = after_open.find("\n---\n") {
-        (pos, pos + 5)
-    } else if after_open.ends_with("\n---") {
-        let pos = after_open.len() - 4;
-        (pos, after_open.len())
-    } else {
-        // No closing delimiter — not valid old front matter
-        return input.to_string();
-    };
-
-    let fm_content = &after_open[..fm_end];
-    let body_offset = 4 + body_start_in_after_open;
-    let body = if body_offset <= input.len() {
-        &input[body_offset..]
-    } else {
-        ""
-    };
-
-    // The "real" title is the first line of the body after old front matter
-    let title = body.lines().next().unwrap_or("");
-    if title.is_empty() {
-        return input.to_string(); // no real title to migrate
-    }
-
-    // Body after the title line
-    let body_after_title = if let Some(pos) = body.find('\n') {
-        &body[pos + 1..]
-    } else {
-        ""
-    };
-
-    // Rebuild: title\nmetadata_lines\n---\nbody_after_title
-    if fm_content.is_empty() {
-        // Old front matter was empty (---\n---\n) — just drop it
-        return body.to_string();
-    }
-
-    let mut result = String::with_capacity(input.len());
-    result.push_str(title);
-    result.push('\n');
-    for line in fm_content.lines() {
-        result.push_str(line);
-        result.push('\n');
-    }
-    result.push_str("---\n");
-    result.push_str(body_after_title);
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -378,46 +330,20 @@ pub fn migrate_old_front_matter(input: &str) -> String {
 pub fn strip_scratch_sections(input: &str) -> String {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-    // 0. Migrate old ---/--- front matter to summary-first format if needed.
-    //    This ensures pulldown-cmark doesn't misparse `---` as a thematic break.
-    let migrated;
-    let input = if input.starts_with("---\n") {
-        migrated = migrate_old_front_matter(input);
-        &migrated
-    } else {
-        input
-    };
-
-    // 1. Extract metadata (if any). When metadata IS present, the metadata
-    //    header (title + key:value lines + ---) is preserved verbatim and
-    //    only the body is processed through pulldown-cmark. When there is
-    //    NO metadata, the entire input is processed (the title line is just
-    //    normal content that could be a [scratch] heading).
-    let (meta_map, body) = parse_metadata(input);
-    let has_metadata = !meta_map.is_empty();
-
-    let (meta_raw, parseable) = if has_metadata {
-        // Preserve metadata header, only scratch-strip the body
-        let header = &input[..input.len() - body.len()];
-        (header, body)
-    } else {
-        // No metadata — process the entire input
-        ("", input)
-    };
-
-    if parseable.is_empty() {
-        return input.to_string();
+    if input.is_empty() {
+        return String::new();
     }
 
-    // 2. Parse body with pulldown-cmark to find heading sections
-    //    We collect (heading_level, heading_text, section_start_byte) tuples
+    // Parse the entire input with pulldown-cmark to find heading sections.
+    // With the callout metadata format, there is no `---` metadata delimiter
+    // to confuse pulldown-cmark — callout blocks are valid blockquotes.
     struct HeadingInfo {
         level: u8,
         text: String,
         start: usize, // byte offset into `body`
     }
 
-    let parser = Parser::new_ext(parseable, Options::all());
+    let parser = Parser::new_ext(input, Options::all());
     let mut headings: Vec<HeadingInfo> = Vec::new();
     let mut current_heading_level: Option<u8> = None;
     let mut current_heading_text = String::new();
@@ -462,7 +388,7 @@ pub fn strip_scratch_sections(input: &str) -> String {
             let scratch_level = h.level;
 
             // Find where this section ends
-            let mut end = parseable.len();
+            let mut end = input.len();
             for (j, heading) in headings.iter().enumerate().skip(i + 1) {
                 if heading.level <= scratch_level {
                     end = heading.start;
@@ -470,7 +396,7 @@ pub fn strip_scratch_sections(input: &str) -> String {
                     break;
                 }
             }
-            if end == parseable.len() {
+            if end == input.len() {
                 i = headings.len(); // consumed everything to the end
             }
 
@@ -484,24 +410,20 @@ pub fn strip_scratch_sections(input: &str) -> String {
         return input.to_string();
     }
 
-    // 4. Slice body around removal ranges, preserving original bytes
+    // Slice input around removal ranges, preserving original bytes
     let mut result = String::with_capacity(input.len());
-    result.push_str(meta_raw);
-
     let mut cursor = 0;
     for range in &removal_ranges {
         if range.start > cursor {
-            result.push_str(&parseable[cursor..range.start]);
+            result.push_str(&input[cursor..range.start]);
         }
         cursor = range.end;
     }
-    if cursor < parseable.len() {
-        result.push_str(&parseable[cursor..]);
+    if cursor < input.len() {
+        result.push_str(&input[cursor..]);
     }
 
-    // 5. Handle edge case: if everything was stripped, return empty
-    //    (but preserve metadata header if present)
-    if result == meta_raw && !has_metadata {
+    if result.is_empty() {
         return String::new();
     }
 
@@ -512,340 +434,298 @@ pub fn strip_scratch_sections(input: &str) -> String {
 // Legacy helpers (used by strip_scratch_sections_legacy in tests)
 // ---------------------------------------------------------------------------
 
-/// Parse a code fence opener line. Returns `Some((char, count))` if it's a fence opener.
-///
-/// A fence opener starts with 3 or more backticks or tildes, optionally followed by an
-/// info string (for backticks) or whitespace (for tildes).
-#[cfg(test)]
-fn parse_code_fence_opener(line: &str) -> Option<(char, usize)> {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
 
-    let first = trimmed.chars().next()?;
-    if first != '`' && first != '~' {
-        return None;
-    }
-
-    let count = trimmed.chars().take_while(|&c| c == first).count();
-    if count < 3 {
-        return None;
-    }
-
-    // For backtick fences, the info string must not contain backticks
-    if first == '`' {
-        let rest = &trimmed[count..];
-        if rest.contains('`') {
-            return None;
-        }
-    }
-
-    Some((first, count))
-}
-
-/// Check if a line closes a code fence opened with `fence_char` repeated `fence_count` times.
-///
-/// A closer has at least `fence_count` of the same character, with nothing else (except whitespace).
-#[cfg(test)]
-fn is_code_fence_closer(line: &str, fence_char: char, fence_count: usize) -> bool {
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    let first = trimmed.chars().next().unwrap();
-    if first != fence_char {
-        return false;
-    }
-
-    let count = trimmed.chars().take_while(|&c| c == fence_char).count();
-    if count < fence_count {
-        return false;
-    }
-
-    // The rest of the line (after the fence chars) must be only whitespace
-    trimmed[count..].trim().is_empty()
-}
-
-/// Parse a heading line and return its level (1–6), or None if it's not a heading.
-///
-/// An ATX heading starts with 1–6 `#` characters followed by at least one space
-/// (or the line is just `#` characters, though that's non-standard).
-#[cfg(test)]
-fn parse_heading_level(line: &str) -> Option<usize> {
-    let trimmed = line.trim_start();
-    if !trimmed.starts_with('#') {
-        return None;
-    }
-
-    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
-    if hashes == 0 || hashes > 6 {
-        return None;
-    }
-
-    // Must be followed by a space or be the entire line
-    let rest = &trimmed[hashes..];
-    if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\t') {
-        Some(hashes)
-    } else {
-        None
-    }
-}
-
-/// Check if a heading line contains `[scratch]` (case-insensitive).
-#[cfg(test)]
-fn heading_has_scratch(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    lower.contains("[scratch]")
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── Legacy implementation for comparison testing ──────────────────
-
-    /// The original line-based scratch section stripper (ATX headings only).
-    /// Kept for comparison testing during the pulldown-cmark transition.
-    #[allow(dead_code)]
-    fn strip_scratch_sections_legacy(input: &str) -> String {
-        let has_trailing_newline = input.ends_with('\n');
-        let lines: Vec<&str> = input.lines().collect();
-
-        let mut kept: Vec<&str> = Vec::new();
-
-        // Code fence tracking
-        let mut in_code_fence = false;
-        let mut fence_char: char = '`';
-        let mut fence_count: usize = 0;
-
-        // Scratch stripping state: Some(level) means we're stripping at that heading level
-        let mut stripping: Option<usize> = None;
-
-        for line in &lines {
-            if in_code_fence {
-                if is_code_fence_closer(line, fence_char, fence_count) {
-                    in_code_fence = false;
-                }
-                if stripping.is_some() {
-                    continue;
-                }
-                kept.push(line);
-                continue;
-            }
-
-            if let Some((ch, count)) = parse_code_fence_opener(line) {
-                in_code_fence = true;
-                fence_char = ch;
-                fence_count = count;
-                if stripping.is_some() {
-                    continue;
-                }
-                kept.push(line);
-                continue;
-            }
-
-            if let Some(level) = parse_heading_level(line) {
-                if let Some(strip_level) = stripping {
-                    if level <= strip_level {
-                        stripping = None;
-                    } else {
-                        continue;
-                    }
-                }
-
-                if heading_has_scratch(line) {
-                    stripping = Some(level);
-                    continue;
-                }
-
-                kept.push(line);
-                continue;
-            }
-
-            if stripping.is_some() {
-                continue;
-            }
-            kept.push(line);
-        }
-
-        let mut result = kept.join("\n");
-        if has_trailing_newline && !result.is_empty() {
-            result.push('\n');
-        }
-        result
-    }
-
-    // ── Metadata parser tests ────────────────────────────────────────
+    // ── Metadata parser tests (callout format) ───────────────────────
 
     #[test]
-    fn test_parse_metadata_basic() {
-        let input = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\nbody";
+    fn parse_metadata_callout_basic() {
+        let input = "feat: my feature\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\n# Background\n";
         let (map, body) = parse_metadata(input);
         assert_eq!(map.get("status").unwrap(), "🔴");
         assert_eq!(map.get("issue").unwrap(), "MERC-123");
-        assert_eq!(body, "body");
+        assert!(body.contains("# Background"));
+        assert!(!body.contains("> [!plan]"));
+        assert!(!body.contains("> status:"));
     }
 
     #[test]
-    fn test_parse_metadata_none_blank_line() {
-        // Blank line after title → no metadata
+    fn parse_metadata_callout_multiple_keys() {
+        let input = "title\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n> priority: high\n";
+        let (map, _body) = parse_metadata(input);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get("status").unwrap(), "🔴");
+        assert_eq!(map.get("issue").unwrap(), "MERC-123");
+        assert_eq!(map.get("priority").unwrap(), "high");
+    }
+
+    #[test]
+    fn parse_metadata_callout_with_blank_lines() {
+        // Blank lines before and after callout don't affect parsing
+        let input = "feat: title\n\n\n\n> [!plan]\n> status: 🔴\n\n\n# Background\n";
+        let (map, body) = parse_metadata(input);
+        assert_eq!(map.get("status").unwrap(), "🔴");
+        assert!(body.contains("# Background"));
+    }
+
+    #[test]
+    fn parse_metadata_no_callout() {
         let input = "feat: title\n\n# Background\nSome content.";
         let (map, body) = parse_metadata(input);
         assert!(map.is_empty());
-        assert_eq!(body, "\n# Background\nSome content.");
+        assert!(body.contains("# Background"));
+        assert!(body.contains("Some content."));
     }
 
     #[test]
-    fn test_parse_metadata_none_heading() {
-        // Heading after title → no metadata
-        let input = "feat: title\n# Background\nSome content.";
+    fn parse_metadata_callout_body_extraction() {
+        let input = "feat: title\nsome preamble\n\n> [!plan]\n> status: 🔴\n\n# Body\ntext\n";
+        let (map, body) = parse_metadata(input);
+        assert_eq!(map.get("status").unwrap(), "🔴");
+        // Body should contain preamble and body section, but not callout
+        assert!(body.contains("some preamble"));
+        assert!(body.contains("# Body"));
+        assert!(body.contains("text"));
+        assert!(!body.contains("> [!plan]"));
+        assert!(!body.contains("> status:"));
+    }
+
+    #[test]
+    fn parse_metadata_non_metadata_line_ends_block() {
+        // A "> " line without key: value pattern ends the metadata block
+        let input = "title\n\n> [!plan]\n> status: 🔴\n> some prose line\n\n# Body\n";
+        let (map, body) = parse_metadata(input);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("status").unwrap(), "🔴");
+        // The "> some prose line" is NOT part of the metadata block and stays in body
+        assert!(body.contains("> some prose line"));
+    }
+
+    #[test]
+    fn parse_metadata_thematic_break_in_body() {
+        // --- in body is not mistaken for metadata separator
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\n---\n\ntext\n";
+        let (map, body) = parse_metadata(input);
+        assert_eq!(map.get("status").unwrap(), "🔴");
+        assert!(body.contains("---"));
+        assert!(body.contains("text"));
+    }
+
+    #[test]
+    fn parse_metadata_case_insensitive_opener() {
+        let input_lower = "title\n\n> [!plan]\n> status: 🔴\n";
+        let input_upper = "title\n\n> [!PLAN]\n> status: 🔴\n";
+        let input_mixed = "title\n\n> [!Plan]\n> status: 🔴\n";
+
+        for input in [input_lower, input_upper, input_mixed] {
+            let (map, _) = parse_metadata(input);
+            assert_eq!(map.get("status").unwrap(), "🔴", "Failed for: {:?}", input);
+        }
+    }
+
+    #[test]
+    fn parse_metadata_single_line_input() {
+        let input = "feat: title only";
         let (map, body) = parse_metadata(input);
         assert!(map.is_empty());
-        assert_eq!(body, "# Background\nSome content.");
-    }
-
-    #[test]
-    fn test_parse_metadata_no_body_after_separator() {
-        let input = "feat: title\nstatus: ✅\n---\n";
-        let (map, body) = parse_metadata(input);
-        assert_eq!(map.get("status").unwrap(), "✅");
         assert_eq!(body, "");
     }
 
+    // ── set_metadata_field tests (callout format) ────────────────────
+
     #[test]
-    fn test_parse_metadata_no_body_eof_after_separator() {
-        let input = "feat: title\nstatus: ✅\n---";
-        let (map, body) = parse_metadata(input);
-        assert_eq!(map.get("status").unwrap(), "✅");
-        assert!(body.is_empty(), "body should be empty, got: {:?}", body);
+    fn set_metadata_field_replace_existing() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\nbody\n";
+        let result = set_metadata_field(input, "status", "✅");
+        assert!(result.contains("> status: ✅"), "status should be replaced");
+        assert!(result.contains("> issue: MERC-123"), "other fields preserved");
+        assert!(!result.contains("> status: 🔴"), "old value should be gone");
+        assert!(result.contains("body"), "body preserved");
+        assert!(result.starts_with("feat: title\n"), "title preserved");
     }
 
     #[test]
-    fn test_parse_metadata_single_line_input() {
-        let input = "feat: title";
-        let (map, body) = parse_metadata(input);
-        assert!(map.is_empty());
-        assert!(body.is_empty());
+    fn set_metadata_field_append_new_key() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\nbody\n";
+        let result = set_metadata_field(input, "issue", "MERC-456");
+        assert!(result.contains("> status: 🔴"), "existing field preserved");
+        assert!(result.contains("> issue: MERC-456"), "new field appended");
+        assert!(result.contains("body"), "body preserved");
+        assert!(result.starts_with("feat: title\n"), "title preserved");
     }
 
     #[test]
-    fn test_parse_metadata_no_separator_means_no_metadata() {
-        // All lines look like metadata keys but no --- → no metadata
-        let input = "feat: title\nstatus: 🔴\nissue: MERC-123";
-        let (map, body) = parse_metadata(input);
-        assert!(map.is_empty(), "No --- means no metadata block");
-        assert_eq!(body, "status: 🔴\nissue: MERC-123");
-    }
-
-    #[test]
-    fn test_parse_metadata_no_false_positive_from_prose() {
-        // "Note:" starts with uppercase → not a metadata key
-        let input = "feat: title\nNote: this has a colon\n---\nbody";
-        let (map, body) = parse_metadata(input);
-        assert!(map.is_empty(), "Uppercase key should not match metadata pattern");
-        assert_eq!(body, "Note: this has a colon\n---\nbody");
-    }
-
-    #[test]
-    fn test_parse_metadata_thematic_break_in_body() {
-        // --- in body (after non-metadata content) is NOT a metadata delimiter
-        let input = "feat: title\n\n# Background\n\nSome content.\n\n---\n\nMore content.";
-        let (map, body) = parse_metadata(input);
-        assert!(map.is_empty());
-        // Body is everything after title line (blank line stops metadata scan)
-        assert!(body.contains("---"), "thematic break should be in body");
-        assert!(body.contains("More content."), "content after --- should be in body");
-    }
-
-    #[test]
-    fn test_parse_metadata_blank_line_stops_scan() {
-        // Blank line between title and would-be metadata → no metadata
-        let input = "feat: title\n\nstatus: 🔴\n---\nbody";
-        let (map, body) = parse_metadata(input);
-        assert!(map.is_empty());
-        assert_eq!(body, "\nstatus: 🔴\n---\nbody");
-    }
-
-    #[test]
-    fn test_parse_metadata_key_with_hyphens_underscores() {
-        let input = "feat: title\nmy-key: value1\nmy_key2: value2\n---\nbody";
-        let (map, body) = parse_metadata(input);
-        assert_eq!(map.get("my-key").unwrap(), "value1");
-        assert_eq!(map.get("my_key2").unwrap(), "value2");
-        assert_eq!(body, "body");
-    }
-
-    // ── set_metadata_field tests ─────────────────────────────────────
-
-    #[test]
-    fn test_set_metadata_field_new() {
+    fn set_metadata_field_creates_callout() {
         let input = "feat: my feature\n\n# Background\n";
         let result = set_metadata_field(input, "status", "🔴");
-        assert_eq!(result, "feat: my feature\nstatus: 🔴\n---\n\n# Background\n");
+        assert!(result.contains("> [!plan]"), "callout block should be created");
+        assert!(result.contains("> status: 🔴"), "field should be in callout");
+        assert!(result.contains("# Background"), "body preserved");
+        assert!(result.starts_with("feat: my feature\n"), "title preserved");
     }
 
     #[test]
-    fn test_set_metadata_field_new_single_line() {
+    fn set_metadata_field_preserves_body() {
+        let body_section = "\n# Background\n\n  Indented text.\n\n- list item\n";
+        let input = format!("feat: my feature\n\n> [!plan]\n> status: 🔴\n{}", body_section);
+        let result = set_metadata_field(&input, "status", "✅");
+        assert!(result.contains(body_section), "body must be preserved byte-for-byte");
+    }
+
+    #[test]
+    fn set_metadata_field_single_line_input() {
         let input = "feat: my feature";
         let result = set_metadata_field(input, "status", "🔴");
-        assert_eq!(result, "feat: my feature\nstatus: 🔴\n---\n");
+        assert!(result.contains("> [!plan]"), "callout block should be created");
+        assert!(result.contains("> status: 🔴"), "field should be in callout");
+        assert!(result.starts_with("feat: my feature\n"), "title preserved");
     }
 
-    #[test]
-    fn test_set_metadata_field_replace() {
-        let input = "feat: title\nstatus: 🔴\nissue: MERC-123\n---\nbody";
-        let result = set_metadata_field(input, "status", "✅");
-        assert!(result.contains("status: ✅"), "status should be replaced");
-        assert!(result.contains("issue: MERC-123"), "other fields preserved");
-        assert!(!result.contains("status: 🔴"), "old value should be gone");
-        assert!(result.ends_with("body"), "body preserved");
-        assert!(result.starts_with("feat: title\n"), "title preserved");
-    }
+    // ── remove_metadata tests (callout format) ───────────────────────
 
     #[test]
-    fn test_set_metadata_field_append() {
-        let input = "feat: title\nstatus: 🔴\n---\nbody";
-        let result = set_metadata_field(input, "issue", "MERC-456");
-        assert!(result.contains("status: 🔴"), "existing field preserved");
-        assert!(result.contains("issue: MERC-456"), "new field appended");
-        assert!(result.ends_with("body"), "body preserved");
-        assert!(result.starts_with("feat: title\n"), "title preserved");
-    }
-
-    #[test]
-    fn test_set_metadata_field_preserves_body_byte_for_byte() {
-        let body = "\n# Background\n\n  Indented text.\n\n- list item\n";
-        let input = format!("feat: my feature\nstatus: 🔴\n---\n{}", body);
-        let result = set_metadata_field(&input, "status", "✅");
-        assert!(result.ends_with(body), "body must be preserved byte-for-byte");
-    }
-
-    // ── remove_metadata tests ────────────────────────────────────────
-
-    #[test]
-    fn test_remove_metadata() {
-        let input = "feat: title\nstatus: 🔴\nissue: MERC-123\n---\nbody text here";
+    fn remove_metadata_strips_callout() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\nbody text here\n";
         let result = remove_metadata(input);
-        assert_eq!(result, "body text here");
+        assert!(result.contains("body text here"), "body should remain");
+        assert!(!result.contains("> [!plan]"), "callout should be stripped");
+        assert!(!result.contains("> status:"), "metadata should be stripped");
     }
 
     #[test]
-    fn test_remove_metadata_no_metadata() {
+    fn remove_metadata_no_callout() {
         let input = "feat: title\n\nbody text";
         let result = remove_metadata(input);
-        assert_eq!(result, "\nbody text");
+        assert!(result.contains("body text"));
     }
 
     #[test]
-    fn test_remove_metadata_single_line() {
+    fn remove_metadata_single_line() {
         let input = "feat: title";
         let result = remove_metadata(input);
         assert!(result.is_empty());
     }
 
     // ── Existing scratch stripping tests (must pass with new impl) ───
+
+    // ── PlanDocument tests (callout format) ──────────────────────────
+
+    #[test]
+    fn plan_document_parse_with_callout() {
+        let input = "feat: my feature\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\n# Background\n\nDetails.\n";
+        let doc = PlanDocument::parse(input);
+        assert_eq!(doc.title(), "feat: my feature");
+        assert_eq!(doc.metadata().get("status").unwrap(), "🔴");
+        assert_eq!(doc.metadata().get("issue").unwrap(), "MERC-123");
+        assert!(doc.body().contains("# Background"));
+        assert!(!doc.body().contains("> [!plan]"));
+    }
+
+    #[test]
+    fn plan_document_is_done_callout() {
+        let input = "feat: title\n\n> [!plan]\n> status: ✅\n";
+        let doc = PlanDocument::parse(input);
+        assert!(doc.is_done());
+    }
+
+    #[test]
+    fn plan_document_is_done_not_done() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n";
+        let doc = PlanDocument::parse(input);
+        assert!(!doc.is_done());
+    }
+
+    #[test]
+    fn plan_document_as_done_sets_status() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\n# Body\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("> status: ✅"));
+        assert!(!result.contains("> status: 🔴"));
+        assert!(result.contains("# Body"));
+    }
+
+    #[test]
+    fn plan_document_as_done_creates_callout() {
+        let input = "feat: add something\n\n# Background\n\nSome details.";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("> [!plan]"));
+        assert!(result.contains("> status: ✅"));
+        assert!(result.contains("# Background"));
+    }
+
+    #[test]
+    fn plan_document_as_done_strips_scratch() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\n# Keep\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("> status: ✅"));
+        assert!(result.contains("# Keep"));
+        assert!(result.contains("Visible."));
+        assert!(!result.contains("[scratch]"));
+        assert!(!result.contains("Hidden."));
+    }
+
+    #[test]
+    fn plan_document_as_done_keep_scratch() {
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\n# Notes [scratch]\n\nKept.\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(true);
+        assert!(result.contains("> status: ✅"));
+        assert!(result.contains("[scratch]"));
+        assert!(result.contains("Kept."));
+    }
+
+    #[test]
+    fn plan_document_pr_parts_strips_callout() {
+        let input = "feat: my feature\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\n# Background\n\nDetails.\n";
+        let (title, body) = PlanDocument::parse(input).pr_parts().unwrap();
+        assert_eq!(title, "feat: my feature");
+        assert!(!body.contains("> [!plan]"));
+        assert!(!body.contains("> status:"));
+        assert!(!body.contains("> issue:"));
+        assert!(body.contains("# Background"));
+    }
+
+    #[test]
+    fn plan_document_pr_parts_basic() {
+        let input = "feat: title\n\n# Background\n\nContent.\n";
+        let (title, body) = PlanDocument::parse(input).pr_parts().unwrap();
+        assert_eq!(title, "feat: title");
+        assert!(body.contains("# Background"));
+    }
+
+    #[test]
+    fn plan_document_pr_parts_empty_title() {
+        assert!(PlanDocument::parse("").pr_parts().is_none());
+        assert!(PlanDocument::parse("   \n\nbody").pr_parts().is_none());
+    }
+
+    #[test]
+    fn plan_document_title_edge_cases() {
+        // Empty input
+        let doc = PlanDocument::parse("");
+        assert_eq!(doc.title(), "");
+        assert!(doc.body().is_empty());
+        assert!(doc.metadata().is_empty());
+
+        // Whitespace-only title
+        let doc = PlanDocument::parse("   ");
+        assert_eq!(doc.title(), "   ");
+        assert!(doc.body().is_empty());
+
+        // Title with no body
+        let doc = PlanDocument::parse("feat: just a title");
+        assert_eq!(doc.title(), "feat: just a title");
+        assert!(doc.body().is_empty());
+    }
+
+    // ── Scratch stripping tests ─────────────────────────────────────
 
     #[test]
     fn test_no_scratch_sections() {
@@ -1307,12 +1187,13 @@ Content.
     // ── New pulldown-cmark-specific tests ────────────────────────────
 
     #[test]
-    fn test_scratch_strip_with_metadata() {
+    fn test_scratch_strip_with_callout_metadata() {
         let input = "\
 feat: my feature
-status: 🔴
-issue: MERC-123
----
+
+> [!plan]
+> status: 🔴
+> issue: MERC-123
 
 # Background
 
@@ -1327,8 +1208,10 @@ Private notes here.
 Final results.
 ";
         let result = strip_scratch_sections(input);
-        assert!(result.contains("feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n"),
-            "metadata header should be preserved");
+        assert!(result.contains("> [!plan]"),
+            "callout block should be preserved");
+        assert!(result.contains("> status: 🔴"),
+            "callout metadata should be preserved");
         assert!(result.contains("# Background\n\nSome info.\n"),
             "non-scratch content preserved");
         assert!(result.contains("# Results\n\nFinal results.\n"),
@@ -1436,195 +1319,29 @@ Done.
         assert!(result.contains("Conclusion\n==========\n\nDone."), "same-level setext H1 stops the scratch section");
     }
 
-    // ── Comparison: legacy vs new implementation ─────────────────────
-
-    /// Run both implementations against the same ATX-heading inputs and verify
-    /// they produce the same output. (Setext headings intentionally excluded
-    /// since the legacy parser can't handle them.)
-    #[test]
-    fn test_legacy_vs_new_comparison() {
-        let inputs = [
-            "# Title\n\nSome content.\n\n## Section\n\nMore content.\n",
-            "# Title\n\nSome intro.\n\n## Notes [scratch]\n\nThese are scratch notes.\nThey should be removed.\n\n## Real Section\n\nKeep this.\n",
-            "# Title\n\nContent here.\n\n## Scratch Pad [scratch]\n\nThis is at the end.\nNo more headings follow.\n",
-            "# Title\n\n## Section\n\n### Notes [scratch]\n\nScratch content.\n\n### Another Section\n\nKeep this.\n",
-            "# Title\n\n```\n# This is not a heading\n## Neither is this\n### [scratch] — not a real heading\n```\n\n## Real section\n\nContent.\n",
-            "# Title\n\n~~~\n# Fake heading\n## Also fake [scratch]\n~~~\n\n## Real section\n\nContent.\n",
-            "# Title\n\n## Intro\n\nHello.\n\n## Notes [scratch]\n\nScratch 1.\n\n## Middle\n\nKeep this.\n\n## Draft [scratch]\n\nScratch 2.\n\n## Conclusion\n\nDone.\n",
-            "## A [scratch]\n## B\n## C\n",
-            "## Notes [Scratch]\n\nContent.\n\n## Next\n",
-            "## Notes [SCRATCH]\n\nContent.\n\n## Next\n",
-            "",
-            "## Everything [scratch]\n\nAll content here.\n",
-        ];
-
-        for (i, input) in inputs.iter().enumerate() {
-            let new_result = strip_scratch_sections(input);
-            let legacy_result = strip_scratch_sections_legacy(input);
-            assert_eq!(
-                new_result, legacy_result,
-                "Input #{i} differs between new and legacy implementation.\n\
-                 Input: {:?}\n\
-                 New:    {:?}\n\
-                 Legacy: {:?}",
-                input, new_result, legacy_result
-            );
-        }
-    }
-
-    // ── PlanDocument unit tests ──────────────────────────────────────
+    // ── Scratch stripping with thematic break ────────────────────────
 
     #[test]
-    fn test_plan_document_parse_with_metadata() {
-        let input = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nSome content.\n";
-        let doc = PlanDocument::parse(input);
-        assert_eq!(doc.title(), "feat: my feature");
-        assert_eq!(doc.metadata().get("status").unwrap(), "🔴");
-        assert_eq!(doc.metadata().get("issue").unwrap(), "MERC-123");
-        assert!(!doc.is_done());
-        assert_eq!(doc.body(), "\n# Background\n\nSome content.\n");
-        assert_eq!(doc.raw(), input);
-    }
+    fn test_scratch_strip_thematic_break_in_body() {
+        let input = "\
+# Title
 
-    #[test]
-    fn test_plan_document_parse_no_metadata() {
-        let input = "feat: my feature\n\n# Background\n\nSome content.\n";
-        let doc = PlanDocument::parse(input);
-        assert_eq!(doc.title(), "feat: my feature");
-        assert!(doc.metadata().is_empty());
-        assert!(!doc.is_done());
-        assert_eq!(doc.body(), "\n# Background\n\nSome content.\n");
-    }
+---
 
-    #[test]
-    fn test_plan_document_body_sans_scratch() {
-        let input = "feat: title\nstatus: 🔴\n---\n\n# Background\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n\n# Results\n\nAlso visible.\n";
-        let doc = PlanDocument::parse(input);
-        let stripped = doc.body_sans_scratch();
-        assert!(stripped.contains("# Background"), "non-scratch heading preserved");
-        assert!(stripped.contains("Visible."), "non-scratch content preserved");
-        assert!(stripped.contains("# Results"), "post-scratch heading preserved");
-        assert!(stripped.contains("Also visible."), "post-scratch content preserved");
-        assert!(!stripped.contains("[scratch]"), "scratch heading removed");
-        assert!(!stripped.contains("Hidden."), "scratch content removed");
-        // body() still has the scratch section
-        assert!(doc.body().contains("[scratch]"), "body() is unstripped");
-    }
+## Notes [scratch]
 
-    #[test]
-    fn test_plan_document_empty_input() {
-        let doc = PlanDocument::parse("");
-        assert_eq!(doc.title(), "");
-        assert!(!doc.is_done());
-        assert!(doc.metadata().is_empty());
-        assert!(doc.body().is_empty());
-    }
+Hidden.
 
-    #[test]
-    fn test_plan_document_as_done_sets_status() {
-        let input = "feat: title\nstatus: 🔴\n---\n\n# Background\n\nContent.\n";
-        let doc = PlanDocument::parse(input);
-        let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"), "status should be ✅");
-        assert!(!result.contains("status: 🔴"), "old status gone");
-        assert!(result.starts_with("feat: title\n"), "title preserved");
-        assert!(result.contains("# Background"), "body preserved");
-    }
+## Kept
 
-    #[test]
-    fn test_plan_document_as_done_idempotent() {
-        let input = "feat: title\nstatus: ✅\n---\n\n# Body\n";
-        let doc = PlanDocument::parse(input);
-        let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"));
-        assert_eq!(result.matches("status:").count(), 1, "no duplicate status");
-    }
-
-    #[test]
-    fn test_plan_document_as_done_strips_scratch() {
-        let input = "feat: title\nstatus: 🔴\n---\n\n# Keep\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n";
-        let doc = PlanDocument::parse(input);
-        let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"), "status set");
-        assert!(result.contains("# Keep"), "non-scratch preserved");
-        assert!(!result.contains("[scratch]"), "scratch stripped");
-        assert!(!result.contains("Hidden."), "scratch content stripped");
-    }
-
-    #[test]
-    fn test_plan_document_as_done_keep_scratch() {
-        let input = "feat: title\nstatus: 🔴\n---\n\n# Notes [scratch]\n\nHidden.\n";
-        let doc = PlanDocument::parse(input);
-        let result = doc.as_done(true);
-        assert!(result.contains("status: ✅"), "status set");
-        assert!(result.contains("[scratch]"), "scratch preserved with keep_scratch=true");
-        assert!(result.contains("Hidden."), "scratch content preserved");
-    }
-
-    #[test]
-    fn test_plan_document_as_done_creates_metadata() {
-        let input = "feat: title\n\n# Background\n\nSome details.";
-        let doc = PlanDocument::parse(input);
-        let result = doc.as_done(false);
-        assert!(result.starts_with("feat: title\n"), "title preserved as line 1");
-        assert!(result.contains("status: ✅"), "status created");
-        assert!(result.contains("---\n"), "separator created");
-        assert!(result.contains("# Background"), "body preserved");
-    }
-
-    #[test]
-    fn test_plan_document_pr_parts_basic() {
-        let input = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nVisible.\n\n# Notes [scratch]\n\nHidden.\n\n# Results\n\nFinal.\n";
-        let doc = PlanDocument::parse(input);
-        let (title, body) = doc.pr_parts().unwrap();
-        assert_eq!(title, "feat: my feature");
-        assert!(!body.contains("status:"), "no metadata in PR body");
-        assert!(!body.contains("issue:"), "no metadata in PR body");
-        assert!(!body.contains("[scratch]"), "no scratch in PR body");
-        assert!(!body.contains("Hidden."), "no scratch content in PR body");
-        assert!(body.contains("# Background"), "non-scratch content in PR body");
-        assert!(body.contains("Final."), "non-scratch content in PR body");
-    }
-
-    #[test]
-    fn test_plan_document_pr_parts_empty_title() {
-        let doc = PlanDocument::parse("");
-        assert!(doc.pr_parts().is_none());
-
-        let doc2 = PlanDocument::parse("   \n\nbody");
-        assert!(doc2.pr_parts().is_none());
-    }
-
-    #[test]
-    fn test_plan_document_pr_parts_preserves_magic_words() {
-        let input = "feat: title\nstatus: 🔴\n---\n\nCompletes MERC-123\n\n# Details\n\nWork done.\n";
-        let doc = PlanDocument::parse(input);
-        let (_, body) = doc.pr_parts().unwrap();
-        assert!(body.contains("Completes MERC-123"), "Linear magic words survive");
-    }
-
-    #[test]
-    fn test_plan_document_title_edge_cases() {
-        // Single line, no body
-        let doc = PlanDocument::parse("feat: title");
-        assert_eq!(doc.title(), "feat: title");
-        assert!(doc.body().is_empty());
-        assert!(doc.metadata().is_empty());
-
-        // Body starting with blank line
-        let doc2 = PlanDocument::parse("feat: title\n\nsome body");
-        assert_eq!(doc2.title(), "feat: title");
-        assert_eq!(doc2.body(), "\nsome body");
-
-        // Metadata with no body after separator
-        let doc3 = PlanDocument::parse("feat: title\nstatus: 🔴\n---\n");
-        assert_eq!(doc3.title(), "feat: title");
-        assert_eq!(doc3.metadata().get("status").unwrap(), "🔴");
-        assert_eq!(doc3.body(), "");
-
-        // Body that is only whitespace
-        let doc4 = PlanDocument::parse("feat: title\nstatus: 🔴\n---\n   \n  \n");
-        assert_eq!(doc4.title(), "feat: title");
-        assert!(doc4.pr_parts().unwrap().1.is_empty(), "whitespace-only body should trim to empty");
+Visible.
+";
+        let result = strip_scratch_sections(input);
+        assert!(result.contains("# Title"), "title preserved");
+        assert!(result.contains("---"), "thematic break preserved");
+        assert!(result.contains("## Kept"), "non-scratch section preserved");
+        assert!(result.contains("Visible."), "non-scratch content preserved");
+        assert!(!result.contains("[scratch]"), "scratch heading removed");
+        assert!(!result.contains("Hidden."), "scratch content removed");
     }
 }

@@ -3,11 +3,11 @@ use std::path::Path;
 
 /// Built-in default template for new plan changes.
 ///
-/// Uses summary-first metadata format: the title/summary line comes first
-/// (as jj/git expect), followed by metadata key-value lines, then `---`
-/// separator. Developers who want sections (Background, Tasks, etc.)
-/// should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
-const DEFAULT_TEMPLATE: &str = "(plan: jj:{{CHANGE_ID}})\nstatus: 🔴\n---\n";
+/// Uses Obsidian-style callout metadata format: the title/summary line comes
+/// first (as jj/git expect), followed by a `> [!plan]` callout block with
+/// `> key: value` metadata lines. Developers who want sections (Background,
+/// Tasks, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
+const DEFAULT_TEMPLATE: &str = "(plan: jj:{{CHANGE_ID}})\n\n> [!plan]\n> status: 🔴\n";
 
 /// Resolve the template content using the standard fallback chain:
 ///
@@ -107,8 +107,8 @@ mod tests {
             "Default template should start with the plan summary line"
         );
         assert!(
-            result.contains("status: 🔴\n---\n"),
-            "Default template should contain metadata block with separator"
+            result.contains("> [!plan]\n> status: 🔴\n"),
+            "Default template should contain callout metadata block"
         );
     }
 
@@ -164,9 +164,9 @@ mod tests {
 
     #[test]
     fn test_apply_template_with_placeholder() {
-        let template = "(plan: jj:{{CHANGE_ID}})\nstatus: 🔴\n---\n\n## Background\n";
+        let template = "(plan: jj:{{CHANGE_ID}})\n\n> [!plan]\n> status: 🔴\n\n## Background\n";
         let result = apply_template_full(template, "abcdefgh", None);
-        assert_eq!(result, "(plan: jj:abcdefgh)\nstatus: 🔴\n---\n\n## Background\n");
+        assert_eq!(result, "(plan: jj:abcdefgh)\n\n> [!plan]\n> status: 🔴\n\n## Background\n");
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = render_template_with_bookmark(tmp.path(), "testid01", "feat-test");
         assert!(result.starts_with("(plan: jj:testid01)\n"), "should start with summary line");
-        assert!(result.contains("status: 🔴\n---\n"), "should contain metadata block");
+        assert!(result.contains("> [!plan]\n> status: 🔴\n"), "should contain callout metadata block");
         assert!(!result.contains("{{CHANGE_ID}}"), "placeholder should be replaced");
     }
 

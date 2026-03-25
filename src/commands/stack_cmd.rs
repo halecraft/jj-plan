@@ -1421,11 +1421,12 @@ mod tests {
 
     #[test]
     fn test_pr_parts_strips_metadata() {
-        let content = "feat: my feature\nstatus: 🔴\nissue: MERC-123\n---\n\n# Background\n\nSome details.\n";
+        let content = "feat: my feature\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\n# Background\n\nSome details.\n";
         let (title, body) = PlanDocument::parse(content).pr_parts().unwrap();
         assert_eq!(title, "feat: my feature");
-        assert!(!body.contains("status:"), "metadata fields should not appear in PR body");
-        assert!(!body.contains("issue:"), "metadata fields should not appear in PR body");
+        assert!(!body.contains("> [!plan]"), "callout opener should not appear in PR body");
+        assert!(!body.contains("> status:"), "metadata fields should not appear in PR body");
+        assert!(!body.contains("> issue:"), "metadata fields should not appear in PR body");
         assert!(body.contains("# Background"), "body content should be preserved");
     }
 
@@ -1441,7 +1442,7 @@ mod tests {
 
     #[test]
     fn test_pr_parts_preserves_linear_magic_words() {
-        let content = "feat: my feature\nstatus: 🔴\n---\n\nCompletes MERC-123\n\n# Details\n\nSome work.\n";
+        let content = "feat: my feature\n\n> [!plan]\n> status: 🔴\n\nCompletes MERC-123\n\n# Details\n\nSome work.\n";
         let (title, body) = PlanDocument::parse(content).pr_parts().unwrap();
         assert_eq!(title, "feat: my feature");
         assert!(body.contains("Completes MERC-123"), "Linear magic words must survive to PR body");
@@ -1449,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_pr_parts_title_is_line_1() {
-        let content = "feat: actual title\nstatus: 🔴\n---\n\nBody text.\n";
+        let content = "feat: actual title\n\n> [!plan]\n> status: 🔴\n\nBody text.\n";
         let (title, _body) = PlanDocument::parse(content).pr_parts().unwrap();
         assert_eq!(title, "feat: actual title", "title should be line 1");
     }
@@ -1462,10 +1463,12 @@ mod tests {
 
     #[test]
     fn test_pr_parts_metadata_and_scratch_combined() {
-        let content = "feat: combined test\nstatus: 🔴\nissue: MERC-456\n---\n\n# Background\n\nVisible content.\n\n# Research [scratch]\n\nHidden research.\n\n# Implementation\n\nVisible impl.\n";
+        let content = "feat: combined test\n\n> [!plan]\n> status: 🔴\n> issue: MERC-456\n\n# Background\n\nVisible content.\n\n# Research [scratch]\n\nHidden research.\n\n# Implementation\n\nVisible impl.\n";
         let (title, body) = PlanDocument::parse(content).pr_parts().unwrap();
         assert_eq!(title, "feat: combined test");
-        assert!(!body.contains("status:"), "no front matter in body");
+        assert!(!body.contains("> [!plan]"), "no callout opener in body");
+        assert!(!body.contains("> status:"), "no front matter in body");
+        assert!(!body.contains("> issue:"), "no front matter in body");
         assert!(!body.contains("[scratch]"), "no scratch in body");
         assert!(!body.contains("Hidden research"), "scratch content removed");
         assert!(body.contains("Visible content."), "non-scratch body preserved");

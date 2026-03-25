@@ -276,7 +276,7 @@ fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Wor
 
 /// Print a dry-run diff for a single change, showing what sections would be
 /// stripped and that the done marker would be set.
-fn print_dry_run_diff(doc: &PlanDocument<'_>, keep_scratch: bool) {
+fn print_dry_run_diff(doc: &PlanDocument, keep_scratch: bool) {
     let proposed = doc.as_done(keep_scratch);
 
     eprintln!("--- change ---");
@@ -318,59 +318,59 @@ mod tests {
 
     #[test]
     fn test_as_done_sets_status() {
-        let desc = "feat: title\nstatus: 🔴\n---\nbody text here";
+        let desc = "feat: title\n\n> [!plan]\n> status: 🔴\n\nbody text here";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"), "status should be set to ✅");
-        assert!(!result.contains("status: 🔴"), "old status should be replaced");
+        assert!(result.contains("> status: ✅"), "status should be set to ✅");
+        assert!(!result.contains("> status: 🔴"), "old status should be replaced");
         assert!(result.contains("body text here"), "body text preserved");
         assert!(result.starts_with("feat: title\n"), "title preserved as line 1");
     }
 
     #[test]
     fn test_as_done_already_done() {
-        let desc = "feat: add something\nstatus: ✅\n---\nbody";
+        let desc = "feat: add something\n\n> [!plan]\n> status: ✅\n\nbody";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"));
+        assert!(result.contains("> status: ✅"));
         assert_eq!(result.matches("status:").count(), 1, "no duplicate status");
     }
 
     #[test]
     fn test_as_done_body_text_no_false_positive() {
         // Body text contains literal "plan-status: ✅" — must NOT trigger false positive.
-        let desc = "feat: title\nstatus: 🔴\n---\nThis test has plan-status: ✅ in body text";
+        let desc = "feat: title\n\n> [!plan]\n> status: 🔴\n\nThis test has plan-status: ✅ in body text";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"), "metadata status should be ✅");
+        assert!(result.contains("> status: ✅"), "metadata status should be ✅");
         assert!(result.contains("plan-status: ✅ in body text"), "body text preserved");
     }
 
     #[test]
     fn test_as_done_creates_metadata() {
-        // No existing metadata → creates metadata block after title
+        // No existing metadata → creates callout block after title
         let desc = "feat: add something\n\n# Background\n\nSome details.";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
         assert!(result.starts_with("feat: add something\n"), "title preserved as line 1");
-        assert!(result.contains("status: ✅"), "should set status to ✅");
-        assert!(result.contains("---\n"), "should have --- separator");
+        assert!(result.contains("> status: ✅"), "should set status to ✅");
+        assert!(result.contains("> [!plan]"), "should have callout block");
         assert!(result.contains("# Background"), "body preserved");
     }
 
     #[test]
     fn test_as_done_preserves_other_metadata_fields() {
-        let desc = "feat: title\nstatus: 🔴\nissue: MERC-123\n---\n\n# Phase 1\n\nDone.";
+        let desc = "feat: title\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\n# Phase 1\n\nDone.";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
-        assert!(result.contains("status: ✅"), "status should be ✅");
-        assert!(result.contains("issue: MERC-123"), "other fields preserved");
+        assert!(result.contains("> status: ✅"), "status should be ✅");
+        assert!(result.contains("> issue: MERC-123"), "other fields preserved");
         assert!(result.contains("# Phase 1"), "body content preserved");
     }
 
     #[test]
     fn test_as_done_no_duplicate_status() {
-        let desc = "feat: something\nstatus: 🔴\n---\nbody";
+        let desc = "feat: something\n\n> [!plan]\n> status: 🔴\n\nbody";
         let doc = PlanDocument::parse(desc);
         let result = doc.as_done(false);
         assert_eq!(result.matches("status:").count(), 1,

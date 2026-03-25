@@ -584,7 +584,7 @@ mod tests {
 
     #[test]
     fn test_log_entry_is_done_metadata() {
-        let entry = make_log_entry("some content\nstatus: ✅\n---\nbody");
+        let entry = make_log_entry("some content\n\n> [!plan]\n> status: ✅\n\nbody");
         assert!(entry.is_done());
     }
 
@@ -598,14 +598,14 @@ mod tests {
     #[test]
     fn test_log_entry_is_done_body_text_not_false_positive() {
         // Body text contains literal "plan-status: ✅" — must NOT trigger false positive
-        let entry = make_log_entry("title\nstatus: 🔴\n---\nplan-status: ✅ in body text");
+        let entry = make_log_entry("title\n\n> [!plan]\n> status: 🔴\n\nplan-status: ✅ in body text");
         assert!(!entry.is_done());
     }
 
     #[test]
     fn test_log_entry_is_done_old_style_not_detected() {
-        // Old-style plan-status line without metadata → not done
-        let entry = make_log_entry("title\n\nplan-status: ✅");
+        // Old-style ---‐delimited format is no longer recognized
+        let entry = make_log_entry("title\nstatus: ✅\n---\nbody");
         assert!(!entry.is_done());
     }
 

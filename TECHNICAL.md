@@ -705,43 +705,48 @@ A single-threaded tokio runtime is created per `jj stack` command invocation. Th
 
 ## Markdown Processing (`src/markdown.rs`)
 
-### Summary-first metadata format
+### Callout metadata format
 
-Plan descriptions use a summary-first metadata format that keeps the commit summary on line 1 (as jj/git expect):
+Plan descriptions use an Obsidian-style callout block for metadata, keeping the commit summary on line 1 (as jj/git expect):
 
 ```
 feat: my feature          ← line 1: always the title (shown in jj log, git log, PR titles)
-status: 🔴                ← metadata key: value lines (optional)
-issue: MERC-123
----                       ← separator
+
+> [!plan]                 ← callout opener (case-insensitive on "plan")
+> status: 🔴              ← metadata key: value lines (optional)
+> issue: MERC-123
 
 # Background              ← body content
 ```
 
 Parsing rules:
 - Line 1 is always the title — never metadata.
-- Lines 2+ are metadata if they match `^[a-z][a-z0-9_-]*: ` (lowercase identifier key). Key restriction prevents false positives from prose lines with colons.
-- The metadata region ends at the first `---` line. If a non-metadata line appears before `---`, there is no metadata.
-- Everything after `---\n` is the body. A `---` later in the body is just a CommonMark thematic break.
+- Scan all lines (after title) for `> [!plan]` (the callout opener, case-insensitive).
+- Read subsequent `> key: value` lines where key matches `^[a-z][a-z0-9_-]*: ` after stripping the `> ` prefix. The block ends at the first line that doesn't start with `> ` or doesn't match the key pattern.
+- Blank lines before, after, or around the callout block do not affect parsing (blank-line tolerant).
+- Body is everything outside the title line and the callout block lines. A `---` in the body is just a CommonMark thematic break — no special handling needed.
+- `set_metadata_field` finds the callout block and replaces/appends the key. If no callout block exists, inserts one after the title line.
+
+This format replaced an earlier `---`-delimited "summary-first" format that was position-sensitive (metadata had to start on line 2, no blank lines allowed) and used `---` as both metadata separator and CommonMark thematic break. The callout format is unambiguous, blank-line tolerant, and renders correctly in both plain text and markdown renderers.
 
 Free functions: `parse_metadata()`, `set_metadata_field()`, `remove_metadata()`, `strip_scratch_sections()`.
 
 ### `PlanDocument` — unified parse-and-transform facade
 
-`PlanDocument<'a>` parses a description string once and provides both read accessors and transform methods. It borrows from the input string and should be constructed at consumer boundaries (display, done, submit), not stored on long-lived types.
+`PlanDocument` parses a description string once and provides both read accessors and transform methods. It owns its data (cloned from the input) and should be constructed at consumer boundaries (display, done, submit), not stored on long-lived types.
 
 ```rust
 let doc = PlanDocument::parse(&description);
 
-// Read accessors (no allocation)
+// Read accessors (borrow from owned data)
 doc.title()      // → &str — line 1, the commit summary
 doc.is_done()    // → bool — metadata status == ✅
 doc.metadata()   // → &BTreeMap<String, String>
-doc.body()       // → &str — everything after ---
+doc.body()       // → &str — everything outside title and callout block
 doc.raw()        // → &str — original input
 
 // Transform methods (allocate new Strings)
-doc.as_done(keep_scratch)  // → String — strip scratch + set status: ✅
+doc.as_done(keep_scratch)  // → String — strip scratch + set status: ✅ in callout
 doc.pr_parts()             // → Option<(String, String)> — (title, body) for PR
 doc.body_sans_scratch()    // → String — body with [scratch] sections removed
 ```
@@ -755,9 +760,9 @@ Three consumer patterns:
 
 ### Scratch section stripping
 
-`strip_scratch_sections()` uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading detection (ATX and setext headings, code fence awareness). The metadata block is extracted first, then the body is parsed through `pulldown-cmark` to identify heading byte ranges. Scratch sections (headings containing `[scratch]`, case-insensitive) are sliced out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
+`strip_scratch_sections()` uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading detection (ATX and setext headings, code fence awareness). The entire input is passed directly to pulldown-cmark — the callout metadata block is a valid CommonMark blockquote that pulldown-cmark handles correctly (it will never match as a `[scratch]` heading). Scratch sections (headings containing `[scratch]`, case-insensitive) are sliced out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
 
-Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, metadata preservation.
+Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, callout metadata preservation, `---` thematic breaks in body.
 
 ---
 
