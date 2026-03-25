@@ -274,13 +274,13 @@ jj plan -h
 
 ### `jj stack`
 
-Show the stack visualization with bookmark structure, sync status, PR status, and change IDs.
+Show the current stack visualization with bookmark structure, sync status, PR status, and change IDs. Only plans in the `@`-relative stack (between `trunk()` and the working copy) are shown — plans on other stacks are not included.
 
 ```
 jj stack
 ```
 
-**Single-stack output:**
+**Output:**
 
 ```
   ◉ feat-api ykvsnxrl (@)
@@ -295,21 +295,7 @@ jj stack
   ◆ trunk()
 ```
 
-**Multi-stack output (column layout):**
-
-When multiple independent stacks exist (sibling branches from trunk), they are rendered side-by-side with a column gutter:
-
-```
-  auth                     │ dashboard
-                           │
-  ◉ auth-tests (@)         │ ○ dash-api (synced, PR #45)
-  │ Add auth tests         │ │ Dashboard API endpoints
-  │                        │ │
-  ○ auth-refactor (PR #44) │ ◆ trunk()
-  │ Refactor auth module   │
-  │                        │
-  ◆ trunk()                │
-```
+This is the same view shown in `jj status` and written to `.jj-plan/stack.md`. To see all stacks across the repo, use `jj stack --all`.
 
 **Legend:**
 
@@ -327,6 +313,32 @@ When multiple independent stacks exist (sibling branches from trunk), they are r
 Each node line includes the short change ID (reverse-hex format) for use with `jj show`, `jj edit`, or `jj:` references in plan files.
 
 If the stack has gaps (unbookmarked changes between bookmarks), a warning is shown.
+
+---
+
+### `jj stack --all`
+
+Show all registered stacks across the repo, regardless of working copy position. When multiple independent stacks exist (sibling branches from trunk), they are rendered side-by-side with a column gutter:
+
+```
+jj stack --all
+```
+
+**Multi-stack output (column layout):**
+
+```
+  auth                     │ dashboard
+                           │
+  ◉ auth-tests (@)         │ ○ dash-api (synced, PR #45)
+  │ Add auth tests         │ │ Dashboard API endpoints
+  │                        │ │
+  ○ auth-refactor (PR #44) │ ◆ trunk()
+  │ Refactor auth module   │
+  │                        │
+  ◆ trunk()                │
+```
+
+Note: In multi-stack mode, markdown links to plan files are not included because per-stack file indices don't match global plan file indices.
 
 ---
 

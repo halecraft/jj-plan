@@ -4,7 +4,7 @@ use crate::merge::{create_merge_plan, execute_merge, MergeCandidate, MergeStep};
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::save_pr_cache;
-use crate::stack_builder::{build_stack, collect_submission_chain, find_submit_target, narrow_segments};
+use crate::stack_builder::{build_multi_stack, build_stack, collect_submission_chain, find_submit_target, narrow_segments};
 use crate::stack_context::StackContext;
 use crate::submit::{
     analyze_submission, comments, create_submission_plan, execute_submission,
@@ -32,6 +32,16 @@ pub fn dispatch_stack(
     // Help handling — only on explicit --help/-h
     if matches!(subcommand, Some("--help" | "-h")) {
         print_stack_help();
+        return Ok(0);
+    }
+
+    // --all flag: show all stacks across the repo (parsed before subcommand match)
+    if matches!(subcommand, Some("--all")) {
+        crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+        workspace.reload();
+        // Sync plan files for current stack first (so plan dir is up to date)
+        let _ = crate::wrap::resolve_and_sync(plan_dir, workspace, registry);
+        show_all_stacks(plan_dir, workspace, registry);
         return Ok(0);
     }
 
@@ -1045,6 +1055,47 @@ fn run_auth(args: &[String]) -> Result<i32> {
 // Help text
 // ---------------------------------------------------------------------------
 
+/// Display all registered stacks across the repo (multi-stack global view).
+///
+/// This is the `jj stack --all` entry point. Uses `build_multi_stack` to
+/// discover all registered plan bookmarks, groups them, and renders a
+/// multi-column visualization.
+fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry) {
+    use crate::pr_cache::load_pr_cache;
+    use crate::stack_render;
+
+    let multi = build_multi_stack(workspace, registry);
+    if multi.stacks.is_empty() {
+        eprintln!("No registered plans.");
+        eprintln!("Create one with: jj plan new <bookmark-name>");
+        return;
+    }
+
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let pr_cache = load_pr_cache(&repo_root).ok();
+    let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
+    let rendered = stack_render::render_stack(&columns);
+
+    let color = stack_render::should_color();
+    let formatted = if color {
+        stack_render::format_ansi(&rendered)
+    } else {
+        stack_render::format_plain(&rendered)
+    };
+
+    let num_stacks = multi.stacks.len();
+    eprintln!();
+    eprintln!("Plan stacks ({}/; {} stack{}):",
+        plan_dir.dir_name(),
+        num_stacks,
+        if num_stacks == 1 { "" } else { "s" },
+    );
+
+    for line in &formatted {
+        eprintln!("{}", line);
+    }
+}
+
 fn print_stack_help() {
     eprintln!("jj stack — stack-oriented PR operations");
     eprintln!();
@@ -1061,6 +1112,7 @@ fn print_stack_help() {
     eprintln!("  auth                Authentication management");
     eprintln!();
     eprintln!("Options:");
+    eprintln!("  --all               Show all stacks across the repo");
     eprintln!("  --help, -h          Show this help message");
 }
 

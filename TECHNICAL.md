@@ -134,9 +134,20 @@ trunk()..(@  | descendants(@))
 
 This range is evaluated via jj-lib's in-process revset engine. The result is walked in topological order (parents before children) and partitioned into segments. This is the `@`-relative view — it only sees the lineage of the current working copy.
 
-### Multi-stack view (visualization)
+### Single-stack rendering (hot path)
 
-`build_multi_stack()` discovers ALL registered plan bookmarks across the repo, regardless of working copy position. It uses a two-pass approach:
+The rendering pipeline (terminal output + `stack.md`) uses the same `build_stack()` result as the sync pipeline. In `resolve_and_sync()`, the stack is built once and forked into two consumers:
+
+1. **Sync views** (`stack_to_sync_changes`): Flat list of `SyncChangeView`s for plan file I/O.
+2. **Rendering** (`build_column_from_stack`): Converts the `Stack` into a single `StackColumn` for the Span-based rendering pipeline (`render_stack` → `format_markdown`/`format_ansi`).
+
+This "build once, fork twice" architecture avoids the redundant second jj-lib evaluation that previously occurred when `build_multi_stack()` was called on every mutating command. The `stack.md` file always contains clickable markdown links to plan files (no multi-stack link suppression).
+
+### Multi-stack view (`jj stack --all`)
+
+`build_multi_stack()` discovers ALL registered plan bookmarks across the repo, regardless of working copy position. It is used only by `jj stack --all` (explicit opt-in) and `jj stack untrack`. It is **not** called on the hot path (mutating commands, `jj status`, bare `jj stack`).
+
+It uses a two-pass approach:
 
 1. **Discovery**: For each registered bookmark, evaluate `trunk()..{bookmark}` and collect all commits into a unified map.
 2. **Grouping**: Bookmarks with an explicit `stack` field in the registry are grouped by that value. Remaining bookmarks (`stack = None`) are grouped by DAG topology using a union-find algorithm (`group_bookmarks_by_ancestry()`).
@@ -156,7 +167,7 @@ pub struct MultiStack {
 }
 ```
 
-`build_multi_stack()` is used only by `jj stack` visualization and `jj stack untrack`. The sync/flush pipeline continues to use `build_stack()`. This separation ensures zero coupling between multi-stack awareness and the critical sync path.
+In `--all` mode, `build_columns()` applies multi-stack link suppression (clears `plan_filename` on rows) because per-group file indices don't match global plan file indices. This limitation only affects `--all` output.
 
 ### Stack base bookmarks
 
@@ -199,14 +210,16 @@ After every mutating command (via `wrap()`), `auto_cleanup_merged_stacks()` scan
 
 ### Key functions
 
-| Function | Signature | Purpose |
-|---|---|---|
-| `build_stack` | `(&Workspace, Option<&PlanRegistry>) → StackResult` | Build the @-relative stack (sync/flush) |
-| `build_multi_stack` | `(&Workspace, &PlanRegistry) → MultiStack` | Build all stacks (visualization) |
-| `group_bookmarks_by_ancestry` | `(&[(String, String)], &HashMap) → HashMap` | Union-find grouping by DAG topology |
-| `find_submit_target` | `(&Stack) → Option<&BookmarkSegment>` | Find the segment nearest to `@` |
-| `narrow_segments` | `(&Stack, &PlanRegistry) → Vec<NarrowedBookmarkSegment>` | One bookmark per segment |
-| `collect_submission_chain` | `(&Stack, &str) → Result<SubmissionChain, String>` | Trunk-to-target chain with gaps |
+| Function | Module | Signature | Purpose |
+|---|---|---|---|
+| `build_stack` | `stack_builder` | `(&Workspace, Option<&PlanRegistry>) → StackResult` | Build the @-relative stack (sync/flush/render) |
+| `build_multi_stack` | `stack_builder` | `(&Workspace, &PlanRegistry) → MultiStack` | Build all stacks (`--all` only) |
+| `build_column_from_stack` | `stack_render` | `(&Stack, &str, &PlanRegistry, &Workspace, Option<&PrCache>) → Option<StackColumn>` | Single stack → display column (hot path) |
+| `build_columns` | `stack_render` | `(&MultiStack, &PlanRegistry, &Workspace, Option<&PrCache>) → Vec<StackColumn>` | Multi-stack → display columns (`--all`) |
+| `group_bookmarks_by_ancestry` | `stack_builder` | `(&[(String, String)], &HashMap) → HashMap` | Union-find grouping by DAG topology |
+| `find_submit_target` | `stack_builder` | `(&Stack) → Option<&BookmarkSegment>` | Find the segment nearest to `@` |
+| `narrow_segments` | `stack_builder` | `(&Stack, &PlanRegistry) → Vec<NarrowedBookmarkSegment>` | One bookmark per segment |
+| `collect_submission_chain` | `stack_builder` | `(&Stack, &str) → Result<SubmissionChain, String>` | Trunk-to-target chain with gaps |
 
 ---
 
@@ -282,7 +295,7 @@ Uses a **gather → plan → execute** architecture:
    - File summary for `stack.md` (received as opaque `Option<&str>` from the caller — sync writes but does not generate this content).
 3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`.
 
-Note: `resolve_and_sync` in `wrap.rs` performs a single GATHER that serves both the sync pipeline (plan file I/O) and the rendering pipeline (terminal + markdown output). It builds the multi-stack, generates `stack.md` content via `format_markdown_with_header`, and passes it to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second GATHER traversal is needed.
+Note: `resolve_and_sync` in `wrap.rs` builds the @-relative stack once via `build_current_stack()` and forks it into two consumers: `stack_to_sync_changes()` for plan file sync and `build_column_from_stack()` for rendering. The rendered `stack.md` content is passed to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second traversal is needed. `build_multi_stack()` is never called on this path.
 
 `SyncChangeView` remains thin — it stores only the raw description string. Plan-awareness (metadata parsing, `is_done` checks) is accessed on demand via `PlanDocument::parse()` at consumer boundaries, not pre-cached on adapter types. This avoids sync hazards where a cached `metadata` field could desync from the `description` after mutations.
 
@@ -334,7 +347,7 @@ Graph visualization with markdown links on bookmark names, generated by `format_
 
 ```
 
-The file view uses the same Span model as the terminal view but applies `format_markdown` instead of `format_ansi`/`format_plain`. Spans with a `link_target` are wrapped in markdown link syntax `[text](target)`. In multi-stack mode, `plan_filename` is cleared (links are absent) because per-group indices don't match global plan file indices.
+The file view uses the same Span model as the terminal view but applies `format_markdown` instead of `format_ansi`/`format_plain`. Spans with a `link_target` are wrapped in markdown link syntax `[text](target)`. Since `stack.md` is always rendered from the single @-relative stack, plan file links are always present and correct. (In `jj stack --all` mode, `plan_filename` is cleared because per-group indices don't match global plan file indices — but `--all` output goes to the terminal only, not to `stack.md`.)
 
 ---
 

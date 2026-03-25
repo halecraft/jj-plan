@@ -2,9 +2,8 @@ use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::load_pr_cache;
-use crate::stack_builder::build_multi_stack;
 use crate::stack_render::{self, StackColumn};
-use crate::types::{self, PlanRegistry};
+use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 use crate::sync;
 
@@ -12,7 +11,6 @@ use crate::sync;
 /// `show_plan_stack`. Avoids a second GATHER traversal of the repository.
 pub struct StackDisplayData {
     pub columns: Vec<StackColumn>,
-    pub num_stacks: usize,
 }
 
 /// Unified handler for mutating commands: flush → command → reload → sync → show.
@@ -219,8 +217,12 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
         None
     });
 
-    // Build sync views from the registry-filtered stack
-    let sync_changes = build_sync_views(workspace, registry);
+    // Build the @-relative stack once — single source of truth for both
+    // plan file sync and rendering.
+    let stack_result = build_current_stack(workspace, registry);
+
+    // Fork 1: sync views for plan files
+    let sync_changes = stack_to_sync_changes(&stack_result, workspace, registry);
     match &sync_changes {
         Some(views) => {
             debug_log!("  sync views: {} bookmark(s)", views.len());
@@ -232,18 +234,24 @@ pub fn resolve_and_sync(plan_dir: &PlanDir, workspace: &Workspace, registry: &Pl
             debug_log!("  plan_dir: {:?}", plan_dir.path);
         }
     }
-    // Build multi-stack for the rendering pipeline (markdown content for stack.md)
-    let multi = build_multi_stack(workspace, registry);
-    let (stack_md_content, display_data) = if multi.stacks.is_empty() {
-        (None, None)
-    } else {
-        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-        let pr_cache = load_pr_cache(&repo_root).ok();
-        let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
-        let rendered = stack_render::render_stack(&columns);
-        let md_content = stack_render::format_markdown_with_header(&rendered);
-        let num_stacks = multi.stacks.len();
-        (Some(md_content), Some(StackDisplayData { columns, num_stacks }))
+
+    // Fork 2: rendering for stack.md + terminal
+    let (stack_md_content, display_data) = match &stack_result {
+        StackResult::Ok(stack) if !stack.segments.is_empty() => {
+            let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+            let pr_cache = load_pr_cache(&repo_root).ok();
+            let stack_name = derive_stack_name(stack, registry);
+            match stack_render::build_column_from_stack(stack, &stack_name, registry, workspace, pr_cache.as_ref()) {
+                Some(column) => {
+                    let columns = vec![column];
+                    let rendered = stack_render::render_stack(&columns);
+                    let md_content = stack_render::format_markdown_with_header(&rendered);
+                    (Some(md_content), Some(StackDisplayData { columns }))
+                }
+                None => (None, None),
+            }
+        }
+        _ => (None, None),
     };
 
     sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry, stack_md_content.as_deref());
@@ -280,15 +288,9 @@ pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>) {
         stack_render::format_plain(&rendered)
     };
 
-    let is_multi = data.num_stacks > 1;
-
     // Header
     eprintln!();
-    eprint!("Plan stack ({}/", plan_dir.dir_name());
-    if is_multi {
-        eprint!(" {} stacks", data.num_stacks);
-    }
-    eprintln!("):");
+    eprintln!("Plan stack ({}/):", plan_dir.dir_name());
 
     for line in &formatted {
         eprintln!("{}", line);
@@ -316,11 +318,30 @@ pub fn resolve_sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry
 /// Returns `None` when the stack is empty, contains merge commits, or
 /// has no registry-matching segments.
 pub fn build_sync_views(workspace: &Workspace, registry: &PlanRegistry) -> Option<Vec<SyncChangeView>> {
-    // Build the stack using the new builder with registry filtering
-    let stack_result = crate::stack_builder::build_stack(workspace, Some(registry));
-
-    // Convert to the adapter type
+    let stack_result = build_current_stack(workspace, registry);
     stack_to_sync_changes(&stack_result, workspace, registry)
+}
+
+/// Build the @-relative stack. Single source of truth for "what stack am I on?"
+///
+/// Thin wrapper around `build_stack()` with registry filtering. Returns the
+/// raw `StackResult` so callers can fork it into both sync views and rendering.
+fn build_current_stack(workspace: &Workspace, registry: &PlanRegistry) -> StackResult {
+    crate::stack_builder::build_stack(workspace, Some(registry))
+}
+
+/// Derive a human-readable name for the current stack.
+///
+/// Uses the tip-most (last segment) registered bookmark name, falling back
+/// to `"plan"` if no registered bookmark is found.
+fn derive_stack_name(stack: &crate::types::Stack, registry: &PlanRegistry) -> String {
+    stack.segments.last()
+        .and_then(|seg| {
+            seg.bookmarks.iter()
+                .find(|b| registry.is_tracked(&b.name))
+                .map(|b| b.name.clone())
+        })
+        .unwrap_or_else(|| "plan".to_string())
 }
 
 /// A lightweight view of a stack change for sync and flush.
@@ -353,11 +374,10 @@ impl SyncChangeView {
 ///
 /// Returns `None` for `StackResult::Empty`.
 fn stack_to_sync_changes(
-    result: &crate::types::StackResult,
+    result: &StackResult,
     workspace: &Workspace,
-    registry: &crate::types::PlanRegistry,
+    registry: &PlanRegistry,
 ) -> Option<Vec<SyncChangeView>> {
-    use crate::types::StackResult;
 
     match result {
         StackResult::Empty => None,
@@ -404,5 +424,93 @@ fn stack_to_sync_changes(
                 Some(views)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Bookmark, BookmarkSegment, LogEntry, Stack};
+    use chrono::Utc;
+
+    fn make_bookmark(name: &str) -> Bookmark {
+        Bookmark {
+            name: name.to_string(),
+            commit_id: "aabb".to_string(),
+            change_id: "ccdd".to_string(),
+            has_remote: false,
+            is_synced: false,
+        }
+    }
+
+    fn make_segment(bookmark_name: &str) -> BookmarkSegment {
+        BookmarkSegment {
+            bookmarks: vec![make_bookmark(bookmark_name)],
+            changes: vec![LogEntry {
+                commit_id: "aabb".to_string(),
+                change_id: "ccdd".to_string(),
+                author_name: String::new(),
+                author_email: String::new(),
+                description_first_line: "desc".to_string(),
+                description: "desc".to_string(),
+                parents: vec![],
+                local_bookmarks: vec![bookmark_name.to_string()],
+                remote_bookmarks: vec![],
+                is_working_copy: false,
+                is_empty: true,
+                authored_at: Utc::now(),
+                committed_at: Utc::now(),
+            }],
+        }
+    }
+
+    fn make_registry(names: &[&str]) -> PlanRegistry {
+        let mut reg = PlanRegistry::new();
+        for name in names {
+            reg.track(crate::types::PlannedBookmark::new(*name, "ccdd"));
+        }
+        reg
+    }
+
+    #[test]
+    fn derive_stack_name_uses_tip_bookmark() {
+        let stack = Stack {
+            segments: vec![make_segment("feat-auth"), make_segment("feat-api")],
+            gaps: vec![],
+        };
+        let registry = make_registry(&["feat-auth", "feat-api"]);
+        assert_eq!(derive_stack_name(&stack, &registry), "feat-api");
+    }
+
+    #[test]
+    fn derive_stack_name_skips_unregistered_bookmarks() {
+        let stack = Stack {
+            segments: vec![make_segment("feat-auth"), make_segment("unregistered")],
+            gaps: vec![],
+        };
+        // Only feat-auth is registered — unregistered tip is skipped,
+        // but derive_stack_name checks tip only, so falls back to "plan".
+        let registry = make_registry(&["feat-auth"]);
+        assert_eq!(derive_stack_name(&stack, &registry), "plan");
+    }
+
+    #[test]
+    fn derive_stack_name_empty_stack_falls_back() {
+        let stack = Stack {
+            segments: vec![],
+            gaps: vec![],
+        };
+        let registry = make_registry(&[]);
+        assert_eq!(derive_stack_name(&stack, &registry), "plan");
+    }
+
+    #[test]
+    fn derive_stack_name_single_segment() {
+        let stack = Stack {
+            segments: vec![make_segment("hotfix")],
+            gaps: vec![],
+        };
+        let registry = make_registry(&["hotfix"]);
+        assert_eq!(derive_stack_name(&stack, &registry), "hotfix");
     }
 }

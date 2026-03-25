@@ -1797,7 +1797,7 @@ plan-status: ✅"
 # Phase 5: Multi-column jj stack visualization
 # =============================================================================
 
-@test "jj stack shows multi-column output for sibling branches" {
+@test "jj stack --all shows multi-column output for sibling branches" {
   # Create two genuine sibling branches from start (trunk-adjacent).
   # We use $REAL_JJ to create the second branch's commit so that
   # jj new doesn't rebase the first branch (--insert-after @ would
@@ -1836,9 +1836,16 @@ EOF
   # Sync so plan files are created
   jj status >/dev/null 2>&1
 
+  # Bare `jj stack` shows only the current stack (dash-api, since @ is there)
   run jj stack
   [[ "$status" -eq 0 ]]
-  # Multi-stack should show stack headers for both stacks
+  [[ "$output" == *"dash-api"* ]]
+  # auth-refactor is on a different stack — should NOT appear in bare `jj stack`
+  [[ "$output" != *"auth-refactor"* ]]
+
+  # `jj stack --all` shows all stacks across the repo
+  run jj stack --all
+  [[ "$status" -eq 0 ]]
   # Multi-stack should show both bookmark names
   [[ "$output" == *"auth-refactor"* ]]
   [[ "$output" == *"dash-api"* ]]

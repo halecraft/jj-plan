@@ -687,10 +687,51 @@ pub fn prepare_display_rows(
         .collect()
 }
 
+/// Build a single `StackColumn` from a `Stack` + metadata.
+///
+/// Shared inner function used by both `build_column_from_stack` (single-stack
+/// hot path) and `build_columns` (multi-stack `--all` path). Performs the
+/// narrow → prepare → assemble pipeline for one stack.
+fn build_single_column(
+    stack: &Stack,
+    name: &str,
+    registry: &PlanRegistry,
+    workspace: &Workspace,
+    pr_cache: Option<&PrCache>,
+) -> StackColumn {
+    let narrowed = narrow_segments(stack, registry);
+    let rows = prepare_display_rows(&narrowed, workspace, pr_cache);
+    StackColumn {
+        name: name.to_string(),
+        rows,
+        gaps: stack.gaps.clone(),
+    }
+}
+
+/// Build a single stack column from the @-relative stack, ready for rendering.
+///
+/// This is the "current stack only" entry point used by the sync/display hot
+/// path. Always produces plan file links (no multi-stack link suppression).
+/// Returns `None` if the stack has no segments.
+pub fn build_column_from_stack(
+    stack: &Stack,
+    name: &str,
+    registry: &PlanRegistry,
+    workspace: &Workspace,
+    pr_cache: Option<&PrCache>,
+) -> Option<StackColumn> {
+    if stack.segments.is_empty() {
+        return None;
+    }
+    Some(build_single_column(stack, name, registry, workspace, pr_cache))
+}
+
 /// Build stack columns from a `MultiStack`, ready for rendering.
 ///
 /// Encapsulates the per-group narrow → prepare → assemble loop. This is a
 /// GATHER function — it calls into the workspace and PR cache.
+///
+/// Used by `jj stack --all` for the global multi-stack view.
 pub fn build_columns(
     multi: &MultiStack,
     registry: &PlanRegistry,
@@ -702,29 +743,21 @@ pub fn build_columns(
         .stacks
         .iter()
         .map(|group| {
-            let narrowed = narrow_segments(
-                &Stack {
-                    segments: group.segments.clone(),
-                    gaps: group.gaps.clone(),
-                },
-                registry,
-            );
-
-            let mut rows = prepare_display_rows(&narrowed, workspace, pr_cache);
+            let group_stack = Stack {
+                segments: group.segments.clone(),
+                gaps: group.gaps.clone(),
+            };
+            let mut column = build_single_column(&group_stack, &group.name, registry, workspace, pr_cache);
 
             // Multi-stack: per-group indices don't match global plan file indices,
             // so clear plan_filename to prevent incorrect markdown links.
             if is_multi {
-                for row in &mut rows {
+                for row in &mut column.rows {
                     row.plan_filename = None;
                 }
             }
 
-            StackColumn {
-                name: group.name.clone(),
-                rows,
-                gaps: group.gaps.clone(),
-            }
+            column
         })
         .collect()
 }
@@ -1112,6 +1145,53 @@ mod tests {
         assert!(
             output.contains("dash-api abcd1234"),
             "multi-column should include change ID for dash-api"
+        );
+    }
+
+    #[test]
+    fn single_stack_column_has_plan_file_links_in_markdown() {
+        // Verify that single-stack rendering produces markdown links to plan files.
+        // This is the key property that was broken in multi-stack mode (links were
+        // cleared) and is now always correct on the hot path via build_column_from_stack.
+        let col = StackColumn {
+            name: "feat".to_string(),
+            rows: vec![
+                DisplayRow {
+                    bookmark_name: "feat-api".to_string(),
+                    short_change_id: "abcd1234".to_string(),
+                    change_id_split: None,
+                    is_wc: true,
+                    indicators: vec!["@".to_string()],
+                    first_line: "Add API".to_string(),
+                    plan_filename: Some("02-feat-api.md".to_string()),
+                    metadata: BTreeMap::new(),
+                },
+                DisplayRow {
+                    bookmark_name: "feat-auth".to_string(),
+                    short_change_id: "efgh5678".to_string(),
+                    change_id_split: None,
+                    is_wc: false,
+                    indicators: vec![],
+                    first_line: "Auth module".to_string(),
+                    plan_filename: Some("01-feat-auth.md".to_string()),
+                    metadata: BTreeMap::new(),
+                },
+            ],
+            gaps: vec![],
+        };
+
+        let rendered = render_stack(&[col]);
+        let md_lines = format_markdown(&rendered);
+        let md_output = md_lines.join("\n");
+
+        // Markdown output should contain clickable links to plan files
+        assert!(
+            md_output.contains("[feat-api](./02-feat-api.md)"),
+            "single-stack markdown should link feat-api to its plan file"
+        );
+        assert!(
+            md_output.contains("[feat-auth](./01-feat-auth.md)"),
+            "single-stack markdown should link feat-auth to its plan file"
         );
     }
 }
