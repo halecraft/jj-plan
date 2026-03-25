@@ -339,7 +339,11 @@ Graph visualization with semantic indicators. **Compact format** (default):
 - `◉` = working copy, `○` = other node, `◆` = trunk.
 - Indicators: `@` (working copy), `✓` (done), `~` (has file changes), `synced`, `PR #N`.
 - `✓` supersedes `~` — a done change does not show `~`.
-- Multi-stack mode adds column gutters and `stack:` headers.
+- Multi-stack mode adds column gutters and `stack:` headers with per-column rainbow colors.
+- Each column's gutter `│`, node markers (`○`), and header are rendered in a distinct color from a rotating 6-color palette (cyan, yellow, magenta, blue, green, bright red). The working copy marker `◉` stays bold green regardless of column.
+- Column gutters only appear once a column starts rendering — unstarted columns show spaces instead of `│`, reducing horizontal noise.
+- The `Style` enum includes `ColumnConnector(usize)` and `ColumnHeader(usize)` variants that carry the column index for palette lookup. `format_plain` and `format_markdown` treat these as plain text.
+- Implicit stacks (no `stack/*` base bookmark) are labeled `"Stack 1"`, `"Stack 2"`, etc. instead of borrowing a bookmark name. Explicit stacks keep their human-chosen name from the `stack/*` base bookmark.
 
 #### File view (`stack.md`, written to disk)
 

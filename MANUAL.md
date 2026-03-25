@@ -340,19 +340,22 @@ jj stack --all --format=regular    # verbose format (flag order doesn't matter)
 jj stack --format=regular --all    # same
 ```
 
-**Multi-stack output (column layout):**
+**Multi-stack output (compact, with column colors):**
 
 ```
-  auth                     │ dashboard
-                           │
-  ◉ auth-tests (@)         │ ○ dash-api (synced, PR #45)
-  │ Add auth tests         │ │ Dashboard API endpoints
-  │                        │ │
-  ○ auth-refactor (PR #44) │ ◆ trunk()
-  │ Refactor auth module   │
-  │                        │
-  ◆ trunk()                │
+  │   stack: auth
+  ○   auth-tests abcd1234 (@) Add auth tests
+  ○   auth-refactor efgh5678 (PR #44) Refactor auth module
+  │
+  │ │ stack: Stack 1
+  │ ◉ dash-api ijkl9012 (synced, PR #45) Dashboard API endpoints
+  ├─╯
+  ◆ trunk()
 ```
+
+In the terminal, each column's gutter `│`, node markers (`○`), and `stack:` header are rendered in a distinct color from a rotating rainbow palette (cyan, yellow, magenta, blue, green, bright red). The working copy marker `◉` stays bold green. Columns that haven't started rendering yet show spaces instead of `│` to reduce horizontal noise.
+
+Stacks created with `jj plan new --stack <name>` display their human-chosen name (e.g. `"auth"`). Implicit stacks (no explicit `stack/*` base bookmark) are labeled `"Stack 1"`, `"Stack 2"`, etc.
 
 Note: In multi-stack mode, markdown links to plan files are not included because per-stack file indices don't match global plan file indices.
 

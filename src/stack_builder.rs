@@ -345,21 +345,6 @@ pub fn build_multi_stack(workspace: &Workspace, registry: &PlanRegistry) -> Mult
                 continue;
             }
 
-            // Derive group name from the first (trunk-most) registered bookmark.
-            // Skip bookmarks that aren't in the registry (e.g. `start` might
-            // appear as a segment in multiple groups but isn't the plan we want
-            // to name the group after).
-            let first_registered = stack.segments.iter()
-                .flat_map(|seg| seg.bookmarks.iter())
-                .find(|b| registry.is_tracked(&b.name))
-                .map(|b| b.name.clone())
-                .unwrap_or_else(|| {
-                    stack.segments.first()
-                        .and_then(|seg| seg.bookmarks.first())
-                        .map(|b| b.name.clone())
-                        .unwrap_or_else(|| "unnamed".to_string())
-                });
-
             // Check for explicit stack/* base bookmark, but ONLY for groups
             // that have an explicit stack_id. Implicit (DAG-topology) groups
             // don't have base bookmarks. Also only scan segment tip commits
@@ -375,9 +360,12 @@ pub fn build_multi_stack(workspace: &Workspace, registry: &PlanRegistry) -> Mult
                 None
             };
 
+            // Explicit stack/* base bookmark → use stripped name.
+            // Implicit stack (no base bookmark) → empty sentinel, replaced
+            // with counter label ("Stack 1", "Stack 2", ...) after sorting.
             let name = base_bookmark.as_ref()
                 .map(|b| b.strip_prefix(&stack_prefix).unwrap_or(b).to_string())
-                .unwrap_or(first_registered);
+                .unwrap_or_default();
 
             stack_groups.push(StackGroup {
                 name,
@@ -393,6 +381,16 @@ pub fn build_multi_stack(workspace: &Workspace, registry: &PlanRegistry) -> Mult
         b.segments.len().cmp(&a.segments.len())
             .then_with(|| a.name.cmp(&b.name))
     });
+
+    // Assign counter names to implicit stacks (those with empty sentinel name).
+    // Explicit stacks (with stack/* base bookmark) keep their human-chosen name.
+    let mut counter = 1usize;
+    for group in &mut stack_groups {
+        if group.name.is_empty() {
+            group.name = format!("Stack {}", counter);
+            counter += 1;
+        }
+    }
 
     MultiStack { stacks: stack_groups }
 }

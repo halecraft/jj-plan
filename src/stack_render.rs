@@ -50,12 +50,18 @@ pub enum Style {
     ChangeIdRest,
     /// Indicator text like @, ✓ (green), or other indicator text.
     Indicator,
-    /// Gutter connectors: │, ├─┴─╯ (dim).
+    /// Gutter connectors: │, ├─┴─╯ (dim). Used for trunk merge and single-column.
     Connector,
-    /// Stack header text: "stack: name".
+    /// Stack header text: "stack: name". Used only in single-column mode (unstyled).
     StackHeader,
     /// Warning text: ⚠ messages.
     Warning,
+    /// Per-column gutter connector: │, ○ node markers. The `usize` is the column
+    /// index, used to select a color from the rainbow palette in `format_ansi`.
+    ColumnConnector(usize),
+    /// Per-column stack header: "stack: name". The `usize` is the column index.
+    /// Rendered with underline + column color in `format_ansi`.
+    ColumnHeader(usize),
 }
 
 /// Stack visualization format.
@@ -114,9 +120,21 @@ const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
+const UNDERLINE: &str = "\x1b[4m";
 // 256-color codes matching jj's change ID rendering:
 const BRIGHT_MAGENTA: &str = "\x1b[1m\x1b[38;5;5m"; // bold + 256-color magenta (unique prefix)
 const GRAY: &str = "\x1b[38;5;8m"; // 256-color dark gray (rest of ID)
+
+/// Rainbow palette for multi-column gutter coloring.
+/// Each column gets a distinct color, rotating through the palette.
+const COLUMN_COLORS: &[&str] = &[
+    "\x1b[36m", // cyan
+    "\x1b[33m", // yellow
+    "\x1b[35m", // magenta
+    "\x1b[34m", // blue
+    "\x1b[32m", // green
+    "\x1b[91m", // bright red
+];
 
 // ---------------------------------------------------------------------------
 // Color mode resolution (moved from wrap.rs)
@@ -206,6 +224,19 @@ pub fn format_ansi(lines: &[Vec<Span>]) -> Vec<String> {
                     }
                     Style::Indicator => {
                         buf.push_str(GREEN);
+                        buf.push_str(&span.text);
+                        buf.push_str(RESET);
+                    }
+                    Style::ColumnConnector(i) => {
+                        let color = COLUMN_COLORS[i % COLUMN_COLORS.len()];
+                        buf.push_str(color);
+                        buf.push_str(&span.text);
+                        buf.push_str(RESET);
+                    }
+                    Style::ColumnHeader(i) => {
+                        let color = COLUMN_COLORS[i % COLUMN_COLORS.len()];
+                        buf.push_str(UNDERLINE);
+                        buf.push_str(color);
                         buf.push_str(&span.text);
                         buf.push_str(RESET);
                     }
@@ -317,21 +348,28 @@ enum GutterMark {
 /// `num_cols` is the total number of stack columns.
 /// `active_col` is the column that "owns" this line.
 /// `mark` controls what character appears in the active column.
+/// `started` tracks which columns have begun rendering. Columns where
+/// `started[col] == false` emit spaces instead of `│` pipes.
 ///
-/// Returns spans like [Connector("│ "), Marker("○ ")] (2 chars per column).
-fn build_gutter(num_cols: usize, active_col: usize, mark: GutterMark) -> Vec<Span> {
+/// Returns spans like [ColumnConnector("│ "), Marker("○ ")] (2 chars per column).
+fn build_gutter(num_cols: usize, active_col: usize, mark: GutterMark, started: &[bool]) -> Vec<Span> {
     let mut spans = Vec::with_capacity(num_cols);
     for col in 0..num_cols {
         if col == active_col {
             match mark {
-                GutterMark::Node => spans.push(Span::new("○ ", Style::Marker)),
-                GutterMark::WorkingCopy => spans.push(Span::new("◉ ", Style::WorkingCopyMarker)),
-                GutterMark::Continuation | GutterMark::Header => {
-                    spans.push(Span::new("│ ", Style::Connector))
+                GutterMark::Node => spans.push(Span::new("○ ", Style::ColumnConnector(col))),
+                GutterMark::WorkingCopy => spans.push(Span::new("◉ ", Style::ColumnConnector(col))),
+                GutterMark::Continuation => {
+                    spans.push(Span::new("│ ", Style::ColumnConnector(col)))
+                }
+                GutterMark::Header => {
+                    spans.push(Span::plain("  "))
                 }
             }
+        } else if started[col] {
+            spans.push(Span::new("│ ", Style::ColumnConnector(col)));
         } else {
-            spans.push(Span::new("│ ", Style::Connector));
+            spans.push(Span::plain("  "));
         }
     }
     spans
@@ -529,18 +567,22 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
 fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<Span>> {
     let num_cols = columns.len();
     let mut lines: Vec<Vec<Span>> = Vec::new();
+    let mut started = vec![false; num_cols];
 
     if format == StackFormat::Regular {
         lines.push(vec![]); // leading blank line (Regular only)
     }
 
     for (col_idx, column) in columns.iter().enumerate() {
+        // Mark this column as started (its gutter pipe appears from here on)
+        started[col_idx] = true;
+
         // Stack header
         let mut header_line = vec![Span::plain("  ")];
-        header_line.extend(build_gutter(num_cols, col_idx, GutterMark::Header));
+        header_line.extend(build_gutter(num_cols, col_idx, GutterMark::Header, &started));
         header_line.push(Span::new(
             format!("stack: {}", column.name),
-            Style::StackHeader,
+            Style::ColumnHeader(col_idx),
         ));
         lines.push(header_line);
 
@@ -554,7 +596,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
 
             // Node line
             let mut node_line = vec![Span::plain("  ")];
-            node_line.extend(build_gutter(num_cols, col_idx, mark));
+            node_line.extend(build_gutter(num_cols, col_idx, mark, &started));
             node_line.extend(build_node_content(row));
 
             match format {
@@ -573,7 +615,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                     // Description line
                     if !row.first_line.is_empty() {
                         let mut desc_line = vec![Span::plain("  ")];
-                        desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+                        desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
                         desc_line.push(Span::plain(format!("  {}", row.first_line)));
                         lines.push(desc_line);
                     }
@@ -581,7 +623,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                     // Spacer between segments (not after last)
                     if row_idx < column.rows.len() - 1 {
                         let mut spacer_line = vec![Span::plain("  ")];
-                        spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+                        spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
                         lines.push(spacer_line);
                     }
                 }
@@ -594,7 +636,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                 column.gaps.iter().map(|g| g.unbookmarked.len()).sum();
             lines.push(vec![]);
             let mut warn_line = vec![Span::plain("  ")];
-            warn_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+            warn_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
             warn_line.push(Span::new(
                 format!(
                     "⚠ {} unbookmarked change(s) between plans",
@@ -610,6 +652,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                         num_cols,
                         col_idx,
                         GutterMark::Continuation,
+                        &started,
                     ));
                     gap_line.push(Span::plain(format!(
                         "  {} {}",
@@ -623,7 +666,7 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
         // Spacer between stacks (same for both formats)
         if col_idx < num_cols - 1 {
             let mut spacer_line = vec![Span::plain("  ")];
-            spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation));
+            spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
             lines.push(spacer_line);
         }
     }
@@ -980,12 +1023,13 @@ mod tests {
         let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
-        // The auth column (col 0) should show ○ with a │ gutter for col 1
+        // While rendering auth (col 0), dashboard (col 1) hasn't started yet → spaces, not │
+        // So the auth node line should show "○   " (node + spaces for unstarted col 1)
         assert!(
-            output.contains("○ │"),
-            "auth column node should have gutter for dashboard"
+            !output.contains("○ │"),
+            "auth column should NOT have │ gutter for unstarted dashboard"
         );
-        // The dashboard column (col 1) should show ◉ with a │ gutter for col 0
+        // The dashboard column (col 1) should show ◉ with a │ gutter for col 0 (already started)
         assert!(
             output.contains("│ ◉"),
             "dashboard column node should have gutter for auth"
@@ -1424,6 +1468,165 @@ mod tests {
         assert!(
             !node_line.ends_with(' '),
             "node line should not have trailing space when description is empty: '{node_line}'"
+        );
+    }
+
+    // -- Multi-stack polish tests (rainbow, smart gutter, headers) -----------
+
+    #[test]
+    fn column_connector_style_has_color() {
+        let cols = vec![
+            make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
+            make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
+        ];
+        let lines = format_ansi(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Should contain ANSI color codes from the column palette (not just DIM gray)
+        // Column 0 = cyan (\x1b[36m), Column 1 = yellow (\x1b[33m)
+        assert!(
+            output.contains("\x1b[36m"),
+            "column 0 gutter should use cyan from palette: {output}"
+        );
+        assert!(
+            output.contains("\x1b[33m"),
+            "column 1 gutter should use yellow from palette: {output}"
+        );
+    }
+
+    #[test]
+    fn column_header_is_underlined() {
+        let cols = vec![
+            make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
+            make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
+        ];
+        let lines = format_ansi(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Headers should be underlined + colored
+        assert!(
+            output.contains(&format!("{UNDERLINE}\x1b[36mstack: auth{RESET}")),
+            "auth header should be underlined + cyan: {output}"
+        );
+        assert!(
+            output.contains(&format!("{UNDERLINE}\x1b[33mstack: dashboard{RESET}")),
+            "dashboard header should be underlined + yellow: {output}"
+        );
+    }
+
+    #[test]
+    fn unstarted_columns_show_spaces() {
+        let cols = vec![
+            make_column("a", vec![make_row("a1", "A", false)]),
+            make_column("b", vec![make_row("b1", "B", false)]),
+            make_column("c", vec![make_row("c1", "C", true)]),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+
+        // While rendering column 0 (a), columns 1 and 2 haven't started.
+        // The header line for "a" should NOT have │ for columns 1 and 2.
+        let header_a = lines.iter().find(|l| l.contains("stack: a")).unwrap();
+        // Column 0 header: "  │ stack: a" (just the active col's │, no trailing │ │)
+        assert!(
+            !header_a.contains("│ │"),
+            "unstarted columns should not show pipes on column 0 header: '{header_a}'"
+        );
+
+        // The node line for "a1" should have ○ but no trailing │ for cols 1, 2
+        let node_a = lines.iter().find(|l| l.contains("a1")).unwrap();
+        assert!(
+            !node_a.contains("│"),
+            "unstarted columns should show spaces, not pipes, on column 0 node: '{node_a}'"
+        );
+    }
+
+    #[test]
+    fn started_columns_show_pipes() {
+        let cols = vec![
+            make_column("a", vec![make_row("a1", "A", false)]),
+            make_column("b", vec![make_row("b1", "B", false)]),
+            make_column("c", vec![make_row("c1", "C", true)]),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+
+        // While rendering column 2 (c), columns 0 and 1 have already started.
+        // The node line for "c1" should show │ │ before ◉
+        let node_c = lines.iter().find(|l| l.contains("c1")).unwrap();
+        assert!(
+            node_c.contains("│ │"),
+            "started columns should show pipes on column 2 node: '{node_c}'"
+        );
+    }
+
+    #[test]
+    fn format_plain_ignores_column_styles() {
+        let cols = vec![
+            make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
+            make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Plain format should have no ANSI codes
+        assert!(
+            !output.contains("\x1b["),
+            "format_plain should not contain ANSI escape sequences: {output}"
+        );
+        // Should still contain structural elements
+        assert!(output.contains("│"), "should still have │ pipes");
+        assert!(output.contains("stack: auth"), "should still have stack header text");
+        assert!(output.contains("stack: dashboard"), "should still have stack header text");
+    }
+
+    #[test]
+    fn implicit_stack_gets_counter_name_in_output() {
+        // Simulate implicit stacks by giving columns counter-style names
+        // (this is what build_multi_stack produces for implicit stacks)
+        let cols = vec![
+            make_column("Stack 1", vec![make_row("feat-auth", "Auth", false)]),
+            make_column("Stack 2", vec![make_row("fix-bug", "Bug fix", true)]),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        assert!(
+            output.contains("stack: Stack 1"),
+            "implicit stack should show counter name: {output}"
+        );
+        assert!(
+            output.contains("stack: Stack 2"),
+            "implicit stack should show counter name: {output}"
+        );
+        // Bookmark names should NOT appear in headers (no redundancy)
+        assert!(
+            !output.contains("stack: feat-auth"),
+            "implicit stack should NOT use bookmark as header name"
+        );
+    }
+
+    #[test]
+    fn explicit_stack_keeps_human_name_in_output() {
+        // Simulate explicit stack with a human-chosen name
+        // (this is what build_multi_stack produces for stack/* base bookmarks)
+        let cols = vec![
+            make_column("auth", vec![
+                make_row("auth-tests", "Add tests", false),
+                make_row("auth-refactor", "Refactor auth", false),
+            ]),
+            make_column("Stack 1", vec![make_row("fix-bug", "Bug fix", true)]),
+        ];
+        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let output = lines.join("\n");
+
+        // Explicit stack keeps its human name
+        assert!(
+            output.contains("stack: auth"),
+            "explicit stack should keep human-chosen name: {output}"
+        );
+        // Implicit stack gets counter
+        assert!(
+            output.contains("stack: Stack 1"),
+            "implicit stack should get counter name: {output}"
         );
     }
 }
