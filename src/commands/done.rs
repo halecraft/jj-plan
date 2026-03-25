@@ -179,6 +179,7 @@ fn run_done_single(
     // shell shim's wrap → flush_all) would read the stale plan file and
     // overwrite the jj description, losing the front matter we just set.
     workspace.reload();
+    crate::wrap::cleanup_stale_and_migrate(plan_dir, workspace, registry);
     let gathered = crate::wrap::sync_to_disk(plan_dir, workspace, registry);
 
     // If we targeted the working copy (default), advance to the next undone plan.

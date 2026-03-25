@@ -260,25 +260,24 @@ pub fn sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanR
 }
 
 // ---------------------------------------------------------------------------
-// Sync tier 3: full_sync_and_show — stale cleanup + migration + sync + show
+// Composable prerequisite: cleanup_stale_and_migrate
 // ---------------------------------------------------------------------------
 
-/// Full post-mutation sync: untrack stale bookmarks, migrate legacy
-/// filenames, sync plan files to disk, show stack.
+/// Cleanup: untrack stale bookmarks and migrate legacy filenames.
 ///
-/// This is the batteries-included function for user-facing command paths.
-/// It handles all the lifecycle steps that `wrap()` performs after a
-/// mutating command:
+/// Performs the two imperative side effects that must run before sync:
+/// 1. Detect and untrack registry entries whose bookmarks no longer exist in jj.
+/// 2. Migrate legacy change-ID-based filenames to bookmark-named files.
 ///
-/// 1. Detect and untrack stale registry entries (abandoned bookmarks)
-/// 2. Migrate legacy change-ID-based filenames to bookmark-named files
-/// 3. Build the stack, sync plan files, render display data
-/// 4. Show the stack visualization
-pub fn full_sync_and_show(
+/// Idempotent: safe to call multiple times (second call finds nothing to do).
+///
+/// Callers compose this with `sync_to_disk` or `sync_and_show` depending on
+/// whether they need display. `full_sync_and_show` is the convenience wrapper
+/// that calls both `cleanup_stale_and_migrate` + `sync_and_show`.
+pub fn cleanup_stale_and_migrate(
     plan_dir: &PlanDir,
     workspace: &Workspace,
     registry: &PlanRegistry,
-    format: StackFormat,
 ) {
     // 1. Detect and untrack stale registry entries.
     let all_bookmarks = workspace.local_bookmarks();
@@ -318,8 +317,28 @@ pub fn full_sync_and_show(
         }
         None
     });
+}
 
-    // 3-4. Sync plan files to disk and show the stack.
+// ---------------------------------------------------------------------------
+// Sync tier 3: full_sync_and_show — stale cleanup + migration + sync + show
+// ---------------------------------------------------------------------------
+
+/// Full post-mutation sync: untrack stale bookmarks, migrate legacy
+/// filenames, sync plan files to disk, show stack.
+///
+/// This is the batteries-included function for user-facing command paths.
+/// Delegates to `cleanup_stale_and_migrate` + `sync_and_show`.
+///
+/// Callers that need cleanup without display (e.g. `jj stack --all` which
+/// uses its own multi-stack display) can call `cleanup_stale_and_migrate` +
+/// `sync_to_disk` directly.
+pub fn full_sync_and_show(
+    plan_dir: &PlanDir,
+    workspace: &Workspace,
+    registry: &PlanRegistry,
+    format: StackFormat,
+) {
+    cleanup_stale_and_migrate(plan_dir, workspace, registry);
     sync_and_show(plan_dir, workspace, registry, format);
 }
 

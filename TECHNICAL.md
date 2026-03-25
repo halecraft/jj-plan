@@ -35,7 +35,7 @@ Read-only jj commands (`log`, `diff`, `show`, etc.) pass through via `exec` with
 | `src/workspace.rs` | 1045 | Unified jj-lib wrapper: reads + git write operations |
 | `src/stack_render.rs` | 1075 | Pure stack rendering: Span/Style model, multi-column layout, ANSI/plain/markdown formatting |
 | `src/stack_builder.rs` | 1477 | Stack construction, gap detection, `collect_submission_chain()` |
-| `src/wrap.rs` | ~500 | Wrap lifecycle, three-tier sync (`sync_to_disk`, `sync_and_show`, `full_sync_and_show`), `find_stale_bookmarks()`, `StackDisplayData`, `SyncChangeView` |
+| `src/wrap.rs` | ~500 | Wrap lifecycle, `cleanup_stale_and_migrate()`, three-tier sync (`sync_to_disk`, `sync_and_show`, `full_sync_and_show`), `find_stale_bookmarks()`, `StackDisplayData`, `SyncChangeView` |
 | `src/flush.rs` | 298 | Plan file → jj description sync (file is authoritative) |
 | `src/sync.rs` | 587 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
 | `src/plan_file.rs` | 574 | Plan file parsing, bookmark name encoding, legacy migration |
@@ -289,12 +289,22 @@ The real `jj` command runs with inherited stdio. Its exit code is captured.
 
 ### Phase 4: Full sync & show (`full_sync_and_show`)
 
-This phase is handled by `full_sync_and_show()`, the batteries-included sync function for user-facing command paths. It performs four sub-steps:
+This phase is handled by `full_sync_and_show()`, the batteries-included sync function for user-facing command paths. It delegates to `cleanup_stale_and_migrate()` + `sync_and_show()`:
+
+1. **Cleanup** (`cleanup_stale_and_migrate`): detect and untrack stale bookmarks, migrate legacy filenames (see below).
+2. **Sync to disk** (`sync_to_disk`): build the @-relative stack, fork into sync views + rendering, call `sync::sync()`.
+3. **Show stack** (`show_plan_stack`): render the stack visualization to the terminal.
+
+Callers that need cleanup without the single-stack display (e.g. `jj stack --all`, which uses its own multi-stack display) can call `cleanup_stale_and_migrate` + `sync_to_disk` directly.
+
+### Composable prerequisite: `cleanup_stale_and_migrate`
+
+`cleanup_stale_and_migrate(plan_dir, workspace, registry)` performs two imperative side effects that must run before sync:
 
 1. **Detect stale bookmarks** (`find_stale_bookmarks`, pure): identify registry entries whose bookmarks no longer exist in jj (e.g. deleted by `jj abandon`). Untrack and save if any found.
 2. **Migrate legacy filenames** (`plan_file::migrate_legacy_filenames`): rename old change-ID-based filenames to bookmark-named files.
-3. **Sync to disk** (`sync_to_disk`): build the @-relative stack, fork into sync views + rendering, call `sync::sync()`.
-4. **Show stack** (`show_plan_stack`): render the stack visualization to the terminal.
+
+This function is idempotent — safe to call multiple times (the second call finds nothing to do). It is not a sync tier itself, but a composable prerequisite that any caller can invoke before choosing which sync tier to use.
 
 ### Three-tier sync functions
 
@@ -302,9 +312,9 @@ This phase is handled by `full_sync_and_show()`, the batteries-included sync fun
 
 | Function | Does | Used by |
 |---|---|---|
-| `sync_to_disk(plan_dir, workspace, registry) → Option<StackDisplayData>` | Build stack, sync plan files, return display data. No registry mutations or stderr output. | Internal paths needing display data (`auto_cleanup_merged_stacks`, `run_merge_async`, `run_done_single`) |
+| `sync_to_disk(plan_dir, workspace, registry) → Option<StackDisplayData>` | Build stack, sync plan files, return display data. No registry mutations or stderr output. | Internal paths needing display data (`auto_cleanup_merged_stacks`, `run_merge_async`, `run_done_single`, `dispatch_stack --all`) |
 | `sync_and_show(plan_dir, workspace, registry, format)` | `sync_to_disk` + `show_plan_stack`. | Internal re-sync paths where stale-bookmark detection is not needed (`run_stack_untrack`, `run_untrack`) |
-| `full_sync_and_show(plan_dir, workspace, registry, format)` | Stale-bookmark cleanup + legacy migration + `sync_and_show`. | User-facing command paths after mutations (`wrap`, `dispatch_stack`, `plan_next/prev/go`, `run_done`, `run_new`, `run_track`) |
+| `full_sync_and_show(plan_dir, workspace, registry, format)` | `cleanup_stale_and_migrate` + `sync_and_show`. | User-facing command paths after mutations (`wrap`, `dispatch_stack`, `plan_next/prev/go`, `run_done`, `run_new`, `run_track`) |
 
 ### Sync internals (`src/sync.rs`)
 

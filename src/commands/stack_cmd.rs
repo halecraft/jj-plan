@@ -128,11 +128,12 @@ pub fn dispatch_stack(
     if parsed.show_all {
         crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
         workspace.reload();
-        // Sync plan files for current stack first (so plan dir is up to date).
-        // Uses full_sync_and_show for stale-bookmark cleanup, but the
-        // single-stack display it produces is immediately followed by the
-        // multi-stack display from show_all_stacks.
-        crate::wrap::full_sync_and_show(plan_dir, workspace, registry, effective_format);
+        // Cleanup stale bookmarks + migrate legacy filenames, then sync plan
+        // files to disk. Display is handled exclusively by show_all_stacks
+        // (multi-stack view), so we use sync_to_disk instead of sync_and_show
+        // to avoid an unwanted single-stack display.
+        crate::wrap::cleanup_stale_and_migrate(plan_dir, workspace, registry);
+        let _ = crate::wrap::sync_to_disk(plan_dir, workspace, registry);
         show_all_stacks(plan_dir, workspace, registry, effective_format);
         return Ok(0);
     }
