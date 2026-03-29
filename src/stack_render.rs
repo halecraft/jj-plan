@@ -880,7 +880,6 @@ pub fn build_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Gap;
 
     // -- Test helpers --------------------------------------------------------
 

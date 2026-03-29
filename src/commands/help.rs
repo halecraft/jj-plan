@@ -219,7 +219,7 @@ pub fn build_plan_help() -> PlanHelp {
             ("jj plan new <bookmark>", "Create a plan (change + bookmark + template)"),
             ("$EDITOR .jj-plan/current.md", "Write the current plan"),
             ("jj plan new <next-bookmark>", "Add another plan to the stack"),
-            ("jj plan done", "Mark the current plan done and advance"),
+            ("jj plan done", "Mark the current plan done"),
         ],
         commands: vec![
             HelpEntry {

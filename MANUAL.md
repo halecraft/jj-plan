@@ -202,7 +202,6 @@ jj plan done --keep-scratch    # don't strip [scratch] sections
    - If a `plan-status:` line already exists with a different value (e.g., `🔴`), it is replaced in-place.
    - If no `plan-status:` line exists, one is appended.
    - If `plan-status: ✅` is already present, no change is made.
-4. If the target is the working copy (default), automatically advances to the next undone plan in the stack.
 
 **Flags:**
 

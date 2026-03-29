@@ -17,9 +17,6 @@ use crate::wrap::SyncChangeView;
 /// - `--keep-scratch`: don't strip `[scratch]` sections
 /// - `--dry-run`: show what would be changed without modifying anything
 /// - Positional arg: a specific CHANGE_ID to mark done (defaults to `@`)
-///
-/// When marking a single plan done (the default), if the target is the
-/// working copy (`@`), automatically advances to the next undone plan.
 pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &mut Workspace, registry: &PlanRegistry, format: StackFormat) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
     // 1. Parse args
@@ -118,8 +115,7 @@ fn run_done_stack(
 // Single plan flow (default)
 // ---------------------------------------------------------------------------
 
-/// Mark a single plan as done, then advance to the next undone plan if the
-/// target was the working copy.
+/// Mark a single plan as done.
 #[allow(clippy::too_many_arguments)]
 fn run_done_single(
     jj: &JjBinary,
@@ -133,7 +129,6 @@ fn run_done_single(
     format: StackFormat,
 ) -> crate::error::Result<i32> {
     let target = target_id.clone().unwrap_or_else(|| "@".to_string());
-    let is_default_target = target_id.is_none(); // targeting working copy
 
     // Try to find the change in the resolved stack
     let found = changes.and_then(|cs| find_change_in_stack(cs, &target));
@@ -182,16 +177,8 @@ fn run_done_single(
     crate::wrap::cleanup_stale_and_migrate(plan_dir, workspace, registry);
     let gathered = crate::wrap::sync_to_disk(plan_dir, workspace, registry);
 
-    // If we targeted the working copy (default), advance to the next undone plan.
-    // advance_to_next_undone() does its own workspace.reload() + full_sync_and_show(),
-    // so skip the outer one to avoid a redundant second stack build + sync cycle.
-    if is_default_target {
-        advance_to_next_undone(jj, plan_dir, workspace, registry, format);
-    } else {
-        // Explicit target or no advance needed — show the stack
-        // using the display data we already gathered above.
-        crate::wrap::show_plan_stack(plan_dir, gathered.as_ref(), format);
-    }
+    // Show the updated stack.
+    crate::wrap::show_plan_stack(plan_dir, gathered.as_ref(), format);
     Ok(0)
 }
 
@@ -223,55 +210,6 @@ fn read_description(workspace: &Workspace, target: &str) -> Option<String> {
 /// place to maintain the `StackResult` → `Vec<SyncChangeView>` conversion.
 fn build_sync_views_for_done(workspace: &Workspace, registry: &PlanRegistry) -> Option<Vec<SyncChangeView>> {
     crate::wrap::build_sync_views(workspace, registry)
-}
-
-/// After marking the current working copy done, re-resolve the stack and
-/// advance (`jj edit`) to the next undone change.
-///
-/// Re-resolves the stack once (after the describe mutation), then searches
-/// forward (with wraparound) for the next undone change. After `jj edit`,
-/// calls `full_sync_and_show()` exactly once to update plan files.
-fn advance_to_next_undone(jj: &JjBinary, plan_dir: &PlanDir, workspace: &mut Workspace, registry: &PlanRegistry, format: StackFormat) {
-    // Re-resolve the stack once after the describe
-    workspace.reload();
-    let changes = build_sync_views_for_done(workspace, registry);
-
-    let changes = match changes {
-        Some(c) => c,
-        None => {
-            // No stack resolved — still sync to pick up the done marker.
-            crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
-            return;
-        }
-    };
-
-    // Find the current working copy index
-    let current_idx = match changes.iter().position(|c| c.is_working_copy) {
-        Some(idx) => idx,
-        None => {
-            // Can't determine position — sync what we have.
-            crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
-            return;
-        }
-    };
-
-    // Search forward then wraparound for the next undone change
-    let forward = &changes[current_idx + 1..];
-    let wraparound = &changes[..current_idx];
-    let next_undone = forward.iter().chain(wraparound.iter()).find(|c| !c.is_done());
-
-    match next_undone {
-        Some(change) => {
-            let _ = jj.run_inherit(&["edit", "-r", &change.change_id]);
-            workspace.reload();
-            crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
-        }
-        None => {
-            // All done — still sync to pick up the done marker we just wrote.
-            crate::wrap::full_sync_and_show(plan_dir, workspace, registry, format);
-            eprintln!("All plans in stack are done 🎉");
-        }
-    }
 }
 
 /// Print a dry-run diff for a single change, showing what sections would be
@@ -313,7 +251,6 @@ fn print_dry_run_diff(doc: &PlanDocument, keep_scratch: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::markdown::PlanDocument;
 
     #[test]

@@ -1231,32 +1231,16 @@ Need JWT and API key support
   [[ "$desc" == *"plan-status: ✅"* ]]
 }
 
-@test "jj plan done advances to next undone plan" {
+@test "jj plan done does not change working copy" {
   jj describe -m "Plan 1"
   local P1 P2
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj plan new step-1; jj describe -m "Plan 2"
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
+  # Go back to plan 1 and mark it done
   jj edit -r "$P1"
   jj plan done
-  local CUR
-  CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  [[ "$CUR" == "$P2" ]]
-}
-
-@test "jj plan done wraps around to earlier undone plan when at end of stack" {
-  jj describe -m "Plan 1"
-  local P1 P2 P3
-  P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
-  P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Plan 3"
-  P3=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  # Mark plan 2 done (middle), leave plan 1 undone
-  jj plan done "$P2"
-  # Now at plan 3 (last); mark it done — should wraparound to plan 1
-  jj edit -r "$P3"
-  jj plan done
+  # Working copy should still be plan 1, not advanced to plan 2
   local CUR
   CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   [[ "$CUR" == "$P1" ]]

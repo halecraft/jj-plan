@@ -57,7 +57,7 @@ jj plan go 2                   # jump to plan #2
 # Submit as stacked PRs — plan content becomes the PR description
 jj stack submit
 
-# Mark done — strips [scratch] working memory, advances to next
+# Mark done — strips [scratch] working memory, sets status ✅
 jj plan done
 
 # Sync with remote (fetch + re-submit)
