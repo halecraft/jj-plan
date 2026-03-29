@@ -284,6 +284,14 @@ impl PlanDocument {
         strip_scratch_sections(&self.body)
     }
 
+    /// All headings in the raw document (title line + callout + body).
+    ///
+    /// Uses `extract_headings` (pulldown-cmark) for CommonMark-compliant
+    /// heading detection with code fence immunity. Computed on demand.
+    pub fn headings(&self) -> Vec<HeadingInfo> {
+        extract_headings(&self.raw)
+    }
+
     /// The complete "mark as done" transformation.
     ///
     /// 1. If `!keep_scratch`, strips `[scratch]` sections from the full document.
@@ -316,31 +324,37 @@ impl PlanDocument {
 }
 
 // ---------------------------------------------------------------------------
-// Scratch section stripping (pulldown-cmark based)
+// Heading extraction (pulldown-cmark based)
 // ---------------------------------------------------------------------------
 
-/// Strip all `[scratch]`-annotated heading sections from a markdown document.
+/// A heading found in a markdown document.
 ///
-/// Uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading
-/// detection (ATX and setext headings, code fence awareness). Front matter is
-/// extracted first (pulldown-cmark would misparse `---` as a thematic break),
-/// then heading events define byte ranges for scratch sections, which are sliced
-/// out of the original body text — preserving all original formatting byte-for-byte
-/// in non-scratch regions.
-pub fn strip_scratch_sections(input: &str) -> String {
+/// Extracted via `pulldown-cmark` with `into_offset_iter()` for proper
+/// CommonMark compliance (ATX and setext headings, code fence immunity).
+pub struct HeadingInfo {
+    /// Heading level (1–6).
+    pub level: u8,
+    /// The heading's text content (inline code included, markup stripped).
+    pub text: String,
+    /// Byte offset of the heading in the source string.
+    pub byte_offset: usize,
+    /// 1-based line number of the heading in the source string.
+    pub line: usize,
+}
+
+/// Extract all headings from a markdown string.
+///
+/// Uses `pulldown-cmark`'s offset iterator for correct CommonMark heading
+/// detection (ATX `#` headings, setext underline headings) with automatic
+/// code fence immunity. Returns headings in document order.
+///
+/// The `line` field is computed from `byte_offset` by counting newlines
+/// in `input[..byte_offset]`.
+pub fn extract_headings(input: &str) -> Vec<HeadingInfo> {
     use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
     if input.is_empty() {
-        return String::new();
-    }
-
-    // Parse the entire input with pulldown-cmark to find heading sections.
-    // With the callout metadata format, there is no `---` metadata delimiter
-    // to confuse pulldown-cmark — callout blocks are valid blockquotes.
-    struct HeadingInfo {
-        level: u8,
-        text: String,
-        start: usize, // byte offset into `body`
+        return Vec::new();
     }
 
     let parser = Parser::new_ext(input, Options::all());
@@ -360,15 +374,20 @@ pub fn strip_scratch_sections(input: &str) -> String {
                 current_heading_text.push_str(&text);
             }
             Event::Code(code) if current_heading_level.is_some() => {
-                // Heading text might contain inline code
                 current_heading_text.push_str(&code);
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some(level) = current_heading_level.take() {
+                    let line = input[..current_heading_start]
+                        .bytes()
+                        .filter(|&b| b == b'\n')
+                        .count()
+                        + 1;
                     headings.push(HeadingInfo {
                         level,
                         text: std::mem::take(&mut current_heading_text),
-                        start: current_heading_start,
+                        byte_offset: current_heading_start,
+                        line,
                     });
                 }
             }
@@ -376,7 +395,29 @@ pub fn strip_scratch_sections(input: &str) -> String {
         }
     }
 
-    // 3. Identify scratch section byte ranges to remove
+    headings
+}
+
+// ---------------------------------------------------------------------------
+// Scratch section stripping (pulldown-cmark based)
+// ---------------------------------------------------------------------------
+
+/// Strip all `[scratch]`-annotated heading sections from a markdown document.
+///
+/// Uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading
+/// detection (ATX and setext headings, code fence awareness). Front matter is
+/// extracted first (pulldown-cmark would misparse `---` as a thematic break),
+/// then heading events define byte ranges for scratch sections, which are sliced
+/// out of the original body text — preserving all original formatting byte-for-byte
+/// in non-scratch regions.
+pub fn strip_scratch_sections(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+
+    let headings = extract_headings(input);
+
+    // Identify scratch section byte ranges to remove
     //    A scratch section: starts at a heading with [scratch] in its text,
     //    extends until the next heading of same or higher level, or end of body.
     let mut removal_ranges: Vec<std::ops::Range<usize>> = Vec::new();
@@ -384,14 +425,14 @@ pub fn strip_scratch_sections(input: &str) -> String {
     while i < headings.len() {
         let h = &headings[i];
         if h.text.to_lowercase().contains("[scratch]") {
-            let scratch_start = h.start;
+            let scratch_start = h.byte_offset;
             let scratch_level = h.level;
 
             // Find where this section ends
             let mut end = input.len();
             for (j, heading) in headings.iter().enumerate().skip(i + 1) {
                 if heading.level <= scratch_level {
-                    end = heading.start;
+                    end = heading.byte_offset;
                     i = j; // continue scanning from this heading
                     break;
                 }
@@ -723,6 +764,62 @@ mod tests {
         let doc = PlanDocument::parse("feat: just a title");
         assert_eq!(doc.title(), "feat: just a title");
         assert!(doc.body().is_empty());
+    }
+
+    // ── extract_headings tests ──────────────────────────────────────
+
+    #[test]
+    fn test_extract_headings_basic() {
+        let input = "Title line\n\n# First\n\nSome text.\n\n## Second\n\n### Third\n";
+        let headings = extract_headings(input);
+        assert_eq!(headings.len(), 3);
+
+        assert_eq!(headings[0].level, 1);
+        assert_eq!(headings[0].text, "First");
+        assert_eq!(headings[0].line, 3);
+
+        assert_eq!(headings[1].level, 2);
+        assert_eq!(headings[1].text, "Second");
+        assert_eq!(headings[1].line, 7);
+
+        assert_eq!(headings[2].level, 3);
+        assert_eq!(headings[2].text, "Third");
+        assert_eq!(headings[2].line, 9);
+    }
+
+    #[test]
+    fn test_extract_headings_ignores_fenced_code() {
+        let input = "# Real heading\n\n```\n# Not a heading\n```\n\n## Also real\n";
+        let headings = extract_headings(input);
+        assert_eq!(headings.len(), 2);
+        assert_eq!(headings[0].text, "Real heading");
+        assert_eq!(headings[1].text, "Also real");
+
+        // Tilde fences too
+        let input2 = "# Top\n\n~~~\n## Fake\n~~~\n\n### Bottom\n";
+        let headings2 = extract_headings(input2);
+        assert_eq!(headings2.len(), 2);
+        assert_eq!(headings2[0].text, "Top");
+        assert_eq!(headings2[1].text, "Bottom");
+    }
+
+    #[test]
+    fn test_extract_headings_setext() {
+        let input = "Setext H1\n=========\n\nSome text.\n\nSetext H2\n---------\n";
+        let headings = extract_headings(input);
+        assert_eq!(headings.len(), 2);
+        assert_eq!(headings[0].level, 1);
+        assert_eq!(headings[0].text, "Setext H1");
+        assert_eq!(headings[0].line, 1);
+        assert_eq!(headings[1].level, 2);
+        assert_eq!(headings[1].text, "Setext H2");
+        assert_eq!(headings[1].line, 6);
+    }
+
+    #[test]
+    fn test_extract_headings_empty_input() {
+        let headings = extract_headings("");
+        assert!(headings.is_empty());
     }
 
     // ── Scratch stripping tests ─────────────────────────────────────

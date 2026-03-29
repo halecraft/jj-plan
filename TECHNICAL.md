@@ -236,6 +236,8 @@ args[0] match:
   other       → wrap::wrap()        // flush → run → reload → sync → show
 ```
 
+`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
+
 Before dispatch:
 1. Resolve the real jj binary.
 2. Check for `plan --help` early.
@@ -729,7 +731,7 @@ Parsing rules:
 
 This format replaced an earlier `---`-delimited "summary-first" format that was position-sensitive (metadata had to start on line 2, no blank lines allowed) and used `---` as both metadata separator and CommonMark thematic break. The callout format is unambiguous, blank-line tolerant, and renders correctly in both plain text and markdown renderers.
 
-Free functions: `parse_metadata()`, `set_metadata_field()`, `remove_metadata()`, `strip_scratch_sections()`.
+Free functions: `parse_metadata()`, `set_metadata_field()`, `remove_metadata()`, `extract_headings()`, `strip_scratch_sections()`.
 
 ### `PlanDocument` — unified parse-and-transform facade
 
@@ -744,6 +746,7 @@ doc.is_done()    // → bool — metadata status == ✅
 doc.metadata()   // → &BTreeMap<String, String>
 doc.body()       // → &str — everything outside title and callout block
 doc.raw()        // → &str — original input
+doc.headings()   // → Vec<HeadingInfo> — all headings with line numbers
 
 // Transform methods (allocate new Strings)
 doc.as_done(keep_scratch)  // → String — strip scratch + set status: ✅ in callout
@@ -751,16 +754,23 @@ doc.pr_parts()             // → Option<(String, String)> — (title, body) for
 doc.body_sans_scratch()    // → String — body with [scratch] sections removed
 ```
 
-Three consumer patterns:
+Four consumer patterns:
 1. **Done path** (`done.rs`): `PlanDocument::parse(desc).as_done(keep_scratch)` → `jj describe -m`.
 2. **Submit path** (`stack_cmd.rs`): `PlanDocument::parse(&content).pr_parts()` → PR title + body.
 3. **Display path** (`stack_render.rs`): `PlanDocument::parse(&tip.description)` → `is_done`, `title`, `metadata` indicators.
+4. **Summary path** (`summary.rs`): `PlanDocument::parse(&desc)` → `title`, `metadata`, `body`, `headings()` for outline extraction.
 
 `description_is_done()` and `description_first_line()` in `types.rs` remain as thin wrappers for plan-agnostic call sites (`LogEntry`, `SyncChangeView`) that don't need a full `PlanDocument`.
 
+### Heading extraction
+
+`extract_headings(input: &str) -> Vec<HeadingInfo>` uses `pulldown-cmark` with `into_offset_iter()` for CommonMark-compliant heading detection (ATX and setext headings, code fence immunity). Each `HeadingInfo` contains `level` (1–6), `text` (inline markup stripped), `byte_offset`, and `line` (1-based, computed from byte offset). This is the shared foundation for both scratch-section stripping and outline extraction.
+
+`PlanDocument::headings()` is a convenience accessor that calls `extract_headings(&self.raw)` on demand (not cached), consistent with other on-demand methods like `body_sans_scratch()`.
+
 ### Scratch section stripping
 
-`strip_scratch_sections()` uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading detection (ATX and setext headings, code fence awareness). The entire input is passed directly to pulldown-cmark — the callout metadata block is a valid CommonMark blockquote that pulldown-cmark handles correctly (it will never match as a `[scratch]` heading). Scratch sections (headings containing `[scratch]`, case-insensitive) are sliced out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
+`strip_scratch_sections()` is a consumer of `extract_headings()` — it filters for headings containing `[scratch]` (case-insensitive) and slices them out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
 
 Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, callout metadata preservation, `---` thematic breaks in body.
 

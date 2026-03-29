@@ -54,6 +54,10 @@ jj plan next                   # advance to next plan
 jj plan prev                   # go back
 jj plan go 2                   # jump to plan #2
 
+# Inspect plan structure (great for LLM context)
+jj plan summary                # outline, phases, cross-refs, diff stat
+jj plan summary --json         # machine-readable JSON output
+
 # Submit as stacked PRs — plan content becomes the PR description
 jj stack submit
 

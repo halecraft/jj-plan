@@ -1318,6 +1318,66 @@ plan-status: ✅"
 }
 
 # =============================================================================
+# jj plan summary
+# =============================================================================
+
+@test "jj plan summary shows plan outline" {
+  jj describe -m "feat: my feature
+
+> [!plan]
+> status: 🟡
+
+# Background
+
+Some context.
+
+# 🟡 Phase 1: Setup
+
+## Tasks
+
+- ✅ Create files
+- 🔴 Wire things
+
+# 🔴 Phase 2: Tests
+
+## Tasks
+
+- 🔴 Write tests
+"
+  run jj plan summary
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Outline:"* ]]
+  [[ "$output" == *"Phases:"* ]]
+  [[ "$output" == *"Stack"* ]]
+  [[ "$output" == *"Phase 1"* ]]
+  [[ "$output" == *"0/2 complete"* ]]
+}
+
+@test "jj plan summary --json outputs valid JSON" {
+  jj describe -m "feat: json test
+
+> [!plan]
+> status: 🔴
+
+# Background
+
+Details here.
+"
+  run jj plan summary --json
+  [[ "$status" -eq 0 ]]
+  local title
+  title=$(echo "$output" | jq -r .title)
+  [[ "$title" == "feat: json test" ]]
+}
+
+@test "jj plan summary --stack=quiet omits stack" {
+  jj describe -m "feat: quiet test"
+  run jj plan summary --stack=quiet
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"Stack"* ]]
+}
+
+# =============================================================================
 # jj plan next / prev
 # =============================================================================
 

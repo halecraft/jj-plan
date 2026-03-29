@@ -220,6 +220,7 @@ pub fn build_plan_help() -> PlanHelp {
             ("$EDITOR .jj-plan/current.md", "Write the current plan"),
             ("jj plan new <next-bookmark>", "Add another plan to the stack"),
             ("jj plan done", "Mark the current plan done"),
+            ("jj plan summary", "Inspect plan structure, phases, and context"),
         ],
         commands: vec![
             HelpEntry {
@@ -261,6 +262,22 @@ pub fn build_plan_help() -> PlanHelp {
             HelpEntry {
                 label: "go <N | bookmark | ID>",
                 description: "Jump to a plan by index (1-based), bookmark name, or change ID",
+            },
+            HelpEntry {
+                label: "summary [target] [flags]",
+                description: "Show structured plan summary (LLM-friendly)",
+            },
+            HelpEntry {
+                label: "  --json",
+                description: "Output as JSON instead of text",
+            },
+            HelpEntry {
+                label: "  --no-diff-stat",
+                description: "Suppress diff stat section",
+            },
+            HelpEntry {
+                label: "  --stack=full|minimal|quiet",
+                description: "Control stack verbosity (default: full)",
             },
             HelpEntry {
                 label: "config",

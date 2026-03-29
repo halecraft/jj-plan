@@ -211,6 +211,45 @@ jj plan done --keep-scratch    # don't strip [scratch] sections
 | `--keep-scratch` | Don't strip `[scratch]` sections |
 | `--dry-run` | Preview what would be changed without modifying anything |
 
+### `jj plan summary`
+
+Show a structured summary of a plan — designed for LLM tool calls but useful for humans too.
+
+```
+jj plan summary                # summarize the working copy's plan
+jj plan summary <target>       # summarize a specific change ID or bookmark
+jj plan summary --json         # output as JSON (includes raw plan body)
+jj plan summary --no-diff-stat # suppress the diff stat section
+jj plan summary --stack=quiet  # omit the stack section
+jj plan summary --stack=minimal # compact stack (bookmark + ID + status only)
+```
+
+**What it outputs:**
+
+All output goes to **stdout** (not stderr), so it can be piped or captured by tool-calling LLMs.
+
+| Section | Content |
+|---|---|
+| Header | Title, bookmark, change ID, status |
+| Metadata | All callout metadata fields + line count + word count |
+| Outline | Every markdown heading with line numbers |
+| Phases | Compact progress (e.g. `2/3 complete (✅✅🔴)`) + active phase task counts |
+| References | `jj:CHANGE_ID` cross-references resolved to bookmark + title |
+| Diff stat | `jj diff --stat` output for the change |
+| Stack | Full stack with `← this plan` marker |
+
+**Flags:**
+
+| Flag | Description |
+|---|---|
+| `--json` | Output as JSON instead of text (includes `raw_body` field) |
+| `--no-diff-stat` | Suppress the diff stat section |
+| `--stack=full` | Full stack with one-line summaries (default) |
+| `--stack=minimal` | Compact: bookmark, change ID, status only |
+| `--stack=quiet` | Omit the stack section entirely |
+
+Phase and task status indicators are configurable via `JJ_PLAN_STATUS_*` environment variables (see [Environment Variables](#environment-variables)).
+
 ### `jj plan next`
 
 Advance to the next plan in the stack (toward the tip).
@@ -725,6 +764,38 @@ Override the plan template file path.
 
 ```sh
 export JJ_PLAN_TEMPLATE="$HOME/.config/jj-plan/template.md"
+```
+
+### `JJ_PLAN_STATUS_DONE`
+
+Override the "done" status indicator used by `jj plan summary` for phase/task parsing.
+
+```sh
+export JJ_PLAN_STATUS_DONE="✅"       # default
+```
+
+### `JJ_PLAN_STATUS_WIP`
+
+Override the "work in progress" status indicator.
+
+```sh
+export JJ_PLAN_STATUS_WIP="🟡"        # default
+```
+
+### `JJ_PLAN_STATUS_TODO`
+
+Override the "not started" status indicator.
+
+```sh
+export JJ_PLAN_STATUS_TODO="🔴"       # default
+```
+
+### `JJ_PLAN_STATUS_BLOCKED`
+
+Override the "blocked" status indicator.
+
+```sh
+export JJ_PLAN_STATUS_BLOCKED="⛔"    # default
 ```
 
 ### `GITHUB_TOKEN` / `GH_TOKEN`

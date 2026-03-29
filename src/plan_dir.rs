@@ -136,6 +136,48 @@ pub fn plan_max() -> usize {
         .unwrap_or(50)
 }
 
+/// Configurable status indicator strings for phase/task parsing.
+///
+/// Each field defaults to the standard emoji but can be overridden via
+/// `JJ_PLAN_STATUS_*` env vars. Used by `jj plan summary` to identify
+/// phase and task statuses in plan headings and list items.
+pub struct StatusIndicators {
+    pub done: String,
+    pub wip: String,
+    pub todo: String,
+    pub blocked: String,
+}
+
+/// Read `JJ_PLAN_STATUS_*` env vars, falling back to default emojis.
+///
+/// | Env var | Default |
+/// |---|---|
+/// | `JJ_PLAN_STATUS_DONE` | `✅` |
+/// | `JJ_PLAN_STATUS_WIP` | `🟡` |
+/// | `JJ_PLAN_STATUS_TODO` | `🔴` |
+/// | `JJ_PLAN_STATUS_BLOCKED` | `⛔` |
+pub fn resolve_status_indicators() -> StatusIndicators {
+    fn env_or(var: &str, default: &str) -> String {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| default.to_string())
+    }
+    StatusIndicators {
+        done: env_or("JJ_PLAN_STATUS_DONE", "✅"),
+        wip: env_or("JJ_PLAN_STATUS_WIP", "🟡"),
+        todo: env_or("JJ_PLAN_STATUS_TODO", "🔴"),
+        blocked: env_or("JJ_PLAN_STATUS_BLOCKED", "⛔"),
+    }
+}
+
+impl StatusIndicators {
+    /// Return all indicator strings as a slice for iteration.
+    pub fn all(&self) -> [&str; 4] {
+        [&self.done, &self.wip, &self.todo, &self.blocked]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +243,16 @@ mod tests {
         // (Can't reliably test env override without env manipulation)
         // Just verify the function doesn't panic
         let _max = plan_max();
+    }
+
+    #[test]
+    fn test_status_indicators_defaults() {
+        let ind = resolve_status_indicators();
+        assert_eq!(ind.done, "✅");
+        assert_eq!(ind.wip, "🟡");
+        assert_eq!(ind.todo, "🔴");
+        assert_eq!(ind.blocked, "⛔");
+        assert_eq!(ind.all().len(), 4);
     }
 
     #[test]

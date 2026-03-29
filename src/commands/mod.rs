@@ -6,6 +6,7 @@ pub mod help;
 pub mod nav;
 pub mod new;
 pub mod stack_cmd;
+pub mod summary;
 pub mod track;
 pub mod untrack;
 
@@ -73,6 +74,9 @@ pub fn dispatch_plan(
         }
         Some("done") => {
             done::run_done(jj, plan_dir, sub_args, workspace, registry, format)
+        }
+        Some("summary") => {
+            summary::run_summary(jj, plan_dir, sub_args, workspace, registry, format)
         }
 
         Some("next") => nav::plan_next(jj, plan_dir, workspace, registry, format),
