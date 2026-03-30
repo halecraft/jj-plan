@@ -236,12 +236,19 @@ args[0] match:
   other       → wrap::wrap()        // flush → run → reload → sync → show
 ```
 
-`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. Bare `jj plan` (no subcommand) defaults to `summary` — read-only, identical to `jj plan summary`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
+`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
+
+Bare `jj plan` (no subcommand) shows **contextual orientation**:
+- If `@` is a tracked plan → shows full summary (same as `jj plan summary`).
+- If `@` is NOT a tracked plan → shows an orientation message with next steps. If plans exist in the current stack, lists them with navigation hints (`jj plan go`, `jj plan next/prev`). If no plans exist, hints `jj plan new`.
+- `jj plan summary` (explicit) always shows the raw summary regardless of `@`'s state — it's a data tool, not an orientation tool.
+
+The `resolve_plan_bookmark_at(workspace, registry, target)` helper (in `commands/mod.rs`) resolves whether a given revision has a tracked plan bookmark. Used by both `dispatch_plan` (orientation check) and `summary::run_summary` (bookmark resolution).
 
 Before dispatch:
 1. Resolve the real jj binary.
 2. Check for `plan --help` early.
-3. Find repo root and plan directory.
+3. Find repo root and plan directory. **`plan` and `stack` are jj-plan-only commands** — if no plan directory exists, they show an activation message instead of falling through to real jj (which would give "unrecognized subcommand"). All other commands (`abandon`, `describe`, `new`, `edit`, etc.) are real jj commands and passthrough normally.
 4. Open `Workspace` via jj-lib. If loading fails, degrade to passthrough.
 
 ### `jj stack` dispatch

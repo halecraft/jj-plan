@@ -295,7 +295,8 @@ pub fn build_plan_help() -> PlanHelp {
             },
         ],
         notes: vec![
-            "`jj plan` (no subcommand) shows the plan summary for @.",
+            "`jj plan` shows the plan summary if @ is a plan, or orientation with next steps.",
+            "`jj plan summary` always shows raw summary data (even if @ is not a plan).",
             "`jj status` shows the current plan stack with file paths.",
             "Plan files are `.jj-plan/NN-bookmark.md` — paths shown as `→` in stack output.",
             "`jj stack submit/sync/merge` — stacked PR operations.",

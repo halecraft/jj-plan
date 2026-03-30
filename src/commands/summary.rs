@@ -570,17 +570,8 @@ pub fn run_summary(
         .resolve_change_id(&target)
         .unwrap_or_else(|| target.clone());
 
-    // Resolve bookmark name: scan registry for matching change ID
-    let bookmark = registry
-        .bookmarks
-        .iter()
-        .find(|b| {
-            workspace
-                .short_change_id_from_hex(&b.change_id)
-                .as_deref()
-                == Some(change_id.as_str())
-        })
-        .map(|b| b.name.clone())
+    // Resolve bookmark name via shared helper
+    let bookmark = super::resolve_plan_bookmark_at(workspace, registry, &target)
         .unwrap_or_default();
 
     // Extract cross-ref IDs and batch-resolve

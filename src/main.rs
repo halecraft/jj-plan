@@ -90,6 +90,16 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
     let plan_dir = match resolve_plan_dir(Some(&repo_root)) {
         Some(pd) => pd,
         None => {
+            // plan and stack are jj-plan-only commands — intercept before passthrough
+            if matches!(subcommand.as_str(), "plan" | "stack") {
+                eprintln!("jj-plan is not activated in this repository.");
+                eprintln!();
+                eprintln!("To activate:");
+                eprintln!("  echo '.jj-plan' >> .gitignore");
+                eprintln!("  mkdir .jj-plan");
+                return Ok(1);
+            }
+            // All other commands: passthrough to real jj
             jj.exec_strings(args)?;
             unreachable!();
         }
