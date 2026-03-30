@@ -232,6 +232,7 @@ args[0] match:
   "stack"     → commands::stack_cmd::dispatch_stack()
   "abandon"   → commands::abandon::run_abandon()
   "describe"  → commands::describe::handle_describe()
+  "workspace" → subcommand routing (see below)
   read-only?  → exec(jj, args)     // zero overhead
   other       → wrap::wrap()        // flush → run → reload → sync → show
 ```
@@ -250,6 +251,18 @@ Before dispatch:
 2. Check for `plan --help` early.
 3. Find repo root and plan directory. **`plan` and `stack` are jj-plan-only commands** — if no plan directory exists, they show an activation message instead of falling through to real jj (which would give "unrecognized subcommand"). All other commands (`abandon`, `describe`, `new`, `edit`, etc.) are real jj commands and passthrough normally.
 4. Open `Workspace` via jj-lib. If loading fails, degrade to passthrough.
+
+### `workspace` subcommand routing
+
+`workspace` is **not** in `READONLY_COMMANDS` because `workspace update-stale` is a mutating command that can snapshot the working copy, create recovery commits, and change `@`. If it bypassed the wrap lifecycle, flush would never run before the command and sync would never run after — the next wrapped command could see a diverged workspace state and `plan_sync`'s `None` arm would delete all plan files.
+
+Routing uses a conservative classification via `is_workspace_readonly(args)`:
+
+- **Read-only** (`workspace list`, `workspace root`): exec passthrough (zero overhead). Matched by checking if any element in `args[1..]` is in `WORKSPACE_READONLY_SUBS`.
+- **Bare `workspace`** (no subcommand, shows help): exec passthrough (`args.len() <= 1`).
+- **Everything else** (`workspace update-stale`, `workspace add`, `workspace forget`, `workspace rename`, `workspace --help`): falls through to `wrap::wrap()` for flush → run → reload → sync → show.
+
+Unknown future workspace subcommands conservatively route through wrap, which is always safe — the only cost is flush/sync overhead, negligible for one-off workspace operations.
 
 ### `jj stack` dispatch
 

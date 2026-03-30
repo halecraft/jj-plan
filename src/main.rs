@@ -8,6 +8,8 @@ use jj_plan::wrap;
 
 /// Read-only commands that get zero-overhead passthrough via exec.
 /// Note: status/st are NOT here — they get special handling to append stack summary.
+/// Note: "workspace" is NOT here — subcommand routing is handled separately
+/// because `workspace update-stale` is mutating (can change `@`).
 const READONLY_COMMANDS: &[&str] = &[
     "log",
     "diff",
@@ -27,11 +29,32 @@ const READONLY_COMMANDS: &[&str] = &[
     "gerrit",
     "sign",
     "unsign",
-    "workspace",
 ];
 
 fn is_readonly_command(cmd: &str) -> bool {
     READONLY_COMMANDS.contains(&cmd)
+}
+
+/// Workspace subcommands that are read-only and safe for exec passthrough.
+/// All other workspace subcommands (`update-stale`, `add`, `forget`, `rename`)
+/// are mutating and go through `wrap::wrap()` for flush/sync.
+const WORKSPACE_READONLY_SUBS: &[&str] = &["list", "root"];
+
+/// Classify whether a `workspace` invocation is read-only (exec passthrough)
+/// or mutating (needs wrap lifecycle).
+///
+/// Returns `true` if the workspace subcommand is read-only or if no subcommand
+/// is present (bare `workspace` shows help). Checks if any element in
+/// `args[1..]` matches a known read-only subcommand. This is conservative:
+/// unknown subcommands route through wrap, which is always safe.
+fn is_workspace_readonly(args: &[String]) -> bool {
+    // Bare `workspace` (shows help) or `workspace --help` → passthrough
+    if args.len() <= 1 {
+        return true;
+    }
+    // If any arg after "workspace" is a known read-only subcommand → passthrough.
+    // Scanning all args handles flags before the subcommand (e.g. `workspace --color always list`).
+    args[1..].iter().any(|a| WORKSPACE_READONLY_SUBS.contains(&a.as_str()))
 }
 
 fn main() {
@@ -71,6 +94,14 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
 
     // No args or read-only command → zero-overhead passthrough via exec
     if args.is_empty() || is_readonly_command(&args[0]) {
+        jj.exec_strings(args)?;
+        unreachable!("exec replaces the process");
+    }
+
+    // Workspace subcommand routing: read-only subs (list, root) get exec
+    // passthrough; mutating subs (update-stale, add, forget, rename) fall
+    // through to wrap::wrap() for flush/sync.
+    if args[0] == "workspace" && is_workspace_readonly(args) {
         jj.exec_strings(args)?;
         unreachable!("exec replaces the process");
     }
@@ -146,4 +177,74 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
 
     // All other commands: wrap lifecycle (flush → command → reload → sync → show)
     wrap::wrap(&plan_dir, jj, args, &mut workspace, &registry, format)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn workspace_readonly_subs_contains_list_and_root() {
+        assert!(WORKSPACE_READONLY_SUBS.contains(&"list"));
+        assert!(WORKSPACE_READONLY_SUBS.contains(&"root"));
+        assert_eq!(WORKSPACE_READONLY_SUBS.len(), 2);
+    }
+
+    #[test]
+    fn workspace_update_stale_is_mutating() {
+        assert!(!is_workspace_readonly(&args(&["workspace", "update-stale"])));
+    }
+
+    #[test]
+    fn workspace_add_is_mutating() {
+        assert!(!is_workspace_readonly(&args(&["workspace", "add", "../other"])));
+    }
+
+    #[test]
+    fn workspace_forget_is_mutating() {
+        assert!(!is_workspace_readonly(&args(&["workspace", "forget", "secondary"])));
+    }
+
+    #[test]
+    fn workspace_rename_is_mutating() {
+        assert!(!is_workspace_readonly(&args(&["workspace", "rename", "new-name"])));
+    }
+
+    #[test]
+    fn workspace_list_is_readonly() {
+        assert!(is_workspace_readonly(&args(&["workspace", "list"])));
+    }
+
+    #[test]
+    fn workspace_root_is_readonly() {
+        assert!(is_workspace_readonly(&args(&["workspace", "root"])));
+    }
+
+    #[test]
+    fn workspace_root_with_flags_before_sub_is_readonly() {
+        assert!(is_workspace_readonly(&args(&["workspace", "--color", "always", "root"])));
+    }
+
+    #[test]
+    fn bare_workspace_is_readonly() {
+        // Bare `workspace` shows help — safe for passthrough
+        assert!(is_workspace_readonly(&args(&["workspace"])));
+    }
+
+    #[test]
+    fn workspace_help_routes_through_wrap() {
+        // `workspace --help` has no known readonly sub, so it conservatively
+        // routes through wrap. This is harmless — wrap just runs the command
+        // with flush/sync around it, and `--help` produces no mutations.
+        assert!(!is_workspace_readonly(&args(&["workspace", "--help"])));
+    }
+
+    #[test]
+    fn workspace_not_in_readonly_commands() {
+        assert!(!READONLY_COMMANDS.contains(&"workspace"));
+    }
 }
