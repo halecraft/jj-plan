@@ -15,9 +15,6 @@ pub enum JjPlanError {
     #[error("jj-plan: I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("jj plan: missing subcommand. Run 'jj plan --help' for usage.")]
-    PlanMissingSubcommand,
-
     #[error("jj plan: unknown subcommand '{0}'. Run 'jj plan --help' for usage.")]
     PlanUnknownSubcommand(String),
 

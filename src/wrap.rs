@@ -4,7 +4,7 @@ use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::load_pr_cache;
-use crate::stack_render::{self, StackColumn, StackFormat};
+use crate::stack_render::{self, RenderOptions, StackColumn, StackFormat};
 use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 use crate::sync;
@@ -225,10 +225,13 @@ pub fn sync_to_disk(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRe
             let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
             let pr_cache = load_pr_cache(&repo_root).ok();
             let stack_name = derive_stack_name(stack, registry);
-            match stack_render::build_column_from_stack(stack, &stack_name, registry, workspace, pr_cache.as_ref()) {
+            match stack_render::build_column_from_stack(stack, &stack_name, registry, workspace, pr_cache.as_ref(), plan_dir.dir_name()) {
                 Some(column) => {
                     let columns = vec![column];
-                    let rendered = stack_render::render_stack(&columns, StackFormat::Regular);
+                    let rendered = stack_render::render_stack(&columns, &RenderOptions {
+                        format: StackFormat::Regular,
+                        show_paths: false,
+                    });
                     let md_content = stack_render::format_markdown_with_header(&rendered);
                     (Some(md_content), Some(StackDisplayData { columns }))
                 }
@@ -364,24 +367,15 @@ pub fn show_plan_stack(plan_dir: &PlanDir, data: Option<&StackDisplayData>, form
         }
     };
 
-    // PLAN
-    let rendered = stack_render::render_stack(&data.columns, format);
-
-    // EXECUTE
-    let color = stack_render::should_color();
-    let formatted = if color {
-        stack_render::format_ansi(&rendered)
-    } else {
-        stack_render::format_plain(&rendered)
-    };
-
     // Header
     eprintln!();
     eprintln!("Plan stack ({}/):", plan_dir.dir_name());
 
-    for line in &formatted {
-        eprintln!("{}", line);
-    }
+    // Render → format → print (delegated to shared helper)
+    stack_render::render_to_stderr(&data.columns, &RenderOptions {
+        format,
+        show_paths: true,
+    });
 }
 
 /// Build `SyncChangeView`s from the registry-filtered stack.

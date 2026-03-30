@@ -236,7 +236,7 @@ args[0] match:
   other       → wrap::wrap()        // flush → run → reload → sync → show
 ```
 
-`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
+`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. Bare `jj plan` (no subcommand) defaults to `summary` — read-only, identical to `jj plan summary`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
 
 Before dispatch:
 1. Resolve the real jj binary.
@@ -338,36 +338,47 @@ Note: `sync_to_disk` in `wrap.rs` builds the @-relative stack once via `build_cu
 
 ### Phase 5: Show stack
 
-Display the plan stack using pre-gathered `StackDisplayData` from `sync_to_disk`. `show_plan_stack` accepts `Option<&StackDisplayData>` and a `StackFormat` parameter — it runs PLAN (`render_stack`) and EXECUTE (`format_ansi`/`format_plain` + `eprintln!`) but never touches disk or the repo.
+Display the plan stack using pre-gathered `StackDisplayData` from `sync_to_disk`. `show_plan_stack` delegates rendering to `render_to_stderr` (a shared helper in `stack_render.rs`) instead of doing render → format → eprintln inline. It accepts `Option<&StackDisplayData>` and a `StackFormat` parameter — it never touches disk or the repo.
 
-Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack(columns, format)` in `stack_render.rs`. The `StackFormat` enum controls layout density:
+Both terminal and file output are rendered from the same `Vec<Vec<Span>>` model produced by `render_stack(columns, options)` in `stack_render.rs`. `render_stack` takes `&RenderOptions` (a struct with `format: StackFormat` and `show_paths: bool`) instead of a bare `StackFormat`. `sync_to_disk` passes `show_paths: false` for `stack.md`; terminal call sites pass `show_paths: true`. The `StackFormat` enum controls layout density:
 
 - **`Compact`** (default for terminal): 1 line per plan — description appended inline on the node line. No `│` connector lines, no blank spacers, no leading blank line.
 - **`Regular`** (default for `stack.md`): 3 lines per plan — node line, `│` description line, blank spacer. This is the original pre-compact format.
 
-`sync_to_disk` hardcodes `StackFormat::Regular` for its `stack.md` rendering call. The format parameter is threaded from `main.rs` (where `resolved_stack_format()` reads `JJ_PLAN_STACK_FORMAT` once) through `wrap`, `dispatch_plan`, `dispatch_stack`, and all sub-command functions to `show_plan_stack` and `render_stack`. `jj stack --format=compact|regular` overrides the env-derived default for that invocation via `parse_stack_dispatch_args`.
+`sync_to_disk` hardcodes `StackFormat::Regular` for its `stack.md` rendering call (with `show_paths: false`). The format parameter is threaded from `main.rs` (where `resolved_stack_format()` reads `JJ_PLAN_STACK_FORMAT` once) through `wrap`, `dispatch_plan`, `dispatch_stack`, and all sub-command functions to `show_plan_stack` and `render_stack`. `jj stack --format=compact|regular` overrides the env-derived default for that invocation via `parse_stack_dispatch_args`.
+
+The `RenderOptions` struct and `render_to_stderr` helper centralize format + path display decisions so callers don't need to thread individual booleans:
+
+```
+pub struct RenderOptions {
+    pub format: StackFormat,
+    pub show_paths: bool,
+}
+```
+
+`render_to_stderr` takes `Option<&StackDisplayData>`, `&RenderOptions`, and the plan directory name, calls `render_stack` → `format_ansi`/`format_plain`, and writes to stderr.
 
 #### Terminal view (printed to stderr)
 
 Graph visualization with semantic indicators. **Compact format** (default):
 
 ```
-  ◉ kpqxywon (@, ~) feat-api Add API endpoints
-  ○ mtzrlpvq (~) feat-session Implement session management
-  ○ lonpswlw (✓) feat-auth Extract auth module
+  ◉ kpqxywon (@, ~) feat-api | Add API endpoints → .jj-plan/03-feat-api.md
+  ○ mtzrlpvq (~) feat-session | Implement session management → .jj-plan/02-feat-session.md
+  ○ lonpswlw (✓) feat-auth | Extract auth module → .jj-plan/01-feat-auth.md
   ◆ trunk()
 ```
 
 **Regular format** (`JJ_PLAN_STACK_FORMAT=regular` or `jj stack --format=regular`):
 
 ```
-  ◉ kpqxywon feat-api
+  ◉ kpqxywon feat-api → .jj-plan/03-feat-api.md
   │ (@, ~) Add API endpoints
   │
-  ○ mtzrlpvq feat-session
+  ○ mtzrlpvq feat-session → .jj-plan/02-feat-session.md
   │ (~) Implement session management
   │
-  ○ lonpswlw feat-auth
+  ○ lonpswlw feat-auth → .jj-plan/01-feat-auth.md
   │ (✓) Extract auth module
   │
   ◆ trunk()
@@ -376,6 +387,7 @@ Graph visualization with semantic indicators. **Compact format** (default):
 - `◉` = working copy, `○` = other node, `◆` = trunk.
 - Indicators: `@` (working copy), `✓` (done), `~` (has file changes), `synced`, `PR #N`.
 - `✓` supersedes `~` — a done change does not show `~`.
+- `→ .jj-plan/NN-bookmark.md` = plan file relative path (terminal only, gated by `RenderOptions::show_paths`).
 - Multi-stack mode adds column gutters and `stack:` headers with per-column rainbow colors.
 - Each column's gutter `│`, node markers (`○`), and header are rendered in a distinct color from a rotating 6-color palette (cyan, yellow, magenta, blue, green, bright red). The working copy marker `◉` stays bold green regardless of column.
 - Column gutters only appear once a column starts rendering — unstarted columns show spaces instead of `│`, reducing horizontal noise.
@@ -384,7 +396,7 @@ Graph visualization with semantic indicators. **Compact format** (default):
 
 #### File view (`stack.md`, written to disk)
 
-Graph visualization with markdown links on bookmark names, generated by `format_markdown` in `stack_render.rs`:
+Graph visualization with markdown links on bookmark names, generated by `format_markdown` in `stack_render.rs`. Plan file paths are NOT shown in `stack.md` — gated off via `show_paths: false` in the `RenderOptions` passed by `sync_to_disk`:
 
 ```
 <!-- generated by jj-plan — do not edit -->
@@ -403,6 +415,8 @@ Graph visualization with markdown links on bookmark names, generated by `format_
 ```
 
 The file view uses the same Span model as the terminal view but applies `format_markdown` instead of `format_ansi`/`format_plain`. Spans with a `link_target` are wrapped in markdown link syntax `[text](target)`. Since `stack.md` is always rendered from the single @-relative stack, plan file links are always present and correct. (In `jj stack --all` mode, `plan_filename` is cleared because per-group indices don't match global plan file indices — but `--all` output goes to the terminal only, not to `stack.md`.)
+
+The `StackColumn` struct includes a `plan_dir_name` field (e.g. `".jj-plan"`) so the renderer can compose full relative paths at render time from `row.plan_filename`. For example, if `plan_dir_name` is `".jj-plan"` and `row.plan_filename` is `"03-feat-api.md"`, the renderer produces `→ .jj-plan/03-feat-api.md`. This keeps path construction out of callers and centralizes it in the render layer.
 
 ---
 

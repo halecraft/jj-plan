@@ -212,15 +212,15 @@ pub fn build_plan_help() -> PlanHelp {
         mental_model:
             "One bookmark = one plan = one PR. Plans are jj change descriptions synced to `.jj-plan/` markdown files.",
         usage: vec![
-            "jj plan <SUBCOMMAND>",
+            "jj plan [SUBCOMMAND]",
             "jj plan --help [--color <WHEN>]",
         ],
         workflow: vec![
             ("jj plan new <bookmark>", "Create a plan (change + bookmark + template)"),
-            ("$EDITOR .jj-plan/NN-bookmark.md", "Edit the plan file (see stack.md for filenames)"),
+            ("$EDITOR .jj-plan/NN-bookmark.md", "Edit the plan file (path shown in stack output)"),
             ("jj plan new <next-bookmark>", "Add another plan to the stack"),
             ("jj plan done", "Mark the current plan done"),
-            ("jj plan summary", "Inspect plan structure, phases, and context"),
+            ("jj plan", "Show plan summary (same as `jj plan summary`)"),
         ],
         commands: vec![
             HelpEntry {
@@ -295,8 +295,9 @@ pub fn build_plan_help() -> PlanHelp {
             },
         ],
         notes: vec![
-            "`jj status` shows the current plan stack.",
-            "Plan files are `.jj-plan/NN-bookmark.md` — see `stack.md` for links.",
+            "`jj plan` (no subcommand) shows the plan summary for @.",
+            "`jj status` shows the current plan stack with file paths.",
+            "Plan files are `.jj-plan/NN-bookmark.md` — paths shown as `→` in stack output.",
             "`jj stack submit/sync/merge` — stacked PR operations.",
         ],
         docs: vec![
@@ -642,8 +643,8 @@ mod tests {
         assert!(text.contains("jj plan new <bookmark>"));
         assert!(text.contains("track <bookmark>"));
         assert!(text.contains("untrack <bookmark>"));
-        assert!(text.contains("$EDITOR .jj-plan/current.md"));
-        assert!(text.contains("`jj status` shows the current plan stack."));
+        assert!(text.contains("$EDITOR .jj-plan/NN-bookmark.md"));
+        assert!(text.contains("`jj status` shows the current plan stack"));
         assert!(text.contains("`jj stack submit/sync/merge`"));
         assert!(text.contains("README.md"));
         assert!(text.contains("MANUAL.md"));

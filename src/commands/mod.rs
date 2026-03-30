@@ -92,8 +92,10 @@ pub fn dispatch_plan(
             }
         }
 
-        // No subcommand
-        None => Err(JjPlanError::PlanMissingSubcommand),
+        // No subcommand — default to summary
+        None => {
+            summary::run_summary(jj, plan_dir, &[], workspace, registry, format)
+        }
 
         // Unknown subcommand
         Some(unknown) => Err(JjPlanError::PlanUnknownSubcommand(unknown.to_string())),

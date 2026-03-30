@@ -50,7 +50,7 @@ fn main() {
         Err(e) => {
             eprintln!("{}", e);
             match e {
-                JjPlanError::PlanMissingSubcommand | JjPlanError::PlanUnknownSubcommand(_) => 1,
+                JjPlanError::PlanUnknownSubcommand(_) => 1,
                 _ => 1,
             }
         }

@@ -1177,7 +1177,7 @@ fn run_auth(args: &[String]) -> Result<i32> {
 /// multi-column visualization.
 fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRegistry, format: StackFormat) {
     use crate::pr_cache::load_pr_cache;
-    use crate::stack_render;
+    use crate::stack_render::{self, RenderOptions};
 
     let multi = build_multi_stack(workspace, registry);
     if multi.stacks.is_empty() {
@@ -1188,15 +1188,7 @@ fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanReg
 
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
     let pr_cache = load_pr_cache(&repo_root).ok();
-    let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref());
-    let rendered = stack_render::render_stack(&columns, format);
-
-    let color = stack_render::should_color();
-    let formatted = if color {
-        stack_render::format_ansi(&rendered)
-    } else {
-        stack_render::format_plain(&rendered)
-    };
+    let columns = stack_render::build_columns(&multi, registry, workspace, pr_cache.as_ref(), plan_dir.dir_name());
 
     let num_stacks = multi.stacks.len();
     eprintln!();
@@ -1206,9 +1198,10 @@ fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanReg
         if num_stacks == 1 { "" } else { "s" },
     );
 
-    for line in &formatted {
-        eprintln!("{}", line);
-    }
+    stack_render::render_to_stderr(&columns, &RenderOptions {
+        format,
+        show_paths: true,
+    });
 }
 
 fn print_stack_help() {

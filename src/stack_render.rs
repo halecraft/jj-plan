@@ -77,6 +77,19 @@ pub enum StackFormat {
     Regular,
 }
 
+/// Options controlling how a stack is rendered.
+///
+/// Bundles `StackFormat` with output-target-specific flags to avoid
+/// growing positional parameter lists on `render_stack` and friends.
+#[derive(Debug, Clone)]
+pub struct RenderOptions {
+    /// Layout density: `Compact` (1 line/plan) or `Regular` (3 lines/plan).
+    pub format: StackFormat,
+    /// Whether to append `→ .jj-plan/NN-bookmark.md` path spans to each row.
+    /// `true` for terminal output, `false` for `stack.md` generation.
+    pub show_paths: bool,
+}
+
 /// A span of text with a semantic style.
 ///
 /// The rendering pipeline produces `Vec<Vec<Span>>` (lines of spans).
@@ -325,6 +338,10 @@ pub struct StackColumn {
     pub rows: Vec<DisplayRow>,
     /// Gap warnings for this stack.
     pub gaps: Vec<Gap>,
+    /// Plan directory name (e.g. `".jj-plan"`), used by the renderer to
+    /// compose full relative paths from `DisplayRow::plan_filename`.
+    /// `None` in test contexts or when the plan dir is unavailable.
+    pub plan_dir_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +444,19 @@ fn build_bookmark_spans(row: &DisplayRow) -> Vec<Span> {
             vec![Span::new(&row.bookmark_name, Style::BookmarkName)]
         }
     }
+}
+
+/// Build the plan file path spans (e.g. ` → .jj-plan/01-feat-auth.md`).
+///
+/// Returns an empty vec when `plan_dir_name` is `None` or the row has no
+/// `plan_filename`. The arrow and path are both `Style::Connector` (dim in ANSI).
+fn build_path_spans(plan_dir_name: Option<&str>, row: &DisplayRow) -> Vec<Span> {
+    let Some(dir_name) = plan_dir_name else { return vec![] };
+    let Some(filename) = &row.plan_filename else { return vec![] };
+    vec![
+        Span::new(" → ", Style::Connector),
+        Span::new(format!("{}/{}", dir_name, filename), Style::Connector),
+    ]
 }
 
 /// Build the content spans for a node line (change-id + bookmark, no indicators).
@@ -542,7 +572,8 @@ fn assemble_row_lines(
 /// - `Compact`: 1 line per plan (description appended to node line). No leading blank, no spacers.
 ///
 /// Returns `Vec<Vec<Span>>` — one inner vec per output line.
-fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Span>> {
+fn render_single_column(column: &StackColumn, options: &RenderOptions) -> Vec<Vec<Span>> {
+    let format = options.format;
     let mut lines: Vec<Vec<Span>> = Vec::new();
 
     if format == StackFormat::Regular {
@@ -570,14 +601,25 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
             None
         };
 
-        lines.extend(assemble_row_lines(
+        let mut row_lines = assemble_row_lines(
             node_line,
             row,
             indicator_spans,
             format,
             connector,
             spacer_prefix,
-        ));
+        );
+
+        // Append plan file path to the first line (terminal only).
+        // Compact: the only line. Regular: the node line.
+        if options.show_paths {
+            let path_spans = build_path_spans(column.plan_dir_name.as_deref(), row);
+            if let Some(line) = row_lines.first_mut() {
+                line.extend(path_spans);
+            }
+        }
+
+        lines.extend(row_lines);
     }
 
     // Gap warnings (same for both formats)
@@ -631,7 +673,8 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
 /// - `Compact`: description appended to node line, no spacers between segments within a column.
 ///
 /// Stack headers and trunk merge are the same in both formats.
-fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<Span>> {
+fn render_multi_column(columns: &[StackColumn], options: &RenderOptions) -> Vec<Vec<Span>> {
+    let format = options.format;
     let num_cols = columns.len();
     let mut lines: Vec<Vec<Span>> = Vec::new();
     let mut started = vec![false; num_cols];
@@ -677,14 +720,24 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                 None
             };
 
-            lines.extend(assemble_row_lines(
+            let mut row_lines = assemble_row_lines(
                 node_line,
                 row,
                 indicator_spans,
                 format,
                 desc_prefix,
                 spacer_prefix,
-            ));
+            );
+
+            // Append plan file path to the first line (terminal only).
+            if options.show_paths {
+                let path_spans = build_path_spans(column.plan_dir_name.as_deref(), row);
+                if let Some(line) = row_lines.first_mut() {
+                    line.extend(path_spans);
+                }
+            }
+
+            lines.extend(row_lines);
         }
 
         // Gap warnings (same for both formats)
@@ -757,14 +810,31 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
 /// - `format` controls layout density: `Compact` (1 line/plan) vs `Regular` (3 lines/plan).
 ///
 /// Trunk (`◆ trunk()`) is always included in the output.
-pub fn render_stack(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<Span>> {
+pub fn render_stack(columns: &[StackColumn], options: &RenderOptions) -> Vec<Vec<Span>> {
     if columns.is_empty() {
         return vec![];
     }
     if columns.len() == 1 {
-        render_single_column(&columns[0], format)
+        render_single_column(&columns[0], options)
     } else {
-        render_multi_column(columns, format)
+        render_multi_column(columns, options)
+    }
+}
+
+/// Render a stack to stderr with ANSI coloring (when supported).
+///
+/// Convenience wrapper that runs the full render → format → print pipeline.
+/// Used by `show_plan_stack` and `show_all_stacks` to eliminate duplication.
+pub fn render_to_stderr(columns: &[StackColumn], options: &RenderOptions) {
+    let rendered = render_stack(columns, options);
+    let color = should_color();
+    let formatted = if color {
+        format_ansi(&rendered)
+    } else {
+        format_plain(&rendered)
+    };
+    for line in &formatted {
+        eprintln!("{}", line);
     }
 }
 
@@ -866,6 +936,7 @@ fn build_single_column(
     registry: &PlanRegistry,
     workspace: &Workspace,
     pr_cache: Option<&PrCache>,
+    plan_dir_name: &str,
 ) -> StackColumn {
     let narrowed = narrow_segments(stack, registry);
     let rows = prepare_display_rows(&narrowed, workspace, pr_cache);
@@ -873,6 +944,7 @@ fn build_single_column(
         name: name.to_string(),
         rows,
         gaps: stack.gaps.clone(),
+        plan_dir_name: Some(plan_dir_name.to_string()),
     }
 }
 
@@ -887,11 +959,12 @@ pub fn build_column_from_stack(
     registry: &PlanRegistry,
     workspace: &Workspace,
     pr_cache: Option<&PrCache>,
+    plan_dir_name: &str,
 ) -> Option<StackColumn> {
     if stack.segments.is_empty() {
         return None;
     }
-    Some(build_single_column(stack, name, registry, workspace, pr_cache))
+    Some(build_single_column(stack, name, registry, workspace, pr_cache, plan_dir_name))
 }
 
 /// Build stack columns from a `MultiStack`, ready for rendering.
@@ -905,6 +978,7 @@ pub fn build_columns(
     registry: &PlanRegistry,
     workspace: &Workspace,
     pr_cache: Option<&PrCache>,
+    plan_dir_name: &str,
 ) -> Vec<StackColumn> {
     let is_multi = multi.stacks.len() > 1;
     multi
@@ -915,7 +989,7 @@ pub fn build_columns(
                 segments: group.segments.clone(),
                 gaps: group.gaps.clone(),
             };
-            let mut column = build_single_column(&group_stack, &group.name, registry, workspace, pr_cache);
+            let mut column = build_single_column(&group_stack, &group.name, registry, workspace, pr_cache, plan_dir_name);
 
             // Multi-stack: per-group indices don't match global plan file indices,
             // so clear plan_filename to prevent incorrect markdown links.
@@ -962,7 +1036,13 @@ mod tests {
             name: name.to_string(),
             rows,
             gaps: vec![],
+            plan_dir_name: None,
         }
+    }
+
+    /// Shorthand for `RenderOptions` in tests — `show_paths: false` by default.
+    fn opts(format: StackFormat) -> RenderOptions {
+        RenderOptions { format, show_paths: false }
     }
 
     // -- Moved + adapted tests from stack_cmd.rs ----------------------------
@@ -1000,7 +1080,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Should have ○ markers (not ◉ since neither is WC)
@@ -1029,7 +1109,7 @@ mod tests {
     #[test]
     fn single_stack_shows_working_copy_marker() {
         let col = make_column("feat", vec![make_row("feat-api", "Feature API", true)]);
-        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         assert!(
@@ -1050,7 +1130,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         assert!(
@@ -1075,7 +1155,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // While rendering auth (col 0), dashboard (col 1) hasn't started yet → spaces, not │
@@ -1104,7 +1184,7 @@ mod tests {
             make_column("b", vec![make_row("b1", "B", false)]),
             make_column("c", vec![make_row("c1", "C", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         assert!(
@@ -1115,7 +1195,7 @@ mod tests {
 
     #[test]
     fn empty_stacks_returns_empty() {
-        let result = render_stack(&[], StackFormat::Regular);
+        let result = render_stack(&[], &opts(StackFormat::Regular));
         assert!(result.is_empty(), "empty input should return empty Vec");
     }
 
@@ -1134,7 +1214,7 @@ mod tests {
             make_column("medium", vec![make_row("m-1", "M1", true)]),
             make_column("small", vec![make_row("s-1", "S1", false)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Regular)));
 
         // Find the line indices of each stack header
         let largest_idx = lines
@@ -1169,7 +1249,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", true)],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         assert!(
@@ -1184,7 +1264,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", false)],
         );
-        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_ansi(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Should contain ANSI codes for markers and bookmark names
@@ -1205,7 +1285,7 @@ mod tests {
             "test",
             vec![make_row("test-bookmark", "Test description", true)],
         );
-        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_ansi(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // ◉ should get bold green escape
@@ -1222,7 +1302,7 @@ mod tests {
         row.short_change_id = "kpqxywon".to_string();
 
         let col = make_column("test", vec![row]);
-        let lines = format_ansi(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_ansi(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Prefix should get bright magenta
@@ -1247,7 +1327,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Verify the structural elements are all present and in order
@@ -1302,7 +1382,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Both columns should include the change ID (now before bookmark)
@@ -1321,7 +1401,7 @@ mod tests {
         // Verify that single-stack rendering produces markdown links to plan files.
         // This is the key property that was broken in multi-stack mode (links were
         // cleared) and is now always correct on the hot path via build_column_from_stack.
-        let col = StackColumn {
+        let col: StackColumn = StackColumn {
             name: "feat".to_string(),
             rows: vec![
                 DisplayRow {
@@ -1346,9 +1426,10 @@ mod tests {
                 },
             ],
             gaps: vec![],
+            plan_dir_name: Some(".jj-plan".to_string()),
         };
 
-        let rendered = render_stack(&[col], StackFormat::Regular);
+        let rendered = render_stack(&[col], &opts(StackFormat::Regular));
         let md_lines = format_markdown(&rendered);
         let md_output = md_lines.join("\n");
 
@@ -1360,6 +1441,12 @@ mod tests {
         assert!(
             md_output.contains("[feat-auth](./01-feat-auth.md)"),
             "single-stack markdown should link feat-auth to its plan file"
+        );
+        // Markdown output must NOT contain → path text (show_paths: false).
+        // This guards against stack.md regression: paths are terminal-only.
+        assert!(
+            !md_output.contains("→"),
+            "markdown output must not contain path arrow (show_paths is false): {md_output}"
         );
     }
 
@@ -1374,7 +1461,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Should NOT have │ description lines
@@ -1422,7 +1509,7 @@ mod tests {
                 make_row("auth-refactor", "Refactor auth", false),
             ],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Regular)));
         let output = lines.join("\n");
 
         // Must have │ description lines (with indicators prepended for WC row)
@@ -1455,7 +1542,7 @@ mod tests {
             "feat",
             vec![make_row("feat-api", "Add API endpoints", true)],
         );
-        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Description should appear on the same line, with change-id first and pipe separator
@@ -1480,7 +1567,7 @@ mod tests {
                 vec![make_row("dash-api", "Dashboard API", true)],
             ),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Should NOT have separate description lines (with double-space indent after gutter)
@@ -1515,7 +1602,7 @@ mod tests {
         let mut row = make_row("feat-api", "", false);
         row.first_line = String::new();
         let col = make_column("feat", vec![row]);
-        let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
+        let lines = format_plain(&render_stack(&[col], &opts(StackFormat::Compact)));
 
         // Find the node line
         let node_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
@@ -1534,7 +1621,7 @@ mod tests {
             make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
             make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
         ];
-        let lines = format_ansi(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_ansi(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Should contain ANSI color codes from the column palette (not just DIM gray)
@@ -1555,7 +1642,7 @@ mod tests {
             make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
             make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
         ];
-        let lines = format_ansi(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_ansi(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Headers should be underlined + colored
@@ -1576,7 +1663,7 @@ mod tests {
             make_column("b", vec![make_row("b1", "B", false)]),
             make_column("c", vec![make_row("c1", "C", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
 
         // While rendering column 0 (a), columns 1 and 2 haven't started.
         // The header line for "a" should NOT have │ for columns 1 and 2.
@@ -1602,7 +1689,7 @@ mod tests {
             make_column("b", vec![make_row("b1", "B", false)]),
             make_column("c", vec![make_row("c1", "C", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
 
         // While rendering column 2 (c), columns 0 and 1 have already started.
         // The node line for "c1" should show │ │ before ◉
@@ -1619,7 +1706,7 @@ mod tests {
             make_column("auth", vec![make_row("auth-refactor", "Refactor auth", false)]),
             make_column("dashboard", vec![make_row("dash-api", "Dashboard API", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Plain format should have no ANSI codes
@@ -1641,7 +1728,7 @@ mod tests {
             make_column("Stack 1", vec![make_row("feat-auth", "Auth", false)]),
             make_column("Stack 2", vec![make_row("fix-bug", "Bug fix", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         assert!(
@@ -1670,7 +1757,7 @@ mod tests {
             ]),
             make_column("Stack 1", vec![make_row("fix-bug", "Bug fix", true)]),
         ];
-        let lines = format_plain(&render_stack(&cols, StackFormat::Compact));
+        let lines = format_plain(&render_stack(&cols, &opts(StackFormat::Compact)));
         let output = lines.join("\n");
 
         // Explicit stack keeps its human name
@@ -1684,6 +1771,157 @@ mod tests {
             "implicit stack should get counter name: {output}"
         );
     }
+
+    // -- Plan path rendering tests ------------------------------------------
+
+    /// Helper: make a column with `plan_dir_name` set for path tests.
+    fn make_path_column(name: &str, rows: Vec<DisplayRow>) -> StackColumn {
+        StackColumn {
+            name: name.to_string(),
+            rows,
+            gaps: vec![],
+            plan_dir_name: Some(".jj-plan".to_string()),
+        }
+    }
+
+    /// Helper: make a row with `plan_filename` set for path tests.
+    fn make_path_row(name: &str, desc: &str, is_wc: bool, filename: &str) -> DisplayRow {
+        let mut row = make_row(name, desc, is_wc);
+        row.plan_filename = Some(filename.to_string());
+        row
+    }
+
+    #[test]
+    fn compact_single_column_shows_plan_path() {
+        let col = make_path_column("auth", vec![
+            make_path_row("feat-api", "Add API", true, "02-feat-api.md"),
+            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+        ]);
+        let lines = format_plain(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Compact,
+            show_paths: true,
+        }));
+
+        // Each path must appear on the same line as its bookmark
+        let api_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
+        assert!(
+            api_line.contains("→ .jj-plan/02-feat-api.md"),
+            "compact: path should be on same line as bookmark: '{api_line}'"
+        );
+        let auth_line = lines.iter().find(|l| l.contains("feat-auth")).unwrap();
+        assert!(
+            auth_line.contains("→ .jj-plan/01-feat-auth.md"),
+            "compact: path should be on same line as bookmark: '{auth_line}'"
+        );
+    }
+
+    #[test]
+    fn regular_single_column_shows_plan_path_on_node_line() {
+        let col = make_path_column("auth", vec![
+            make_path_row("feat-api", "Add API", true, "02-feat-api.md"),
+            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+        ]);
+        let lines = format_plain(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Regular,
+            show_paths: true,
+        }));
+        let output = lines.join("\n");
+
+        assert!(
+            output.contains("→ .jj-plan/02-feat-api.md"),
+            "regular should show plan path: {output}"
+        );
+        // Path must be on the node line (same line as bookmark), not on description line
+        let node_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
+        assert!(
+            node_line.contains("→ .jj-plan/02-feat-api.md"),
+            "path should be on the node line: '{node_line}'"
+        );
+        // Description line should NOT contain the path
+        let desc_line = lines.iter().find(|l| l.contains("Add API") && l.contains("│")).unwrap();
+        assert!(
+            !desc_line.contains("→"),
+            "description line should not contain path: '{desc_line}'"
+        );
+    }
+
+    #[test]
+    fn plan_path_absent_when_show_paths_false() {
+        let col = make_path_column("auth", vec![
+            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+        ]);
+        // show_paths: false — simulates stack.md rendering
+        let lines = format_plain(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Regular,
+            show_paths: false,
+        }));
+        let output = lines.join("\n");
+
+        assert!(
+            !output.contains("→"),
+            "show_paths: false should suppress path arrow: {output}"
+        );
+    }
+
+    #[test]
+    fn plan_path_absent_when_plan_filename_none() {
+        // Row with no plan_filename (e.g. multi-stack mode)
+        let col = make_column("auth", vec![
+            make_row("feat-auth", "Auth module", false),
+        ]);
+        let lines = format_plain(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Compact,
+            show_paths: true,
+        }));
+        let output = lines.join("\n");
+
+        assert!(
+            !output.contains("→"),
+            "no plan_filename should suppress path arrow: {output}"
+        );
+    }
+
+    #[test]
+    fn compact_empty_description_shows_path_after_bookmark() {
+        let mut row = make_path_row("feat-auth", "", false, "01-feat-auth.md");
+        row.first_line = String::new();
+        let col = make_path_column("auth", vec![row]);
+        let lines = format_plain(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Compact,
+            show_paths: true,
+        }));
+
+        let node_line = lines.iter().find(|l| l.contains("feat-auth")).unwrap();
+        // Should have path after bookmark with no pipe separator
+        assert!(
+            node_line.contains("feat-auth → .jj-plan/01-feat-auth.md"),
+            "empty description: path should follow bookmark directly: '{node_line}'"
+        );
+        assert!(
+            !node_line.contains("|"),
+            "empty description should have no pipe separator: '{node_line}'"
+        );
+    }
+
+    #[test]
+    fn path_spans_render_dim_in_ansi() {
+        let col = make_path_column("auth", vec![
+            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+        ]);
+        let lines = format_ansi(&render_stack(&[col], &RenderOptions {
+            format: StackFormat::Compact,
+            show_paths: true,
+        }));
+        let node_line = lines.iter().find(|l| l.contains("feat-auth")).unwrap();
+
+        // The arrow and path should be wrapped in DIM escape (Style::Connector)
+        assert!(
+            node_line.contains(&format!("{DIM} → {RESET}")) || node_line.contains(&format!("{DIM}.jj-plan/01-feat-auth.md{RESET}")),
+            "path spans should render with DIM style in ANSI output: '{node_line}'"
+        );
+    }
+
+    // -- assemble_row_lines tests -------------------------------------------
 
     #[test]
     fn assemble_row_lines_compact_and_regular() {
