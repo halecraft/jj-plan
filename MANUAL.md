@@ -77,14 +77,14 @@ Example:
 ```
 Plan stack (.jj-plan/):
 
-  ◉ feat-api xqvzmzvn (@, ~)
-  │ Add API endpoints
+  ◉ xqvzmzvn feat-api
+  │ (@, ~) Add API endpoints
   │
-  ○ feat-session mtzrlpvq (synced, PR #43)
-  │ Implement session management
+  ○ mtzrlpvq feat-session
+  │ (synced, PR #43) Implement session management
   │
-  ○ feat-auth kpqxywon (synced, PR #42, ✓)
-  │ Extract auth module
+  ○ kpqxywon feat-auth
+  │ (synced, PR #42, ✓) Extract auth module
   │
   ◆ trunk()
 ```
@@ -323,23 +323,23 @@ jj stack --format regular       # same, with separate arg
 **Output (compact format — default):**
 
 ```
-  ◉ feat-api ykvsnxrl (@) Add API endpoints
-  ○ feat-session mtzrlpvq (synced, PR #43) Implement session management
-  ○ feat-auth kpqxywon (synced, PR #42, ✓) Extract auth module
+  ◉ ykvsnxrl (@) feat-api Add API endpoints
+  ○ mtzrlpvq (synced, PR #43) feat-session Implement session management
+  ○ kpqxywon (synced, PR #42, ✓) feat-auth Extract auth module
   ◆ trunk()
 ```
 
 **Output (regular format):**
 
 ```
-  ◉ feat-api ykvsnxrl (@)
-  │ Add API endpoints
+  ◉ ykvsnxrl feat-api
+  │ (@) Add API endpoints
   │
-  ○ feat-session mtzrlpvq (synced, PR #43)
-  │ Implement session management
+  ○ mtzrlpvq feat-session
+  │ (synced, PR #43) Implement session management
   │
-  ○ feat-auth kpqxywon (synced, PR #42, ✓)
-  │ Extract auth module
+  ○ kpqxywon feat-auth
+  │ (synced, PR #42, ✓) Extract auth module
   │
   ◆ trunk()
 ```
@@ -381,11 +381,11 @@ jj stack --format=regular --all    # same
 
 ```
   │   stack: auth
-  ○   auth-tests abcd1234 (@) Add auth tests
-  ○   auth-refactor efgh5678 (PR #44) Refactor auth module
+  ○   abcd1234 (@) auth-tests Add auth tests
+  ○   efgh5678 (PR #44) auth-refactor Refactor auth module
   │
   │ │ stack: Stack 1
-  │ ◉ dash-api ijkl9012 (synced, PR #45) Dashboard API endpoints
+  │ ◉ ijkl9012 (synced, PR #45) dash-api Dashboard API endpoints
   ├─╯
   ◆ trunk()
 ```

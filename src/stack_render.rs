@@ -305,7 +305,7 @@ pub struct DisplayRow {
     /// Whether this is the working copy commit.
     pub is_wc: bool,
     /// Raw indicator tokens (e.g. `"@"`, `"✓"`, `"~"`, `"synced"`, `"PR #3"`).
-    /// Formatting into parenthesized display is done by `build_node_content` (PLAN phase).
+    /// Formatting into parenthesized display is done by `build_indicator_spans` (PLAN phase).
     pub indicators: Vec<String>,
     /// First line of the commit description.
     pub first_line: String,
@@ -402,32 +402,41 @@ fn build_trunk_merge(num_cols: usize) -> Vec<Span> {
 // Row rendering helpers (build spans for a single display row)
 // ---------------------------------------------------------------------------
 
-/// Build the content spans for a node line (bookmark + change ID, no indicators).
-fn build_node_content(row: &DisplayRow) -> Vec<Span> {
-    let mut spans = Vec::new();
-
-    // Bookmark name (with optional link target for markdown rendering)
-    match &row.plan_filename {
-        Some(filename) => {
-            spans.push(Span::linked(&row.bookmark_name, Style::BookmarkName, format!("./{}", filename)));
-        }
-        None => {
-            spans.push(Span::new(&row.bookmark_name, Style::BookmarkName));
-        }
-    }
-    spans.push(Span::plain(" "));
-
-    // Change ID (with optional prefix/rest split)
+/// Build the change-id spans for a row (with prefix/rest split coloring when available).
+fn build_change_id_spans(row: &DisplayRow) -> Vec<Span> {
     match &row.change_id_split {
         Some((prefix, rest)) => {
-            spans.push(Span::new(prefix, Style::ChangeIdPrefix));
-            spans.push(Span::new(rest, Style::ChangeIdRest));
+            vec![
+                Span::new(prefix, Style::ChangeIdPrefix),
+                Span::new(rest, Style::ChangeIdRest),
+            ]
         }
         None => {
-            spans.push(Span::plain(&row.short_change_id));
+            vec![Span::plain(&row.short_change_id)]
         }
     }
+}
 
+/// Build the bookmark name span (with optional markdown link target from `plan_filename`).
+fn build_bookmark_spans(row: &DisplayRow) -> Vec<Span> {
+    match &row.plan_filename {
+        Some(filename) => {
+            vec![Span::linked(&row.bookmark_name, Style::BookmarkName, format!("./{}", filename))]
+        }
+        None => {
+            vec![Span::new(&row.bookmark_name, Style::BookmarkName)]
+        }
+    }
+}
+
+/// Build the content spans for a node line (change-id + bookmark, no indicators).
+///
+/// Convenience wrapper over `build_change_id_spans` + `build_bookmark_spans`,
+/// used by `assemble_row_lines` for the Regular format node line.
+fn build_node_content(row: &DisplayRow) -> Vec<Span> {
+    let mut spans = build_change_id_spans(row);
+    spans.push(Span::plain(" "));
+    spans.extend(build_bookmark_spans(row));
     spans
 }
 
@@ -460,6 +469,70 @@ fn build_indicator_spans(row: &DisplayRow) -> Vec<Span> {
 }
 
 // ---------------------------------------------------------------------------
+// Row assembly (shared by single-column and multi-column renderers)
+// ---------------------------------------------------------------------------
+
+/// Assemble the output lines for a single display row, handling both Compact and Regular formats.
+///
+/// This is the single site for format-dependent row assembly, called by both
+/// `render_single_column` and `render_multi_column`. The caller provides:
+///
+/// - `node_line`: pre-built prefix spans (indent + marker, with or without gutter)
+/// - `row`: the display row (used to build change-id/bookmark spans in Compact mode)
+/// - `indicator_spans`: pre-built indicator spans (may be empty)
+/// - `format`: Compact or Regular
+/// - `desc_prefix`: spans for the description line prefix (e.g. `["  ", "│"]`)
+/// - `spacer_prefix`: `Some(spans)` to emit a spacer line, `None` to suppress
+fn assemble_row_lines(
+    mut node_line: Vec<Span>,
+    row: &DisplayRow,
+    indicator_spans: Vec<Span>,
+    format: StackFormat,
+    desc_prefix: Vec<Span>,
+    spacer_prefix: Option<Vec<Span>>,
+) -> Vec<Vec<Span>> {
+    let mut lines = Vec::new();
+
+    match format {
+        StackFormat::Compact => {
+            // Field order: change-id → indicators → bookmark | description
+            node_line.extend(build_change_id_spans(row));
+            node_line.extend(indicator_spans);
+            node_line.push(Span::plain(" "));
+            node_line.extend(build_bookmark_spans(row));
+            if !row.first_line.is_empty() {
+                node_line.push(Span::new(" | ", Style::Connector));
+                node_line.push(Span::plain(&row.first_line));
+            }
+            lines.push(node_line);
+        }
+        StackFormat::Regular => {
+            // Node line: change-id + bookmark
+            node_line.extend(build_node_content(row));
+            lines.push(node_line);
+
+            // Description line: prefix + indicators + description text
+            if !row.first_line.is_empty() || !indicator_spans.is_empty() {
+                let mut desc_line = desc_prefix;
+                desc_line.extend(indicator_spans);
+                if !row.first_line.is_empty() {
+                    desc_line.push(Span::plain(" "));
+                    desc_line.push(Span::plain(&row.first_line));
+                }
+                lines.push(desc_line);
+            }
+
+            // Spacer between segments (caller passes None for last row)
+            if let Some(spacer) = spacer_prefix {
+                lines.push(spacer);
+            }
+        }
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
 // Rendering (PLAN phase — pure)
 // ---------------------------------------------------------------------------
 
@@ -477,7 +550,6 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
     }
 
     for (i, row) in column.rows.iter().enumerate() {
-        // Node line: "  {marker} {bookmark_name} {short_change_id} {indicator_str}"
         let marker_style = if row.is_wc {
             Style::WorkingCopyMarker
         } else {
@@ -485,49 +557,27 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
         };
         let marker_char = if row.is_wc { "◉" } else { "○" };
 
-        let mut node_line = vec![
+        let node_line = vec![
             Span::plain("  "),
             Span::new(marker_char, marker_style),
             Span::plain(" "),
         ];
-        node_line.extend(build_node_content(row));
-
         let indicator_spans = build_indicator_spans(row);
+        let connector = vec![Span::plain("  "), Span::new("│", Style::Connector)];
+        let spacer_prefix = if i < column.rows.len() - 1 {
+            Some(vec![Span::plain("  "), Span::new("│", Style::Connector)])
+        } else {
+            None
+        };
 
-        match format {
-            StackFormat::Compact => {
-                // Append indicators + description inline on the node line
-                node_line.extend(indicator_spans);
-                if !row.first_line.is_empty() {
-                    node_line.push(Span::plain(" "));
-                    node_line.push(Span::plain(&row.first_line));
-                }
-                lines.push(node_line);
-                // No spacer between segments in compact mode
-            }
-            StackFormat::Regular => {
-                lines.push(node_line);
-
-                // Description line: indicators prepended before the description text
-                if !row.first_line.is_empty() || !indicator_spans.is_empty() {
-                    let mut desc_line = vec![
-                        Span::plain("  "),
-                        Span::new("│", Style::Connector),
-                    ];
-                    desc_line.extend(indicator_spans);
-                    if !row.first_line.is_empty() {
-                        desc_line.push(Span::plain(" "));
-                        desc_line.push(Span::plain(&row.first_line));
-                    }
-                    lines.push(desc_line);
-                }
-
-                // Spacer between segments (not after last)
-                if i < column.rows.len() - 1 {
-                    lines.push(vec![Span::plain("  "), Span::new("│", Style::Connector)]);
-                }
-            }
-        }
+        lines.extend(assemble_row_lines(
+            node_line,
+            row,
+            indicator_spans,
+            format,
+            connector,
+            spacer_prefix,
+        ));
     }
 
     // Gap warnings (same for both formats)
@@ -611,48 +661,30 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                 GutterMark::Node
             };
 
-            // Node line
             let mut node_line = vec![Span::plain("  ")];
             node_line.extend(build_gutter(num_cols, col_idx, mark, &started));
-            node_line.extend(build_node_content(row));
-
             let indicator_spans = build_indicator_spans(row);
 
-            match format {
-                StackFormat::Compact => {
-                    // Append indicators + description inline on the node line
-                    node_line.extend(indicator_spans);
-                    if !row.first_line.is_empty() {
-                        node_line.push(Span::plain(" "));
-                        node_line.push(Span::plain(&row.first_line));
-                    }
-                    lines.push(node_line);
-                    // No spacer between segments in compact mode
-                }
-                StackFormat::Regular => {
-                    lines.push(node_line);
+            let mut desc_prefix = vec![Span::plain("  ")];
+            desc_prefix.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
+            desc_prefix.push(Span::plain(" "));
 
-                    // Description line: indicators prepended before the description text
-                    if !row.first_line.is_empty() || !indicator_spans.is_empty() {
-                        let mut desc_line = vec![Span::plain("  ")];
-                        desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
-                        desc_line.push(Span::plain(" "));
-                        desc_line.extend(indicator_spans);
-                        if !row.first_line.is_empty() {
-                            desc_line.push(Span::plain(" "));
-                            desc_line.push(Span::plain(&row.first_line));
-                        }
-                        lines.push(desc_line);
-                    }
+            let spacer_prefix = if row_idx < column.rows.len() - 1 {
+                let mut sp = vec![Span::plain("  ")];
+                sp.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
+                Some(sp)
+            } else {
+                None
+            };
 
-                    // Spacer between segments (not after last)
-                    if row_idx < column.rows.len() - 1 {
-                        let mut spacer_line = vec![Span::plain("  ")];
-                        spacer_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
-                        lines.push(spacer_line);
-                    }
-                }
-            }
+            lines.extend(assemble_row_lines(
+                node_line,
+                row,
+                indicator_spans,
+                format,
+                desc_prefix,
+                spacer_prefix,
+            ));
         }
 
         // Gap warnings (same for both formats)
@@ -973,11 +1005,11 @@ mod tests {
 
         // Should have ○ markers (not ◉ since neither is WC)
         assert!(
-            output.contains("○ auth-tests"),
+            output.contains("○ abcd1234 auth-tests"),
             "should show auth-tests node"
         );
         assert!(
-            output.contains("○ auth-refactor"),
+            output.contains("○ abcd1234 auth-refactor"),
             "should show auth-refactor node"
         );
         // Should have trunk
@@ -1001,7 +1033,7 @@ mod tests {
         let output = lines.join("\n");
 
         assert!(
-            output.contains("◉ feat-api"),
+            output.contains("◉ abcd1234 feat-api"),
             "working copy should use ◉ marker"
         );
     }
@@ -1219,9 +1251,9 @@ mod tests {
         let output = lines.join("\n");
 
         // Verify the structural elements are all present and in order
-        assert!(output.contains("◉ auth-tests abcd1234"));
+        assert!(output.contains("◉ abcd1234 auth-tests"));
         assert!(output.contains("│ (@) Add tests"));
-        assert!(output.contains("○ auth-refactor abcd1234"));
+        assert!(output.contains("○ abcd1234 auth-refactor"));
         assert!(output.contains("│ Refactor auth"));
         assert!(output.contains("◆ trunk()"));
 
@@ -1273,13 +1305,13 @@ mod tests {
         let lines = format_plain(&render_stack(&cols, StackFormat::Regular));
         let output = lines.join("\n");
 
-        // Both columns should include the change ID
+        // Both columns should include the change ID (now before bookmark)
         assert!(
-            output.contains("auth-refactor abcd1234"),
+            output.contains("abcd1234 auth-refactor"),
             "multi-column should include change ID for auth-refactor"
         );
         assert!(
-            output.contains("dash-api abcd1234"),
+            output.contains("abcd1234 dash-api"),
             "multi-column should include change ID for dash-api"
         );
     }
@@ -1397,8 +1429,8 @@ mod tests {
         assert!(output.contains("│ (@) Add tests"), "regular must have description line with indicators");
         assert!(output.contains("│ Refactor auth"), "regular must have description line");
         // Must have │ spacer between segments
-        assert!(output.contains("◉ auth-tests"), "should show auth-tests");
-        assert!(output.contains("○ auth-refactor"), "should show auth-refactor");
+        assert!(output.contains("◉ abcd1234 auth-tests"), "should show auth-tests");
+        assert!(output.contains("○ abcd1234 auth-refactor"), "should show auth-refactor");
         // Must have │ connector before trunk
         let trunk_idx = lines.iter().position(|l| l.contains("◆ trunk()")).unwrap();
         assert!(
@@ -1426,9 +1458,9 @@ mod tests {
         let lines = format_plain(&render_stack(&[col], StackFormat::Compact));
         let output = lines.join("\n");
 
-        // Description should appear on the same line as the bookmark
+        // Description should appear on the same line, with change-id first and pipe separator
         assert!(
-            output.contains("feat-api abcd1234 (@) Add API endpoints"),
+            output.contains("abcd1234 (@) feat-api | Add API endpoints"),
             "compact should have description on same line as bookmark: {output}"
         );
     }
@@ -1456,13 +1488,13 @@ mod tests {
             !output.contains("  Add tests\n"),
             "compact multi-column should not have separate description line"
         );
-        // Descriptions should be inline on node lines
+        // Descriptions should be inline on node lines (change-id first, pipe separator)
         assert!(
-            output.contains("auth-tests abcd1234 Add tests"),
+            output.contains("abcd1234 auth-tests | Add tests"),
             "compact multi-column should have description inline: {output}"
         );
         assert!(
-            output.contains("dash-api abcd1234 (@) Dashboard API"),
+            output.contains("abcd1234 (@) dash-api | Dashboard API"),
             "compact multi-column should have description inline: {output}"
         );
         // Stack headers should still be present
@@ -1650,6 +1682,108 @@ mod tests {
         assert!(
             output.contains("stack: Stack 1"),
             "implicit stack should get counter name: {output}"
+        );
+    }
+
+    #[test]
+    fn assemble_row_lines_compact_and_regular() {
+        let row = make_row("feat-api", "Add API endpoints", true);
+        let indicator_spans = build_indicator_spans(&row);
+        let desc_prefix = vec![Span::plain("  "), Span::new("│", Style::Connector)];
+        let spacer = vec![Span::plain("  "), Span::new("│", Style::Connector)];
+        let node_prefix = vec![Span::plain("  "), Span::new("◉", Style::WorkingCopyMarker), Span::plain(" ")];
+
+        // --- Compact: single line with change-id → indicators → bookmark → description ---
+        let compact_lines = assemble_row_lines(
+            node_prefix.clone(),
+            &row,
+            indicator_spans.clone(),
+            StackFormat::Compact,
+            desc_prefix.clone(),
+            Some(spacer.clone()),
+        );
+        assert_eq!(compact_lines.len(), 1, "compact should produce exactly 1 line");
+        let compact_text = format_plain(&compact_lines).join("");
+        assert!(
+            compact_text.contains("abcd1234 (@) feat-api | Add API endpoints"),
+            "compact field order should be change-id indicators bookmark | description: '{compact_text}'"
+        );
+
+        // --- Regular: node line + description line + spacer ---
+        let regular_lines = assemble_row_lines(
+            node_prefix.clone(),
+            &row,
+            indicator_spans.clone(),
+            StackFormat::Regular,
+            desc_prefix.clone(),
+            Some(spacer.clone()),
+        );
+        assert_eq!(regular_lines.len(), 3, "regular should produce node + desc + spacer");
+        let regular_text: Vec<String> = format_plain(&regular_lines);
+        assert!(
+            regular_text[0].contains("abcd1234 feat-api"),
+            "regular node line should have change-id then bookmark: '{}'", regular_text[0]
+        );
+        assert!(
+            regular_text[1].contains("│ (@) Add API endpoints"),
+            "regular desc line should have indicators then description: '{}'", regular_text[1]
+        );
+
+        // --- Regular without spacer (last row) ---
+        let last_lines = assemble_row_lines(
+            node_prefix.clone(),
+            &row,
+            indicator_spans.clone(),
+            StackFormat::Regular,
+            desc_prefix.clone(),
+            None,
+        );
+        assert_eq!(last_lines.len(), 2, "regular last row should produce node + desc, no spacer");
+
+        // --- Compact without indicators ---
+        let row_no_ind = make_row("feat-auth", "Auth module", false);
+        let empty_indicators = build_indicator_spans(&row_no_ind);
+        assert!(empty_indicators.is_empty());
+        let node_prefix2 = vec![Span::plain("  "), Span::new("○", Style::Marker), Span::plain(" ")];
+        let compact_no_ind = assemble_row_lines(
+            node_prefix2,
+            &row_no_ind,
+            empty_indicators,
+            StackFormat::Compact,
+            desc_prefix.clone(),
+            None,
+        );
+        let no_ind_text = format_plain(&compact_no_ind).join("");
+        assert!(
+            no_ind_text.contains("abcd1234 feat-auth | Auth module"),
+            "compact without indicators: change-id space bookmark pipe description: '{no_ind_text}'"
+        );
+        // No double space between change-id and bookmark
+        assert!(
+            !no_ind_text.contains("abcd1234  feat-auth"),
+            "should not have double space when no indicators: '{no_ind_text}'"
+        );
+
+        // --- Compact with empty description ---
+        let row_no_desc = make_row("feat-stub", "", false);
+        let ind_stub = build_indicator_spans(&row_no_desc);
+        let node_prefix3 = vec![Span::plain("  "), Span::new("○", Style::Marker), Span::plain(" ")];
+        let compact_no_desc = assemble_row_lines(
+            node_prefix3,
+            &row_no_desc,
+            ind_stub,
+            StackFormat::Compact,
+            desc_prefix,
+            None,
+        );
+        let no_desc_text = format_plain(&compact_no_desc).join("");
+        assert!(
+            no_desc_text.contains("abcd1234 feat-stub"),
+            "compact with empty description should still show change-id and bookmark: '{no_desc_text}'"
+        );
+        assert!(
+            !no_desc_text.ends_with(' '),
+            "should not have trailing space with empty description: '{no_desc_text}'"
         );
     }
 }

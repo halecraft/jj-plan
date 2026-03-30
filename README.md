@@ -5,11 +5,11 @@
 **jj-plan** stores implementation plans as [Jujutsu](https://github.com/jj-vcs/jj) change descriptions and syncs them to markdown files in your editor. Plans are drafted, reviewed, and validated *before* code is written. When you're ready, `jj stack submit` pushes your stack as PRs — with the plan as the PR description.
 
 ```
-  ◉ feat-session mtzrlpvq (@)
-  │ Implement session management
+  ◉ mtzrlpvq feat-session
+  │ (@) Implement session management
   │
-  ○ feat-auth kpqxywon (synced, PR #42)
-  │ Extract auth module
+  ○ kpqxywon feat-auth
+  │ (synced, PR #42) Extract auth module
   │
   ◆ trunk()
 ```
@@ -88,14 +88,14 @@ Parent commit (@-): mtzrlpvq 8f2e4a6b Implement session management
 
 Plan stack (.jj-plan/):
 
-  ◉ feat-api ykvsnxrl (@)
-  │ Add API endpoints
+  ◉ ykvsnxrl feat-api
+  │ (@) Add API endpoints
   │
-  ○ feat-session mtzrlpvq (~)
-  │ Implement session management
+  ○ mtzrlpvq feat-session
+  │ (~) Implement session management
   │
-  ○ feat-auth kpqxywon (✓)
-  │ Extract auth module
+  ○ kpqxywon feat-auth
+  │ (✓) Extract auth module
   │
   ◆ trunk()
 ```
@@ -103,14 +103,14 @@ Plan stack (.jj-plan/):
 `jj stack` shows the same visualization with PR sync status:
 
 ```
-  ◉ feat-api ykvsnxrl (@)
-  │ Add API endpoints
+  ◉ ykvsnxrl feat-api
+  │ (@) Add API endpoints
   │
-  ○ feat-session mtzrlpvq (synced, PR #43)
-  │ Implement session management
+  ○ mtzrlpvq feat-session
+  │ (synced, PR #43) Implement session management
   │
-  ○ feat-auth kpqxywon (synced, PR #42)
-  │ Extract auth module
+  ○ kpqxywon feat-auth
+  │ (synced, PR #42) Extract auth module
   │
   ◆ trunk()
 ```
