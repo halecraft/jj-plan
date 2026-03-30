@@ -364,13 +364,17 @@ Need JWT and API key support
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj plan new step-1; jj describe -m "Step 1"
   jj plan new step-2; jj describe -m "Step 2"
-  # Current is Step 2 (tip) — should have ◉ marker and (@) indicator
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  # Current is Step 2 (tip) — should have ◉ marker on node line
   [[ "$(grep '◉' .jj-plan/stack.md)" == *"[step-2](./03-step-2.md)"* ]]
-  [[ "$(grep '◉' .jj-plan/stack.md)" == *"(@)"* ]]
+  # (@) indicator is on the description line (Regular format)
+  [[ "$stack" == *"(@)"*"Step 2"* ]]
   # Switch to first
   jj edit -r "$PLAN"
+  stack=$(cat .jj-plan/stack.md)
   [[ "$(grep '◉' .jj-plan/stack.md)" == *"[start](./01-start.md)"* ]]
-  [[ "$(grep '◉' .jj-plan/stack.md)" == *"(@)"* ]]
+  [[ "$stack" == *"(@)"*"Plan"* ]]
 }
 
 @test "stack.md updates when stack changes" {
@@ -394,30 +398,42 @@ Need JWT and API key support
   jj describe -m "Plan"
   jj plan new step-1; jj describe -m "Step 1"
   jj plan new step-2; jj describe -m "Step 2"
-  # Empty, not-started change has no indicator parenthetical
-  local start_line
-  start_line=$(grep '\[start\]' .jj-plan/stack.md)
-  [[ "$start_line" != *"(@)"* ]]
-  [[ "$start_line" != *"(~)"* ]]
-  [[ "$start_line" != *"(✓)"* ]]
+  # Empty, not-started change has no indicator parenthetical.
+  # In Regular format, indicators are on the description line (after │),
+  # so we check the node line (bookmark line) AND the next line.
+  # For a blank/not-started change, the description line has no indicators.
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  # The "Plan" description line should not have indicator parens
+  # (grep the line containing "Plan" after │)
+  local plan_desc
+  plan_desc=$(echo "$stack" | grep "Plan$" || true)
+  [[ "$plan_desc" != *"(@)"* ]]
+  [[ "$plan_desc" != *"(~)"* ]]
+  [[ "$plan_desc" != *"(✓)"* ]]
 }
 
 @test "stack.md shows ~ for non-empty non-current changes" {
   jj describe -m "Step 1"
   echo "some work" > file.txt
   jj plan new step-1; jj describe -m "Step 2"
-  # Non-current, non-empty change shows (~) indicator
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"(~)"* ]]
+  # Non-current, non-empty change shows (~) indicator on description line
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"(~)"*"Step 1"* ]]
 }
 
 @test "stack.md shows ✓ for changes with plan-status: ✅" {
   jj describe -m "Step 1"
   jj plan new step-1; jj describe -m "Step 2"
   # Mark Step 1 as done by editing its plan file (bookmark-named: 01-start.md)
-  printf "Step 1\n\nDid the work.\n\nplan-status: ✅" > ".jj-plan/01-start.md"
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nDid the work." > ".jj-plan/01-start.md"
   # Trigger a sync
   jj describe -m "Step 2 updated"
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"(✓)"* ]]
+  # (✓) indicator now on description line in Regular format
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"(✓)"*"Step 1"* ]]
 }
 
 @test "stack.md shows all status types together" {
@@ -433,27 +449,23 @@ Need JWT and API key support
   # Now go back to change 2 to make it current
   jj edit -r @-
   # Mark change 0 as done (bookmark-named: 01-start.md)
-  printf "Done change\n\nplan-status: ✅" > ".jj-plan/01-start.md"
+  printf "Done change\n\n> [!plan]\n> status: ✅" > ".jj-plan/01-start.md"
   # Trigger sync
   jj describe -m "Current work"
   local stack
   stack=$(cat .jj-plan/stack.md)
-  # Done change shows (✓) — ✓ supersedes ~
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"(✓)"* ]]
-  [[ "$stack" == *"Done change"* ]]
-  # Has-changes shows (~)
-  [[ "$(grep '\[step-1\]' .jj-plan/stack.md)" == *"(~)"* ]]
-  [[ "$stack" == *"Has changes"* ]]
-  # Current (working copy) shows (@)
-  [[ "$(grep '\[step-2\]' .jj-plan/stack.md)" == *"(@)"* ]]
-  [[ "$stack" == *"Current work"* ]]
-  # Empty, not-started change has no indicator
-  local step3_line
-  step3_line=$(grep '\[step-3\]' .jj-plan/stack.md)
-  [[ "$step3_line" != *"(@)"* ]]
-  [[ "$step3_line" != *"(~)"* ]]
-  [[ "$step3_line" != *"(✓)"* ]]
-  [[ "$stack" == *"Future work"* ]]
+  # Done change shows (✓) on description line
+  [[ "$stack" == *"(✓)"*"Done change"* ]]
+  # Has-changes shows (~) on description line
+  [[ "$stack" == *"(~)"*"Has changes"* ]]
+  # Current (working copy) shows (@) on description line
+  [[ "$stack" == *"(@)"*"Current work"* ]]
+  # Empty, not-started change: description line has no indicator parens
+  local future_desc
+  future_desc=$(echo "$stack" | grep "Future work" || true)
+  [[ "$future_desc" != *"(@)"* ]]
+  [[ "$future_desc" != *"(~)"* ]]
+  [[ "$future_desc" != *"(✓)"* ]]
 }
 
 @test "stack.md contains clickable markdown links" {
@@ -473,15 +485,15 @@ Need JWT and API key support
   jj describe -m "Step 1"
   local START_CID
   START_CID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  # Write done status to plan file
-  printf "Step 1\n\nCompleted.\n\nplan-status: ✅" > .jj-plan/current.md
+  # Write done status to plan file using callout format
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nCompleted." > .jj-plan/current.md
   # Switch away (flushes to jj)
   jj plan new step-1; jj describe -m "Step 2"
   # Check the description was preserved
   local desc
   desc=$("$REAL_JJ" log -r "$START_CID" -T description --no-graph)
   [[ "$desc" == *"Step 1"* ]]
-  [[ "$desc" == *"plan-status: ✅"* ]]
+  [[ "$desc" == *"status: ✅"* ]]
 }
 
 @test "jj status flushes non-current file edits and updates stack" {
@@ -1115,22 +1127,28 @@ Need JWT and API key support
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj plan new step-1; jj describe -m "Step 1"
-  # Mark Plan as done (bookmark-named: 01-start.md)
-  printf "Plan\n\nplan-status: ✅" > ".jj-plan/01-start.md"
+  # Mark Plan as done using callout format (bookmark-named: 01-start.md)
+  printf "Plan\n\n> [!plan]\n> status: ✅" > ".jj-plan/01-start.md"
   # Switch back to Plan — it is both current AND done
   jj edit -r "$PLAN"
-  # ◉ marker (working copy) and both (@, ✓) indicators
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"◉"* ]]
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"(@, ✓)"* ]]
+  # ◉ marker (working copy) on node line
+  [[ "$(grep '◉' .jj-plan/stack.md)" == *"[start]"* ]]
+  # (@, ✓) indicators on description line (Regular format)
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"(@, ✓)"*"Plan"* ]]
 }
 
-@test "plan-status: ✅ detected when not on the last line" {
+@test "status: ✅ in callout detected when not on the last line" {
   jj describe -m "Step 1"
   jj plan new step-1; jj describe -m "Step 2"
-  # Write plan-status in the middle, with trailing content after it (bookmark-named: 01-start.md)
-  printf "Step 1\n\nplan-status: ✅\n\n## Notes\nSome trailing content" > ".jj-plan/01-start.md"
+  # Write status in callout format with trailing content (bookmark-named: 01-start.md)
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\n## Notes\nSome trailing content" > ".jj-plan/01-start.md"
   jj describe -m "Step 2 updated"
-  [[ "$(grep '\[start\]' .jj-plan/stack.md)" == *"(✓)"* ]]
+  # (✓) indicator on description line in Regular format
+  local stack
+  stack=$(cat .jj-plan/stack.md)
+  [[ "$stack" == *"(✓)"*"Step 1"* ]]
 }
 
 # =============================================================================
@@ -1935,8 +1953,8 @@ EOF
   [[ "$status" -eq 0 ]]
   # stack.md should use regular format (│ connector before description)
   stack_content=$(cat .jj-plan/stack.md)
-  [[ "$stack_content" == *"│ Refactor auth"* ]]
-  [[ "$stack_content" == *"│ Extract module"* ]]
+  [[ "$stack_content" == *"│"*"Refactor auth"* ]]
+  [[ "$stack_content" == *"│"*"Extract module"* ]]
 }
 
 @test "jj stack --format=regular produces multi-line output" {
@@ -1945,8 +1963,8 @@ EOF
   run jj stack --format=regular
   [[ "$status" -eq 0 ]]
   # Regular format should have │ description lines
-  [[ "$output" == *"│ Refactor auth"* ]]
-  [[ "$output" == *"│ Extract module"* ]]
+  [[ "$output" == *"│"*"Refactor auth"* ]]
+  [[ "$output" == *"│"*"Extract module"* ]]
 }
 
 @test "jj stack --all --format=regular works with flag order independence" {
@@ -1954,11 +1972,11 @@ EOF
   run jj stack --all --format=regular
   [[ "$status" -eq 0 ]]
   # Should have regular format with │ description lines
-  [[ "$output" == *"│ Refactor auth"* ]]
+  [[ "$output" == *"│"*"Refactor auth"* ]]
   # Reversed order should also work
   run jj stack --format=regular --all
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"│ Refactor auth"* ]]
+  [[ "$output" == *"│"*"Refactor auth"* ]]
 }
 
 @test "jj stack --format=compact explicitly produces compact output" {
@@ -1981,5 +1999,5 @@ EOF
   JJ_PLAN_STACK_FORMAT=regular run jj stack
   [[ "$status" -eq 0 ]]
   # Env var set to regular should produce │ description lines
-  [[ "$output" == *"│ Refactor auth"* ]]
+  [[ "$output" == *"│"*"Refactor auth"* ]]
 }

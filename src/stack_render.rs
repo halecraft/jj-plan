@@ -402,7 +402,7 @@ fn build_trunk_merge(num_cols: usize) -> Vec<Span> {
 // Row rendering helpers (build spans for a single display row)
 // ---------------------------------------------------------------------------
 
-/// Build the content spans for a node line (bookmark + change ID + indicators).
+/// Build the content spans for a node line (bookmark + change ID, no indicators).
 fn build_node_content(row: &DisplayRow) -> Vec<Span> {
     let mut spans = Vec::new();
 
@@ -428,24 +428,34 @@ fn build_node_content(row: &DisplayRow) -> Vec<Span> {
         }
     }
 
-    // Indicators — format raw tokens into styled spans with parentheses
-    if !row.indicators.is_empty() {
-        spans.push(Span::plain(" ("));
-        for (i, indicator) in row.indicators.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::plain(", "));
-            }
-            // Semantic indicators (@, ✓, ~) get Style::Indicator (green in ANSI).
-            // Others (synced, PR #N) get Style::Plain.
-            let style = match indicator.as_str() {
-                "@" | "✓" | "~" => Style::Indicator,
-                _ => Style::Plain,
-            };
-            spans.push(Span::new(indicator, style));
-        }
-        spans.push(Span::plain(")"));
+    spans
+}
+
+/// Build the indicator spans for a row (e.g. `(@, ✓)`).
+///
+/// Returns an empty vec if there are no indicators. Otherwise returns
+/// spans including the ` (` prefix and `)` suffix, suitable for appending
+/// to a node line (Compact) or prepending to a description line (Regular).
+fn build_indicator_spans(row: &DisplayRow) -> Vec<Span> {
+    if row.indicators.is_empty() {
+        return Vec::new();
     }
 
+    let mut spans = Vec::new();
+    spans.push(Span::plain(" ("));
+    for (i, indicator) in row.indicators.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::plain(", "));
+        }
+        // Semantic indicators (@, ✓, ~) get Style::Indicator (green in ANSI).
+        // Others (synced, PR #N) get Style::Plain.
+        let style = match indicator.as_str() {
+            "@" | "✓" | "~" => Style::Indicator,
+            _ => Style::Plain,
+        };
+        spans.push(Span::new(indicator, style));
+    }
+    spans.push(Span::plain(")"));
     spans
 }
 
@@ -482,9 +492,12 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
         ];
         node_line.extend(build_node_content(row));
 
+        let indicator_spans = build_indicator_spans(row);
+
         match format {
             StackFormat::Compact => {
-                // Append description inline on the node line
+                // Append indicators + description inline on the node line
+                node_line.extend(indicator_spans);
                 if !row.first_line.is_empty() {
                     node_line.push(Span::plain(" "));
                     node_line.push(Span::plain(&row.first_line));
@@ -495,14 +508,18 @@ fn render_single_column(column: &StackColumn, format: StackFormat) -> Vec<Vec<Sp
             StackFormat::Regular => {
                 lines.push(node_line);
 
-                // Description line
-                if !row.first_line.is_empty() {
-                    lines.push(vec![
+                // Description line: indicators prepended before the description text
+                if !row.first_line.is_empty() || !indicator_spans.is_empty() {
+                    let mut desc_line = vec![
                         Span::plain("  "),
                         Span::new("│", Style::Connector),
-                        Span::plain(" "),
-                        Span::plain(&row.first_line),
-                    ]);
+                    ];
+                    desc_line.extend(indicator_spans);
+                    if !row.first_line.is_empty() {
+                        desc_line.push(Span::plain(" "));
+                        desc_line.push(Span::plain(&row.first_line));
+                    }
+                    lines.push(desc_line);
                 }
 
                 // Spacer between segments (not after last)
@@ -599,9 +616,12 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
             node_line.extend(build_gutter(num_cols, col_idx, mark, &started));
             node_line.extend(build_node_content(row));
 
+            let indicator_spans = build_indicator_spans(row);
+
             match format {
                 StackFormat::Compact => {
-                    // Append description inline on the node line
+                    // Append indicators + description inline on the node line
+                    node_line.extend(indicator_spans);
                     if !row.first_line.is_empty() {
                         node_line.push(Span::plain(" "));
                         node_line.push(Span::plain(&row.first_line));
@@ -612,11 +632,16 @@ fn render_multi_column(columns: &[StackColumn], format: StackFormat) -> Vec<Vec<
                 StackFormat::Regular => {
                     lines.push(node_line);
 
-                    // Description line
-                    if !row.first_line.is_empty() {
+                    // Description line: indicators prepended before the description text
+                    if !row.first_line.is_empty() || !indicator_spans.is_empty() {
                         let mut desc_line = vec![Span::plain("  ")];
                         desc_line.extend(build_gutter(num_cols, col_idx, GutterMark::Continuation, &started));
-                        desc_line.push(Span::plain(format!("  {}", row.first_line)));
+                        desc_line.push(Span::plain(" "));
+                        desc_line.extend(indicator_spans);
+                        if !row.first_line.is_empty() {
+                            desc_line.push(Span::plain(" "));
+                            desc_line.push(Span::plain(&row.first_line));
+                        }
                         lines.push(desc_line);
                     }
 
@@ -1194,8 +1219,8 @@ mod tests {
         let output = lines.join("\n");
 
         // Verify the structural elements are all present and in order
-        assert!(output.contains("◉ auth-tests abcd1234 (@)"));
-        assert!(output.contains("│ Add tests"));
+        assert!(output.contains("◉ auth-tests abcd1234"));
+        assert!(output.contains("│ (@) Add tests"));
         assert!(output.contains("○ auth-refactor abcd1234"));
         assert!(output.contains("│ Refactor auth"));
         assert!(output.contains("◆ trunk()"));
@@ -1225,10 +1250,10 @@ mod tests {
                 m
             },
         };
-        // The issue indicator should appear in the rendered output
-        let spans = build_node_content(&row);
+        // The issue indicator should appear in the indicator spans (not node content)
+        let spans = build_indicator_spans(&row);
         let text: String = spans.iter().map(|s| s.text.as_str()).collect();
-        assert!(text.contains("MERC-123"), "issue indicator should appear in rendered content: {}", text);
+        assert!(text.contains("MERC-123"), "issue indicator should appear in indicator spans: {}", text);
     }
 
     #[test]
@@ -1368,8 +1393,8 @@ mod tests {
         let lines = format_plain(&render_stack(&[col], StackFormat::Regular));
         let output = lines.join("\n");
 
-        // Must have │ description lines
-        assert!(output.contains("│ Add tests"), "regular must have description line");
+        // Must have │ description lines (with indicators prepended for WC row)
+        assert!(output.contains("│ (@) Add tests"), "regular must have description line with indicators");
         assert!(output.contains("│ Refactor auth"), "regular must have description line");
         // Must have │ spacer between segments
         assert!(output.contains("◉ auth-tests"), "should show auth-tests");
