@@ -40,8 +40,8 @@ mkdir .jj-plan
 # Create a plan — makes a jj change + bookmark + plan file
 jj plan new feat-auth
 
-# Write the plan (your editor, an AI agent, or both)
-$EDITOR .jj-plan/current.md
+# Write the plan (see stack.md for plan filenames)
+$EDITOR .jj-plan/01-feat-auth.md
 
 # Implement — every jj command syncs plan files automatically
 # Edit code... jj status shows your plan stack on every invocation
@@ -158,7 +158,7 @@ The AI writes analysis, alternatives explored, and debugging notes in scratch se
 
 ### The closed loop
 
-When the agent reads `.jj-plan/current.md`, it has the full decision record. When it's done, the clean plan becomes the permanent historical record. The code links back to it:
+When the agent reads the plan file (e.g. `.jj-plan/01-feat-auth.md`), it has the full decision record. When it's done, the clean plan becomes the permanent historical record. The code links back to it:
 
 ```
 Plan (jj description) → Code (references jj:CHANGE_ID) → PR (plan = description) → Archaeology (jj show → full plan)
@@ -221,7 +221,7 @@ Each bookmarked change in a stack is one unit of work: the description *is* the 
 
 ```sh
 jj plan new feat-auth          # create a change + bookmark + plan file
-# Edit .jj-plan/current.md — write the plan
+# Edit .jj-plan/01-feat-auth.md — write the plan
 jj plan new feat-session       # add another plan to the stack
 jj plan done                   # mark current plan done
 jj stack submit                # push as stacked PRs
@@ -284,7 +284,6 @@ The binary maintains a directory of markdown files synced with change descriptio
 
 ```
 .jj-plan/
-  current.md          → symlink to active change's plan
   stack.md            → browsable stack overview with clickable markdown links
   01-feat-auth.md     — first plan (closest to trunk)
   02-feat-session.md

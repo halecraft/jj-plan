@@ -176,20 +176,13 @@ where
     }
 }
 
-/// Check if `current.md` points to `error.md` (error state).
+/// Check if the plan directory is in error state.
 ///
-/// During error state, flush is skipped to prevent overwriting error info.
+/// Error state is indicated by the existence of `error.md` in the plan
+/// directory. During error state, flush is skipped to prevent overwriting
+/// error info.
 pub fn is_error_state(plan_dir: &Path) -> bool {
-    let current = plan_dir.join("current.md");
-
-    #[cfg(unix)]
-    {
-        if let Ok(target) = fs::read_link(&current) {
-            return target.file_name().and_then(|n| n.to_str()) == Some("error.md");
-        }
-    }
-
-    false
+    plan_dir.join("error.md").exists()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,31 +229,7 @@ pub fn rename_or_warn(from: &Path, to: &Path) {
     }
 }
 
-/// Create a symlink, warning on failure. Unix only.
-#[cfg(unix)]
-pub fn symlink_or_warn(target: &str, link: &Path) {
-    if let Err(e) = std::os::unix::fs::symlink(target, link) {
-        eprintln!(
-            "jj-plan: warning: failed to create symlink {} → {}: {}",
-            link.display(),
-            target,
-            e
-        );
-    }
-}
 
-/// Copy a file, warning on failure.
-#[cfg(not(unix))]
-pub fn copy_or_warn(src: &Path, dst: &Path) {
-    if let Err(e) = fs::copy(src, dst) {
-        eprintln!(
-            "jj-plan: warning: failed to copy {} → {}: {}",
-            src.display(),
-            dst.display(),
-            e
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -411,20 +380,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_is_error_state_with_error_symlink() {
+    fn test_is_error_state_with_error_md_present() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("error.md"), "error").unwrap();
-        std::os::unix::fs::symlink("error.md", tmp.path().join("current.md")).unwrap();
         assert!(is_error_state(tmp.path()));
     }
 
     #[test]
-    #[cfg(unix)]
-    fn test_is_error_state_with_normal_symlink() {
+    fn test_is_error_state_without_error_md() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("01-feat-auth.md"), "plan").unwrap();
-        std::os::unix::fs::symlink("01-feat-auth.md", tmp.path().join("current.md")).unwrap();
         assert!(!is_error_state(tmp.path()));
     }
 

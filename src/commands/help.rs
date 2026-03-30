@@ -217,7 +217,7 @@ pub fn build_plan_help() -> PlanHelp {
         ],
         workflow: vec![
             ("jj plan new <bookmark>", "Create a plan (change + bookmark + template)"),
-            ("$EDITOR .jj-plan/current.md", "Write the current plan"),
+            ("$EDITOR .jj-plan/NN-bookmark.md", "Edit the plan file (see stack.md for filenames)"),
             ("jj plan new <next-bookmark>", "Add another plan to the stack"),
             ("jj plan done", "Mark the current plan done"),
             ("jj plan summary", "Inspect plan structure, phases, and context"),
@@ -296,7 +296,7 @@ pub fn build_plan_help() -> PlanHelp {
         ],
         notes: vec![
             "`jj status` shows the current plan stack.",
-            "`.jj-plan/current.md` is the main editing surface.",
+            "Plan files are `.jj-plan/NN-bookmark.md` — see `stack.md` for links.",
             "`jj stack submit/sync/merge` — stacked PR operations.",
         ],
         docs: vec![

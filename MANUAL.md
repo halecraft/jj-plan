@@ -47,7 +47,6 @@ Created by `mkdir .jj-plan` to activate jj-plan in a repository. The binary main
 
 ```
 .jj-plan/
-  current.md          → symlink to the active change's plan file
   stack.md            → browsable stack overview with clickable markdown links
   01-feat-auth.md     — first plan (closest to trunk)
   02-feat-session.md  — second plan
@@ -147,7 +146,7 @@ jj plan new auth-tests                   # inherits parent plan's stack
 4. Registers the bookmark in the plan registry.
 5. If `--stack <name>` is provided, creates a `stack/<name>` base bookmark and associates the plan with that stack.
 6. Applies the plan template and writes the initial plan file.
-7. Updates `current.md` symlink to point at the new plan file.
+7. Writes the plan file (e.g. `02-feat-session.md`).
 
 **Arguments:**
 
@@ -870,10 +869,10 @@ GITEA_INTEGRATION=1 GITEA_HOST=code.example.com GITEA_TOKEN=xxx \
 ```sh
 mkdir .jj-plan                     # activate jj-plan
 jj plan new feat-auth              # create first plan
-$EDITOR .jj-plan/current.md       # write the plan
+$EDITOR .jj-plan/01-feat-auth.md  # write the plan (see stack.md for filenames)
 # ... implement ...
 jj plan new feat-session           # create second plan
-$EDITOR .jj-plan/current.md       # write the plan
+$EDITOR .jj-plan/02-feat-session.md  # write the plan
 # ... implement ...
 jj stack auth github test          # verify authentication
 jj stack submit                    # push and create PRs

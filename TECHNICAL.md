@@ -329,9 +329,8 @@ Uses a **gather → plan → execute** architecture:
    - Files to remove (bookmarks no longer in stack).
    - Files to rename (same bookmark, different index).
    - Files to write (description changed in jj).
-   - Symlink target (which file `current.md` points to).
    - File summary for `stack.md` (received as opaque `Option<&str>` from the caller — sync writes but does not generate this content).
-3. **Execute**: Apply the plan — remove, rename, write, update symlink, write `stack.md`.
+3. **Execute**: Apply the plan — remove, rename, write, write `stack.md`. Also cleans up any stale `current.md` from older versions.
 
 Note: `sync_to_disk` in `wrap.rs` builds the @-relative stack once via `build_current_stack()` and forks it into two consumers: `stack_to_sync_changes()` for plan file sync and `build_column_from_stack()` for rendering. The rendered `stack.md` content is passed to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second traversal is needed. `build_multi_stack()` is never called on this path.
 
