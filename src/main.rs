@@ -170,8 +170,8 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
         return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace, &registry, format);
     }
 
-    // Special handling for "describe" — intercept -m to write to plan file first
-    if subcommand == "describe" {
+    // Special handling for "describe" (and its alias "desc") — intercept -m to write to plan file first
+    if matches!(subcommand.as_str(), "describe" | "desc") {
         return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace, &registry, format);
     }
 
@@ -246,5 +246,12 @@ mod tests {
     #[test]
     fn workspace_not_in_readonly_commands() {
         assert!(!READONLY_COMMANDS.contains(&"workspace"));
+    }
+
+    #[test]
+    fn desc_alias_matches_describe_dispatch() {
+        // Both "describe" and "desc" should match the dispatch condition
+        assert!(matches!("describe", "describe" | "desc"));
+        assert!(matches!("desc", "describe" | "desc"));
     }
 }

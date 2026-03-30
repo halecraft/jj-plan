@@ -299,6 +299,7 @@ pub fn build_plan_help() -> PlanHelp {
             "`jj plan summary` always shows raw summary data (even if @ is not a plan).",
             "`jj status` shows the current plan stack with file paths.",
             "Plan files are `.jj-plan/NN-bookmark.md` — paths shown as `→` in stack output.",
+            "`jj describe -m` on a tracked plan is blocked; edit the plan file directly.",
             "`jj stack submit/sync/merge` — stacked PR operations.",
         ],
         docs: vec![

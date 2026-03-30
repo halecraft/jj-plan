@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_file;
@@ -5,20 +7,24 @@ use crate::stack_render::StackFormat;
 use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 
-/// Intercept `jj describe -m "..."` to write the message to the plan file first.
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/// Intercept `jj describe` (and `jj desc`) with plan-aware guard logic.
 ///
-/// When a user runs `jj describe -m "content"` in a plan-activated repo, we
-/// write the message to the plan file so it becomes the source of truth. Then
-/// we delegate to `wrap::wrap()` which runs the standard lifecycle:
-/// flush (picks up our file write) → command → sync → show.
+/// When `-m`/`--message` or `--stdin` targets a tracked plan, the command
+/// is **blocked** with an educational error — unless `--override-plan-protocol`
+/// is present. This prevents LLMs (and humans) from accidentally replacing
+/// a rich plan document with a one-liner.
 ///
-/// For editor-mode describe (no `-m`/`--message`), we pass through directly
-/// to `wrap::wrap()` — the editor flow doesn't conflict because sync will
-/// pick up whatever the user wrote via the editor.
+/// Editor-mode describe (no `-m`/`--stdin`) is always passed through to
+/// `wrap::wrap()` unguarded — the user can see the full content and make
+/// informed edits.
 ///
-/// `args` is the full original argument list starting with "describe",
+/// `args` is the full original argument list starting with "describe" or "desc",
 /// e.g. `["describe", "-m", "new content"]` or
-/// `["describe", "-r", "abc", "-m", "content"]`.
+/// `["desc", "-r", "abc", "-m", "content"]`.
 pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
@@ -27,61 +33,133 @@ pub fn handle_describe(
     registry: &PlanRegistry,
     format: StackFormat,
 ) -> crate::error::Result<i32> {
-    // 1. Parse describe args to find -m/--message values and -r/--revision target
+    // ── GATHER ──────────────────────────────────────────────────────────
     let parsed = parse_describe_args(args);
 
-    // If no -m/--message found, this is editor-mode → pass through to wrap
-    if parsed.messages.is_empty() {
-        return crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format);
-    }
-
-    // 2. Build the concatenated message (jj concatenates multiple -m with newlines)
-    let message = parsed.messages.join("\n");
-
-    // 3. Determine target change: -r/--revision value, or "@" if unspecified
+    // Resolve target revision → plan bookmark → plan file entry.
     let target = parsed.revision.as_deref().unwrap_or("@");
+    let bookmark_name = super::resolve_plan_bookmark_at(workspace, registry, target);
 
-    // 4. Resolve the target change ID, then find which bookmark points to it
-    let target_change_id = resolve_target_change_id(workspace, target);
-
-    // 5. Find the matching plan file by bookmark name and write the message to it.
-    //    Resolution chain: target revset → change ID → bookmark name → plan file.
-    if let Some(ref change_id) = target_change_id {
+    let plan_file_entry = bookmark_name.as_ref().and_then(|bm_name| {
         let plan_files = plan_file::collect_plan_files(&plan_dir.path, registry);
+        plan_files.into_iter().find(|e| &e.bookmark_name == bm_name)
+    });
 
-        // Find which bookmark points to the target change
-        let bookmark_name = resolve_bookmark_for_change(workspace, change_id);
+    let plan_file_path = plan_file_entry.as_ref().map(|e| e.path.as_path());
 
-        let entry = if let Some(ref bm_name) = bookmark_name {
-            // Match by bookmark name (the new model)
-            plan_files.iter().find(|e| &e.bookmark_name == bm_name)
-        } else {
-            // Fallback for legacy change-ID-named files: try prefix match
-            // against the raw filename content (everything between NN- and .md).
-            // This handles the migration period where old files still exist.
-            
-            plan_files.iter().find(|e| {
-                // The bookmark_name field may contain a decoded legacy change ID
-                change_id.starts_with(&e.bookmark_name)
-                    || e.bookmark_name.starts_with(change_id.as_str())
-            })
-        };
+    // ── PLAN ────────────────────────────────────────────────────────────
+    let action = plan_describe_action(&parsed, plan_file_path);
 
-        if let Some(entry) = entry {
-            // Write the message to the plan file — flush will pick this up
-            plan_file::write_or_warn(&entry.path, &message);
+    // ── EXECUTE ─────────────────────────────────────────────────────────
+    match action {
+        DescribeAction::EditorPassthrough => {
+            crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
         }
-        // If no plan file found, the change isn't in the current stack.
-        // Fall through to wrap which will run the describe normally.
-    }
-    // If we couldn't resolve the change ID (e.g. invalid revset), let
-    // wrap handle it — jj describe will produce its own error.
 
-    // 6. Pass through to wrap: flush → command → sync → show
-    // After flush, jj description matches the file. Then `jj describe -m "..."`
-    // sets the same content again (idempotent). Then sync reads jj and writes
-    // back to files. All consistent.
-    crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
+        DescribeAction::Allow => {
+            // Non-plan target with -m. If there's a plan file for the target,
+            // write the message to it (this path is for non-plan changes that
+            // still happen to have a plan file, which shouldn't happen — but
+            // Allow means plan_file_path was None, so this is just wrap).
+            crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
+        }
+
+        DescribeAction::AllowOverride { plan_file_path: pf_path } => {
+            // User explicitly wants to replace the plan. Write message to
+            // the plan file so flush picks it up, strip the override flag,
+            // then delegate to wrap.
+            let message = parsed.messages.join("\n");
+            plan_file::write_or_warn(&pf_path, &message);
+
+            let stripped: Vec<String> = strip_override_flag(args);
+            crate::wrap::wrap(plan_dir, jj, &stripped, workspace, registry, format)
+        }
+
+        DescribeAction::Block { plan_file_path: display_path } => {
+            let verb = if parsed.has_stdin { "--stdin" } else { "-m" };
+            eprintln!(
+                "jj-plan: blocked `jj describe {}` — this would replace the entire plan document.",
+                verb,
+            );
+            eprintln!();
+            eprintln!("The plan for this change is at: {}", display_path);
+            eprintln!("Edit it directly instead of using `jj describe {}`.", verb);
+            eprintln!();
+            eprintln!("To replace the full description anyway, add --override-plan-protocol.");
+            Ok(1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decision types
+// ---------------------------------------------------------------------------
+
+/// The action `handle_describe` should take after gathering data.
+#[derive(Debug, PartialEq)]
+enum DescribeAction {
+    /// Editor mode (no -m/--stdin). Pass through to wrap unchanged.
+    EditorPassthrough,
+    /// -m/--stdin targets a non-plan change. Delegate to wrap.
+    Allow,
+    /// -m/--stdin targets a tracked plan WITH `--override-plan-protocol`.
+    /// Write message to plan file, strip flag, then wrap.
+    AllowOverride { plan_file_path: PathBuf },
+    /// -m/--stdin targets a tracked plan WITHOUT override. Block with error.
+    Block { plan_file_path: String },
+}
+
+// ---------------------------------------------------------------------------
+// Pure decision function
+// ---------------------------------------------------------------------------
+
+/// Collapse the entire describe guard decision tree into one testable unit.
+///
+/// - `parsed`: parsed argument state (messages, stdin, override flag).
+/// - `plan_file_path`: `Some(path)` if the target resolves to a tracked plan
+///   file; `None` if the target is not a tracked plan.
+fn plan_describe_action(
+    parsed: &ParsedDescribeArgs,
+    plan_file_path: Option<&Path>,
+) -> DescribeAction {
+    let has_replacement = !parsed.messages.is_empty() || parsed.has_stdin;
+
+    if !has_replacement {
+        return DescribeAction::EditorPassthrough;
+    }
+
+    match plan_file_path {
+        None => DescribeAction::Allow,
+        Some(path) => {
+            if parsed.has_override {
+                DescribeAction::AllowOverride {
+                    plan_file_path: path.to_path_buf(),
+                }
+            } else {
+                // Build a relative display path: .jj-plan/NN-bookmark.md
+                let display = path
+                    .file_name()
+                    .map(|f| format!(".jj-plan/{}", f.to_string_lossy()))
+                    .unwrap_or_else(|| path.display().to_string());
+                DescribeAction::Block {
+                    plan_file_path: display,
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arg stripping
+// ---------------------------------------------------------------------------
+
+/// Remove `--override-plan-protocol` from the argument list so jj doesn't
+/// choke on the unknown flag.
+fn strip_override_flag(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|a| a.as_str() != "--override-plan-protocol")
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -92,33 +170,66 @@ pub fn handle_describe(
 struct ParsedDescribeArgs {
     /// All -m/--message values, in order.
     messages: Vec<String>,
-    /// The -r/--revision value, if any.
+    /// The -r/--revision value, if any (explicit flag or positional revset).
     revision: Option<String>,
+    /// Whether `--stdin` was present.
+    has_stdin: bool,
+    /// Whether `--override-plan-protocol` was present.
+    has_override: bool,
 }
 
-/// Parse `jj describe` arguments to extract -m/--message and -r/--revision.
+/// jj global options (long-form) that consume a following value argument.
+/// Used to avoid misidentifying their values as positional revsets.
+const GLOBAL_OPTIONS_WITH_VALUE: &[&str] = &[
+    "--repository",
+    "--at-operation",
+    "--at-op",
+    "--color",
+    "--config",
+    "--config-file",
+    "-R",
+];
+
+/// Parse `jj describe` arguments to extract relevant flags and positional
+/// revsets.
 ///
-/// Handles all common forms:
-/// - `-m VALUE` (separate args)
-/// - `-mVALUE` (joined short form)
-/// - `--message VALUE` (separate args)
-/// - `--message=VALUE` (equals form)
-/// - `-r VALUE` (separate args)
-/// - `-rVALUE` (joined short form)
-/// - `--revision VALUE` (separate args)
-/// - `--revision=VALUE` (equals form)
+/// Handles all common forms of `-m`, `--message`, `-r`, `--revision`,
+/// `--stdin`, `--override-plan-protocol`, and jj global options. Also
+/// collects positional (non-flag) arguments, using the first one as the
+/// revision target when no explicit `-r`/`--revision` is given.
 fn parse_describe_args(args: &[String]) -> ParsedDescribeArgs {
     let mut messages = Vec::new();
     let mut revision = None;
+    let mut has_stdin = false;
+    let mut has_override = false;
+    let mut positional_args: Vec<String> = Vec::new();
 
-    // Skip index 0 which is "describe"
+    // Skip index 0 which is "describe" or "desc"
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
 
-        // -- stops option parsing
+        // -- stops option parsing; remaining args are positional revsets
         if arg == "--" {
+            // Collect everything after -- as positional args
+            for j in (i + 1)..args.len() {
+                positional_args.push(args[j].clone());
+            }
             break;
+        }
+
+        // --override-plan-protocol
+        if arg == "--override-plan-protocol" {
+            has_override = true;
+            i += 1;
+            continue;
+        }
+
+        // --stdin
+        if arg == "--stdin" {
+            has_stdin = true;
+            i += 1;
+            continue;
         }
 
         // --message=VALUE
@@ -187,52 +298,61 @@ fn parse_describe_args(args: &[String]) -> ParsedDescribeArgs {
             continue;
         }
 
-        // Skip other flags/positional args (e.g. --no-edit, --stdin, etc.)
+        // jj global options that take a value: skip the option AND its value
+        // to avoid misidentifying the value as a positional revset.
+        // Handle =VALUE joined forms first (single token, no skip needed).
+        if arg.starts_with("--") {
+            let is_global_with_eq = GLOBAL_OPTIONS_WITH_VALUE.iter().any(|opt| {
+                opt.starts_with("--") && arg.starts_with(&format!("{}=", opt))
+            });
+            if is_global_with_eq {
+                i += 1;
+                continue;
+            }
+
+            let is_global_separate = GLOBAL_OPTIONS_WITH_VALUE.contains(&arg.as_str());
+            if is_global_separate {
+                // Skip the option and its value
+                i += 2;
+                continue;
+            }
+        }
+
+        // -R VALUE (short form of --repository)
+        if arg == "-R" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("-R") && !arg.starts_with("--") {
+            // -RVALUE: joined form, single token
+            i += 1;
+            continue;
+        }
+
+        // Any other flag (starts with -) — skip it (e.g. --no-edit, --editor,
+        // --ignore-working-copy, --debug, --quiet, --no-pager, etc.)
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        // Non-flag argument: this is a positional revset
+        positional_args.push(arg.clone());
         i += 1;
     }
 
-    ParsedDescribeArgs { messages, revision }
-}
-
-// ---------------------------------------------------------------------------
-// Change ID and bookmark resolution
-// ---------------------------------------------------------------------------
-
-/// Resolve a revision specifier to a change ID using the loaded repo.
-fn resolve_target_change_id(workspace: &Workspace, target: &str) -> Option<String> {
-    workspace.resolve_change_id(target)
-}
-
-/// Find the bookmark name that points to a given change ID.
-///
-/// Searches `workspace.local_bookmarks()` for a bookmark whose change_id
-/// matches the given short change ID (prefix match in either direction,
-/// since the workspace stores full hex and we have a short reverse-hex).
-///
-/// Returns `None` if no bookmark points to this change (unbookmarked commit).
-fn resolve_bookmark_for_change(workspace: &Workspace, short_change_id: &str) -> Option<String> {
-    // We need to match the short reverse-hex change_id against the full-hex
-    // change_ids in the bookmark list. The simplest approach: resolve the
-    // short ID to a full commit via the workspace, then match.
-    //
-    // Actually, the workspace's local_bookmarks() returns Bookmark structs
-    // with full hex change_ids. We have a short reverse-hex ID. To compare,
-    // we'd need to convert. Instead, use the workspace to resolve each
-    // bookmark's change_id to short form and compare.
-    //
-    // Simpler: just check if any bookmark resolves to the same short ID
-    // by asking the workspace to resolve the bookmark name as a revset.
-    let bookmarks = workspace.local_bookmarks();
-    for bm in &bookmarks {
-        if let Some(bm_short) = workspace.resolve_change_id(&bm.change_id)
-            && (bm_short == short_change_id
-                || short_change_id.starts_with(&bm_short)
-                || bm_short.starts_with(short_change_id))
-            {
-                return Some(bm.name.clone());
-            }
+    // Positional fallback: if no explicit -r/--revision, use the first
+    // positional arg as the revision target.
+    if revision.is_none() {
+        revision = positional_args.into_iter().next();
     }
-    None
+
+    ParsedDescribeArgs {
+        messages,
+        revision,
+        has_stdin,
+        has_override,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +378,8 @@ mod tests {
         let parsed = parse_describe_args(&a);
         assert!(parsed.messages.is_empty());
         assert!(parsed.revision.is_none());
+        assert!(!parsed.has_stdin);
+        assert!(!parsed.has_override);
     }
 
     #[test]
@@ -379,5 +501,257 @@ mod tests {
         let parsed = parse_describe_args(&a);
         let target = parsed.revision.as_deref().unwrap_or("@");
         assert_eq!(target, "mychange");
+    }
+
+    // -----------------------------------------------------------------------
+    // New: --stdin and --override-plan-protocol detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_detects_stdin_flag() {
+        let a = args(&["describe", "--stdin"]);
+        let parsed = parse_describe_args(&a);
+        assert!(parsed.has_stdin);
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_detects_override_flag() {
+        let a = args(&["describe", "-m", "msg", "--override-plan-protocol"]);
+        let parsed = parse_describe_args(&a);
+        assert!(parsed.has_override);
+        assert_eq!(parsed.messages, vec!["msg"]);
+    }
+
+    #[test]
+    fn test_parse_stdin_and_override_together() {
+        let a = args(&["describe", "--stdin", "--override-plan-protocol"]);
+        let parsed = parse_describe_args(&a);
+        assert!(parsed.has_stdin);
+        assert!(parsed.has_override);
+    }
+
+    // -----------------------------------------------------------------------
+    // New: positional REVSETS
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_positional_revset() {
+        let a = args(&["describe", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+        assert_eq!(parsed.messages, vec!["msg"]);
+    }
+
+    #[test]
+    fn test_parse_positional_revset_does_not_override_explicit_r() {
+        let a = args(&["describe", "-r", "explicit", "positional", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("explicit"));
+    }
+
+    #[test]
+    fn test_parse_positional_skips_global_option_values() {
+        let a = args(&["describe", "--color", "always", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_positional_skips_global_equals_form() {
+        let a = args(&["describe", "--color=always", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_positional_after_double_dash() {
+        // Positional after -- should still be collected
+        let a = args(&["describe", "--", "mychange"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_positional_with_repository_global() {
+        let a = args(&["describe", "--repository", "/some/path", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_positional_with_short_r_separate() {
+        let a = args(&["describe", "-R", "/some/path", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_positional_with_short_r_joined() {
+        let a = args(&["describe", "-R/some/path", "mychange", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.revision.as_deref(), Some("mychange"));
+    }
+
+    #[test]
+    fn test_parse_desc_alias_at_index_zero() {
+        // "desc" at args[0] should be skipped just like "describe"
+        let a = args(&["desc", "-m", "msg"]);
+        let parsed = parse_describe_args(&a);
+        assert_eq!(parsed.messages, vec!["msg"]);
+        assert!(parsed.revision.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_override_flag tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_strip_override_flag() {
+        let a = args(&["describe", "-m", "msg", "--override-plan-protocol", "-r", "abc"]);
+        let stripped = strip_override_flag(&a);
+        assert_eq!(
+            stripped,
+            args(&["describe", "-m", "msg", "-r", "abc"])
+        );
+    }
+
+    #[test]
+    fn test_strip_override_flag_not_present() {
+        let a = args(&["describe", "-m", "msg"]);
+        let stripped = strip_override_flag(&a);
+        assert_eq!(stripped, a);
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_describe_action tests
+    // -----------------------------------------------------------------------
+
+    fn parsed_with_message() -> ParsedDescribeArgs {
+        ParsedDescribeArgs {
+            messages: vec!["some message".to_string()],
+            revision: None,
+            has_stdin: false,
+            has_override: false,
+        }
+    }
+
+    fn parsed_with_message_and_override() -> ParsedDescribeArgs {
+        ParsedDescribeArgs {
+            messages: vec!["some message".to_string()],
+            revision: None,
+            has_stdin: false,
+            has_override: true,
+        }
+    }
+
+    fn parsed_no_message() -> ParsedDescribeArgs {
+        ParsedDescribeArgs {
+            messages: vec![],
+            revision: None,
+            has_stdin: false,
+            has_override: false,
+        }
+    }
+
+    fn parsed_with_stdin() -> ParsedDescribeArgs {
+        ParsedDescribeArgs {
+            messages: vec![],
+            revision: None,
+            has_stdin: true,
+            has_override: false,
+        }
+    }
+
+    #[test]
+    fn test_action_blocks_message_on_tracked_plan() {
+        let path = Path::new("/repo/.jj-plan/02-fix-workspace-passthrough.md");
+        let action = plan_describe_action(&parsed_with_message(), Some(path));
+        match action {
+            DescribeAction::Block { plan_file_path } => {
+                assert!(plan_file_path.contains("02-fix-workspace-passthrough.md"));
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_action_allows_message_with_override() {
+        let path = Path::new("/repo/.jj-plan/02-fix-workspace-passthrough.md");
+        let action = plan_describe_action(&parsed_with_message_and_override(), Some(path));
+        match action {
+            DescribeAction::AllowOverride { plan_file_path } => {
+                assert_eq!(plan_file_path, path);
+            }
+            other => panic!("expected AllowOverride, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_action_allows_message_on_untracked() {
+        let action = plan_describe_action(&parsed_with_message(), None);
+        assert_eq!(action, DescribeAction::Allow);
+    }
+
+    #[test]
+    fn test_action_editor_passthrough() {
+        let path = Path::new("/repo/.jj-plan/01-my-plan.md");
+        let action = plan_describe_action(&parsed_no_message(), Some(path));
+        assert_eq!(action, DescribeAction::EditorPassthrough);
+    }
+
+    #[test]
+    fn test_action_editor_passthrough_no_plan() {
+        let action = plan_describe_action(&parsed_no_message(), None);
+        assert_eq!(action, DescribeAction::EditorPassthrough);
+    }
+
+    #[test]
+    fn test_action_stdin_blocked_on_tracked_plan() {
+        let path = Path::new("/repo/.jj-plan/01-my-plan.md");
+        let action = plan_describe_action(&parsed_with_stdin(), Some(path));
+        match action {
+            DescribeAction::Block { plan_file_path } => {
+                assert!(plan_file_path.contains("01-my-plan.md"));
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_action_stdin_allowed_on_untracked() {
+        let action = plan_describe_action(&parsed_with_stdin(), None);
+        assert_eq!(action, DescribeAction::Allow);
+    }
+
+    #[test]
+    fn test_action_stdin_with_override_allows() {
+        let path = Path::new("/repo/.jj-plan/01-my-plan.md");
+        let parsed = ParsedDescribeArgs {
+            messages: vec![],
+            revision: None,
+            has_stdin: true,
+            has_override: true,
+        };
+        let action = plan_describe_action(&parsed, Some(path));
+        match action {
+            DescribeAction::AllowOverride { plan_file_path } => {
+                assert_eq!(plan_file_path, path);
+            }
+            other => panic!("expected AllowOverride, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_display_path_is_relative() {
+        // The display path in Block should be .jj-plan/filename, not the absolute path
+        let path = Path::new("/some/deep/repo/.jj-plan/03-guard-describe-m.md");
+        let action = plan_describe_action(&parsed_with_message(), Some(path));
+        match action {
+            DescribeAction::Block { plan_file_path } => {
+                assert_eq!(plan_file_path, ".jj-plan/03-guard-describe-m.md");
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
     }
 }
