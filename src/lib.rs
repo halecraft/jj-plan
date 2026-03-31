@@ -8,6 +8,7 @@
 
 pub mod auth;
 pub mod commands;
+pub mod dispatch;
 #[macro_use]
 mod debug;
 pub mod error;

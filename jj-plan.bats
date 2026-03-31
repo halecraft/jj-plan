@@ -1396,6 +1396,106 @@ Details here.
   [[ "$output" != *"Stack"* ]]
 }
 
+@test "jj --no-pager log remains a pure passthrough" {
+  run jj --no-pager log -r @ -T description --no-graph
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"Plan stack ("* ]]
+}
+
+@test "jj --color never log remains a pure passthrough" {
+  run jj --color never log -r @ -T description --no-graph
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"Plan stack ("* ]]
+}
+
+@test "jj --no-pager describe -m is still blocked on tracked plans" {
+  jj plan new step-1 >/dev/null 2>&1
+
+  run jj --no-pager describe -m "replacement"
+  [[ "$status" -eq 1 ]]
+  [[ "$output" == *'blocked `jj describe -m`'* ]]
+}
+
+@test "jj -R target-repo --no-pager log remains a pure passthrough from outside cwd" {
+  local OUTSIDE
+  OUTSIDE="$(mktemp -d)"
+  cd "$OUTSIDE"
+
+  run jj -R "$TEST_REPO" --no-pager log -r @ -T description --no-graph
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"Plan stack ("* ]]
+}
+
+@test "jj -R target-repo --no-pager describe -m works on an untracked current change" {
+  jj new >/dev/null 2>&1
+
+  local OUTSIDE
+  OUTSIDE="$(mktemp -d)"
+  cd "$OUTSIDE"
+
+  run jj -R "$TEST_REPO" --no-pager describe -m "untracked replacement"
+  [[ "$status" -eq 0 ]]
+
+  local desc
+  desc=$("$REAL_JJ" -R "$TEST_REPO" log -r @ -T description --no-graph)
+  [[ "$desc" == "untracked replacement" ]]
+}
+
+@test "jj -R target-repo --no-pager describe --override-plan-protocol preserves other globals" {
+  jj plan new step-1 >/dev/null 2>&1
+
+  local OUTSIDE
+  OUTSIDE="$(mktemp -d)"
+  cd "$OUTSIDE"
+
+  run jj -R "$TEST_REPO" --no-pager describe --override-plan-protocol -m "override replacement"
+  [[ "$status" -eq 0 ]]
+
+  local desc
+  desc=$("$REAL_JJ" -R "$TEST_REPO" log -r @ -T description --no-graph)
+  [[ "$desc" == "override replacement" ]]
+}
+
+@test "jj -R target-repo plan summary uses the target repo from outside cwd" {
+  cat > "$TEST_REPO/.jj-plan/01-start.md" <<'EOF'
+feat: cross-repo summary
+
+> [!plan]
+> status: 🟡
+
+# Background
+
+Some context.
+
+# 🟡 Phase 1: Setup
+
+## Tasks
+
+- 🔴 Check cross-repo summary
+EOF
+  jj status >/dev/null 2>&1
+
+  local OUTSIDE
+  OUTSIDE="$(mktemp -d)"
+  cd "$OUTSIDE"
+
+  run jj -R "$TEST_REPO" plan summary
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Outline:"* ]]
+  [[ "$output" == *"Phase 1"* ]]
+}
+
+@test "jj -R invalid-path defers to real jj for the error" {
+  local OUTSIDE
+  OUTSIDE="$(mktemp -d)"
+  cd "$OUTSIDE"
+
+  run jj -R /tmp/definitely-not-a-jj-repo log -r @ --no-graph
+  [[ "$status" -ne 0 ]]
+  [[ "$output" == *'There is no jj repo in "/tmp/definitely-not-a-jj-repo"'* ]]
+  [[ "$output" != *"jj-plan is not activated in this repository."* ]]
+}
+
 # =============================================================================
 # jj plan next / prev
 # =============================================================================

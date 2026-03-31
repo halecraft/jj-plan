@@ -226,48 +226,99 @@ After every mutating command (via `wrap()`), `auto_cleanup_merged_stacks()` scan
 
 ## Command Dispatch (`src/main.rs`)
 
+Dispatch now begins with a **shell-boundary classification step** instead of assuming `args[0]` is the subcommand.
+
+`classify_args(args)` in `src/dispatch.rs` is the authoritative pure parser for leading jj global options. It returns a `ParsedInvocation` containing:
+
+- `command_index`: where the real subcommand starts in the original argv
+- `command`: the canonical subcommand name after built-in alias normalization
+- `leading_color`: any leading `--color` override
+- `repository_override`: any leading `-R` / `--repository` value
+
+Built-in aliases are normalized here (`st` → `status`, `b` → `bookmark`, `desc` → `describe`, `op` → `operation`, `evolution-log` → `evolog`). Downstream dispatch tables use canonical command names only.
+
+At the shell boundary, `run()` derives two views from the original argv:
+
+- `full_args = args` — the exact original argv, preserved for subprocess forwarding to the real `jj`
+- `cmd_args = &args[command_index..]` — a command-rooted slice for handlers that parse assuming index 0 is the subcommand
+
+This two-slice contract is important because some handlers do both:
+- `dispatch_plan()` and `dispatch_stack()` only need `cmd_args`
+- `wrap::wrap()` only needs `full_args`
+- `commands::describe::handle_describe()` needs **both**: it parses from `cmd_args`, but delegates to `wrap()` with `full_args` so leading globals are preserved
+
+The other shell-boundary derivation is **repo context**. If `ParsedInvocation.repository_override` is present, jj-plan interprets it relative to `cwd` when needed and uses it as the starting path for repo discovery. `find_repo_root_from(start)` in `src/plan_dir.rs` then walks ancestors from that starting path, reusing the same `.jj/` discovery logic as the cwd-based path. This keeps jj-plan's own repo/activation/workspace logic aligned with the repo the real `jj` subprocess will operate on.
+
+If an explicit `-R` / `--repository` value is invalid or cannot be resolved into a jj repo, jj-plan does **not** invent its own error. It passthroughs unchanged to the real `jj` binary and lets jj emit the authoritative user-facing error.
+
+The effective dispatch flow is now:
+
 ```
-args[0] match:
-  "plan"      → commands::dispatch_plan()
-  "stack"     → commands::stack_cmd::dispatch_stack()
-  "abandon"   → commands::abandon::run_abandon()
-  "describe"  → commands::describe::handle_describe()
-  "workspace" → subcommand routing (see below)
-  read-only?  → exec(jj, args)     // zero overhead
-  other       → wrap::wrap()        // flush → run → reload → sync → show
+classify_args(args)
+  ↓
+derive:
+  full_args = args
+  cmd_args  = &args[command_index..]
+  repo_start = repository_override.unwrap_or(cwd)
+  ↓
+plan --help?                  → commands::help::classify_invocation()
+no command / unknown / help?  → exec(jj, full_args)
+readonly command?             → exec(jj, full_args)
+workspace readonly subcommand?→ exec(jj, full_args)
+plan                          → commands::dispatch_plan(..., cmd_args, ...)
+stack                         → commands::stack_cmd::dispatch_stack(..., cmd_args, ...)
+describe                      → commands::describe::handle_describe(..., full_args, cmd_args, ...)
+other                         → wrap::wrap(..., full_args, ...)
 ```
 
-`dispatch_plan` routes to subcommands: `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, `config`. The `summary` subcommand is read-only (no flush, no sync) — it reads from the workspace and jj subprocess, formats output, and prints to stdout.
+There are two top-level dispatch categories:
 
-Bare `jj plan` (no subcommand) shows **contextual orientation**:
-- If `@` is a tracked plan → shows full summary (same as `jj plan summary`).
-- If `@` is NOT a tracked plan → shows an orientation message with next steps. If plans exist in the current stack, lists them with navigation hints (`jj plan go`, `jj plan next/prev`). If no plans exist, hints `jj plan new`.
-- `jj plan summary` (explicit) always shows the raw summary regardless of `@`'s state — it's a data tool, not an orientation tool.
+1. **Exec passthrough** — zero-overhead `exec()` of the real `jj` binary
+2. **Full wrap** — `flush → run → reload → sync → show`
 
-The `resolve_plan_bookmark_at(workspace, registry, target)` helper (in `commands/mod.rs`) resolves whether a given revision has a tracked plan bookmark. Used by both `dispatch_plan` (orientation check) and `summary::run_summary` (bookmark resolution).
+`status` is a deliberate subset of the second category. Although it is read-only in jj, jj-plan treats it as a **coherence command**: users and LLMs run `jj status` frequently, so it is the natural seam where direct `.jj-plan/` file edits are flushed to jj descriptions and then re-synced. This is why `status` is intentionally excluded from `READONLY_COMMANDS` and listed in `COHERENCE_COMMANDS`.
 
-Before dispatch:
-1. Resolve the real jj binary.
-2. Check for `plan --help` early.
-3. Find repo root and plan directory. **`plan` and `stack` are jj-plan-only commands** — if no plan directory exists, they show an activation message instead of falling through to real jj (which would give "unrecognized subcommand"). All other commands (`abandon`, `describe`, `new`, `edit`, etc.) are real jj commands and passthrough normally.
-4. Open `Workspace` via jj-lib. If loading fails, degrade to passthrough.
+`dispatch_plan` still routes to subcommands `new`, `track`, `untrack`, `done`, `summary`, `next`, `prev`, `go`, and `config`. The important change is that it now receives `cmd_args`, so `args[0]` is always `"plan"` even when leading globals were present in the original argv.
+
+Bare `jj plan` (no subcommand) still shows **contextual orientation**:
+- If `@` is a tracked plan → shows full summary (same as `jj plan summary`)
+- If `@` is NOT a tracked plan → shows an orientation message with next steps. If plans exist in the current stack, lists them with navigation hints (`jj plan go`, `jj plan next/prev`). If no plans exist, hints `jj plan new`
+- `jj plan summary` (explicit) always shows the raw summary regardless of `@`'s state — it's a data tool, not an orientation tool
+
+The `resolve_plan_bookmark_at(workspace, registry, target)` helper (in `commands/mod.rs`) still resolves whether a given revision has a tracked plan bookmark. It is used by both `dispatch_plan` (orientation check) and `summary::run_summary` (bookmark resolution).
+
+Before dispatch, `run()` now does this work in order:
+
+1. Resolve the real jj binary
+2. Check for top-level `plan --help` early
+3. Classify the invocation (`classify_args`)
+4. Derive repo context from `cwd` or `repository_override`
+5. Resolve repo root and plan directory against that repo context
+6. Open `Workspace` via jj-lib against that same repo root
+7. Dispatch using canonical command names and the `full_args` / `cmd_args` split
+
+`plan` and `stack` remain jj-plan-only commands. If the resolved target repo has no activated plan directory, they show the activation message instead of falling through to real jj.
+
+There is no longer a special `abandon` dispatch path. `abandon` now falls through to the default wrapped-command lifecycle like any other mutating jj command.
 
 ### `workspace` subcommand routing
 
-`workspace` is **not** in `READONLY_COMMANDS` because `workspace update-stale` is a mutating command that can snapshot the working copy, create recovery commits, and change `@`. If it bypassed the wrap lifecycle, flush would never run before the command and sync would never run after — the next wrapped command could see a diverged workspace state and `plan_sync`'s `None` arm would delete all plan files.
+`workspace` is still **not** in `READONLY_COMMANDS` because `workspace update-stale` is a mutating command that can snapshot the working copy, create recovery commits, and change `@`. If it bypassed the wrap lifecycle, flush would never run before the command and sync would never run after — the next wrapped command could see a diverged workspace state and `plan_sync`'s `None` arm would delete all plan files.
 
-Routing uses a conservative classification via `is_workspace_readonly(args)`:
+Routing still uses `is_workspace_readonly(args)`, but it now receives `cmd_args`, so `args[0]` is guaranteed to be `"workspace"` even when the original invocation had leading globals.
 
-- **Read-only** (`workspace list`, `workspace root`): exec passthrough (zero overhead). Matched by checking if any element in `args[1..]` is in `WORKSPACE_READONLY_SUBS`.
-- **Bare `workspace`** (no subcommand, shows help): exec passthrough (`args.len() <= 1`).
-- **Everything else** (`workspace update-stale`, `workspace add`, `workspace forget`, `workspace rename`, `workspace --help`): falls through to `wrap::wrap()` for flush → run → reload → sync → show.
+- **Read-only** (`workspace list`, `workspace root`): exec passthrough (zero overhead). Matched by checking whether any element in `args[1..]` is in `WORKSPACE_READONLY_SUBS`
+- **Bare `workspace`** (no subcommand, shows help): exec passthrough (`args.len() <= 1`)
+- **Everything else** (`workspace update-stale`, `workspace add`, `workspace forget`, `workspace rename`, `workspace --help`): falls through to `wrap::wrap()` for flush → run → reload → sync → show
 
-Unknown future workspace subcommands conservatively route through wrap, which is always safe — the only cost is flush/sync overhead, negligible for one-off workspace operations.
+Unknown future workspace subcommands still conservatively route through wrap, which is always safe — the only cost is flush/sync overhead.
 
 ### `jj stack` dispatch
 
+`dispatch_stack()` also now receives `cmd_args`, so its existing parsing contract remains stable: `args[0]` is `"stack"` and `args[1..]` contains stack-level flags and subcommands.
+
 ```
-args[1] match:
+cmd_args[1] match:
   None        → show_stack_visualization()
   "--help"    → print_stack_help()
   "submit"    → run_submit()         // tokio block_on

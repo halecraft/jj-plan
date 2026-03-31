@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::dispatch::GLOBAL_OPTIONS_WITH_VALUE;
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::PlanDir;
 use crate::plan_file;
@@ -22,19 +23,23 @@ use crate::workspace::Workspace;
 /// `wrap::wrap()` unguarded — the user can see the full content and make
 /// informed edits.
 ///
-/// `args` is the full original argument list starting with "describe" or "desc",
-/// e.g. `["describe", "-m", "new content"]` or
+/// `full_args` is the full original argument list, including any leading jj
+/// global options such as `--no-pager` or `-R`.
+///
+/// `cmd_args` is the command-rooted slice starting with `"describe"` or
+/// `"desc"`, e.g. `["describe", "-m", "new content"]` or
 /// `["desc", "-r", "abc", "-m", "content"]`.
 pub fn handle_describe(
     jj: &JjBinary,
     plan_dir: &PlanDir,
-    args: &[String],
+    full_args: &[String],
+    cmd_args: &[String],
     workspace: &mut Workspace,
     registry: &PlanRegistry,
     format: StackFormat,
 ) -> crate::error::Result<i32> {
     // ── GATHER ──────────────────────────────────────────────────────────
-    let parsed = parse_describe_args(args);
+    let parsed = parse_describe_args(cmd_args);
 
     // Resolve target revision → plan bookmark → plan file entry.
     let target = parsed.revision.as_deref().unwrap_or("@");
@@ -53,7 +58,7 @@ pub fn handle_describe(
     // ── EXECUTE ─────────────────────────────────────────────────────────
     match action {
         DescribeAction::EditorPassthrough => {
-            crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
+            crate::wrap::wrap(plan_dir, jj, full_args, workspace, registry, format)
         }
 
         DescribeAction::Allow => {
@@ -61,7 +66,7 @@ pub fn handle_describe(
             // write the message to it (this path is for non-plan changes that
             // still happen to have a plan file, which shouldn't happen — but
             // Allow means plan_file_path was None, so this is just wrap).
-            crate::wrap::wrap(plan_dir, jj, args, workspace, registry, format)
+            crate::wrap::wrap(plan_dir, jj, full_args, workspace, registry, format)
         }
 
         DescribeAction::AllowOverride { plan_file_path: pf_path } => {
@@ -71,7 +76,7 @@ pub fn handle_describe(
             let message = parsed.messages.join("\n");
             plan_file::write_or_warn(&pf_path, &message);
 
-            let stripped: Vec<String> = strip_override_flag(args);
+            let stripped: Vec<String> = strip_override_flag(full_args);
             crate::wrap::wrap(plan_dir, jj, &stripped, workspace, registry, format)
         }
 
@@ -177,18 +182,6 @@ struct ParsedDescribeArgs {
     /// Whether `--override-plan-protocol` was present.
     has_override: bool,
 }
-
-/// jj global options (long-form) that consume a following value argument.
-/// Used to avoid misidentifying their values as positional revsets.
-const GLOBAL_OPTIONS_WITH_VALUE: &[&str] = &[
-    "--repository",
-    "--at-operation",
-    "--at-op",
-    "--color",
-    "--config",
-    "--config-file",
-    "-R",
-];
 
 /// Parse `jj describe` arguments to extract relevant flags and positional
 /// revsets.

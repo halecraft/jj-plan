@@ -1,15 +1,18 @@
+use std::path::PathBuf;
+
+use jj_plan::commands;
+use jj_plan::dispatch::classify_args;
 use jj_plan::error::JjPlanError;
 use jj_plan::jj_binary::JjBinary;
-use jj_plan::plan_dir::{find_repo_root, resolve_plan_dir, resolved_stack_format};
+use jj_plan::plan_dir::{find_repo_root_from, resolve_plan_dir, resolved_stack_format};
 use jj_plan::plan_registry::load_registry;
 use jj_plan::workspace;
-use jj_plan::commands;
 use jj_plan::wrap;
 
 /// Read-only commands that get zero-overhead passthrough via exec.
-/// Note: status/st are NOT here — they get special handling to append stack summary.
-/// Note: "workspace" is NOT here — subcommand routing is handled separately
-/// because `workspace update-stale` is mutating (can change `@`).
+///
+/// These are canonical command names only. Built-in jj aliases such as `st`,
+/// `b`, `desc`, and `op` are normalized by `classify_args()` before dispatch.
 const READONLY_COMMANDS: &[&str] = &[
     "log",
     "diff",
@@ -22,17 +25,29 @@ const READONLY_COMMANDS: &[&str] = &[
     "version",
     "root",
     "tag",
-    "op",
     "operation",
     "util",
     "git",
     "gerrit",
     "sign",
     "unsign",
+    "bookmark",
 ];
+
+/// Commands that are read-only in jj but intentionally go through the full
+/// wrap lifecycle in jj-plan.
+///
+/// `status` is the coherence seam: users and LLMs run it frequently, so we
+/// intentionally flush direct `.jj-plan/` edits to jj descriptions before
+/// showing status, then resync afterward.
+const COHERENCE_COMMANDS: &[&str] = &["status"];
 
 fn is_readonly_command(cmd: &str) -> bool {
     READONLY_COMMANDS.contains(&cmd)
+}
+
+fn is_coherence_command(cmd: &str) -> bool {
+    COHERENCE_COMMANDS.contains(&cmd)
 }
 
 /// Workspace subcommands that are read-only and safe for exec passthrough.
@@ -55,6 +70,22 @@ fn is_workspace_readonly(args: &[String]) -> bool {
     // If any arg after "workspace" is a known read-only subcommand → passthrough.
     // Scanning all args handles flags before the subcommand (e.g. `workspace --color always list`).
     args[1..].iter().any(|a| WORKSPACE_READONLY_SUBS.contains(&a.as_str()))
+}
+
+fn resolve_repo_start_path(repository_override: Option<&str>) -> Option<PathBuf> {
+    match repository_override {
+        Some(path) => {
+            let override_path = PathBuf::from(path);
+            if override_path.is_absolute() {
+                Some(override_path)
+            } else {
+                std::env::current_dir()
+                    .ok()
+                    .map(|cwd| cwd.join(override_path))
+            }
+        }
+        None => std::env::current_dir().ok(),
+    }
 }
 
 fn main() {
@@ -92,37 +123,57 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
         return Ok(0);
     }
 
-    // No args or read-only command → zero-overhead passthrough via exec
-    if args.is_empty() || is_readonly_command(&args[0]) {
-        jj.exec_strings(args)?;
+    let invocation = classify_args(args);
+    let subcommand = match invocation.command.as_deref() {
+        Some(command) => command,
+        None => {
+            jj.exec_strings(args)?;
+            unreachable!("exec replaces the process");
+        }
+    };
+
+    let full_args = args;
+    let cmd_args = &args[invocation.command_index..];
+
+    // Read-only commands go straight to the real jj binary. Coherence
+    // commands are intentionally excluded from this fast path.
+    if !is_coherence_command(subcommand) && is_readonly_command(subcommand) {
+        jj.exec_strings(full_args)?;
         unreachable!("exec replaces the process");
     }
 
     // Workspace subcommand routing: read-only subs (list, root) get exec
     // passthrough; mutating subs (update-stale, add, forget, rename) fall
     // through to wrap::wrap() for flush/sync.
-    if args[0] == "workspace" && is_workspace_readonly(args) {
-        jj.exec_strings(args)?;
+    if subcommand == "workspace" && is_workspace_readonly(cmd_args) {
+        jj.exec_strings(full_args)?;
         unreachable!("exec replaces the process");
     }
 
-    let subcommand = &args[0];
-
-    // Resolve repo root — if not in a repo, passthrough
-    let repo_root = match find_repo_root() {
-        Some(root) => root,
+    let repo_start = match resolve_repo_start_path(invocation.repository_override.as_deref()) {
+        Some(path) => path,
         None => {
-            jj.exec_strings(args)?;
-            unreachable!();
+            jj.exec_strings(full_args)?;
+            unreachable!("exec replaces the process");
         }
     };
 
-    // Resolve plan directory — if not activated, passthrough
+    // Resolve repo root — if not in a repo (or the explicit -R target is not
+    // a repo), passthrough and let the real jj binary report the error.
+    let repo_root = match find_repo_root_from(&repo_start) {
+        Some(root) => root,
+        None => {
+            jj.exec_strings(full_args)?;
+            unreachable!("exec replaces the process");
+        }
+    };
+
+    // Resolve plan directory — if not activated, passthrough except for
+    // jj-plan-only commands (`plan`, `stack`), which get an activation message.
     let plan_dir = match resolve_plan_dir(Some(&repo_root)) {
         Some(pd) => pd,
         None => {
-            // plan and stack are jj-plan-only commands — intercept before passthrough
-            if matches!(subcommand.as_str(), "plan" | "stack") {
+            if matches!(subcommand, "plan" | "stack") {
                 eprintln!("jj-plan is not activated in this repository.");
                 eprintln!();
                 eprintln!("To activate:");
@@ -130,9 +181,8 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
                 eprintln!("  mkdir .jj-plan");
                 return Ok(1);
             }
-            // All other commands: passthrough to real jj
-            jj.exec_strings(args)?;
-            unreachable!();
+            jj.exec_strings(full_args)?;
+            unreachable!("exec replaces the process");
         }
     };
 
@@ -143,8 +193,8 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
         Some(w) => w,
         None => {
             eprintln!("jj-plan: warning: could not load repository via jj-lib, running without plan sync");
-            jj.exec_strings(args)?;
-            unreachable!();
+            jj.exec_strings(full_args)?;
+            unreachable!("exec replaces the process");
         }
     };
 
@@ -157,26 +207,44 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
 
     // Special handling for "plan" subcommand
     if subcommand == "plan" {
-        return commands::dispatch_plan(jj, &plan_dir, &repo_root, args, &mut workspace, &registry, format);
+        return commands::dispatch_plan(
+            jj,
+            &plan_dir,
+            &repo_root,
+            cmd_args,
+            &mut workspace,
+            &registry,
+            format,
+        );
     }
 
     // Special handling for "stack" subcommand (PR operations)
     if subcommand == "stack" {
-        return commands::stack_cmd::dispatch_stack(jj, &plan_dir, args, &mut workspace, &registry, format);
+        return commands::stack_cmd::dispatch_stack(
+            jj,
+            &plan_dir,
+            cmd_args,
+            &mut workspace,
+            &registry,
+            format,
+        );
     }
 
-    // Special handling for "abandon" — recover stack bookmark if lost
-    if subcommand == "abandon" {
-        return commands::abandon::run_abandon(jj, &plan_dir, args, &mut workspace, &registry, format);
-    }
-
-    // Special handling for "describe" (and its alias "desc") — intercept -m to write to plan file first
-    if matches!(subcommand.as_str(), "describe" | "desc") {
-        return commands::describe::handle_describe(jj, &plan_dir, args, &mut workspace, &registry, format);
+    // Special handling for "describe" — intercept -m to write to plan file first
+    if subcommand == "describe" {
+        return commands::describe::handle_describe(
+            jj,
+            &plan_dir,
+            full_args,
+            cmd_args,
+            &mut workspace,
+            &registry,
+            format,
+        );
     }
 
     // All other commands: wrap lifecycle (flush → command → reload → sync → show)
-    wrap::wrap(&plan_dir, jj, args, &mut workspace, &registry, format)
+    wrap::wrap(&plan_dir, jj, full_args, &mut workspace, &registry, format)
 }
 
 #[cfg(test)]
@@ -249,9 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn desc_alias_matches_describe_dispatch() {
-        // Both "describe" and "desc" should match the dispatch condition
-        assert!(matches!("describe", "describe" | "desc"));
-        assert!(matches!("desc", "describe" | "desc"));
+    fn status_is_a_coherence_command() {
+        assert!(is_coherence_command("status"));
+        assert!(!is_coherence_command("log"));
+    }
+
+    #[test]
+    fn bookmark_is_in_readonly_commands() {
+        assert!(is_readonly_command("bookmark"));
+        assert!(!is_readonly_command("status"));
     }
 }

@@ -1,5 +1,6 @@
 use std::io::{self, IsTerminal};
 
+use crate::dispatch::classify_args;
 use crate::jj_binary::JjBinary;
 
 /// When to colorize help output.
@@ -134,22 +135,24 @@ fn configured_default_color_mode() -> ColorWhen {
 /// - `plan --help --color always`
 /// - `--color=never plan -h`
 pub fn classify_invocation(args: &[String]) -> InvocationKind {
-    let (leading_color, command_index) = match scan_leading_globals(args) {
-        Some(result) => result,
-        None => return InvocationKind::Other,
-    };
+    let invocation = classify_args(args);
 
-    let Some(command) = args.get(command_index) else {
-        return InvocationKind::Other;
-    };
-
-    if command != "plan" {
+    if invocation.command.as_deref() != Some("plan") {
         return InvocationKind::Other;
     }
 
-    let mut color_override = leading_color;
+    let mut color_override = match invocation.leading_color.as_deref() {
+        Some(value) => {
+            let Some(parsed) = ColorWhen::parse(value) else {
+                return InvocationKind::Other;
+            };
+            Some(parsed)
+        }
+        None => None,
+    };
+
     let mut saw_help = false;
-    let mut idx = command_index + 1;
+    let mut idx = invocation.command_index + 1;
 
     while idx < args.len() {
         let arg = args[idx].as_str();
@@ -372,56 +375,7 @@ pub fn render_plan_help(help: &PlanHelp, color: ColorWhen) -> String {
 // Pure parsing helpers
 // ---------------------------------------------------------------------------
 
-fn scan_leading_globals(args: &[String]) -> Option<(Option<ColorWhen>, usize)> {
-    let mut idx = 0;
-    let mut color_override = None;
 
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-
-        match arg {
-            "--color" => {
-                let value = args.get(idx + 1)?;
-                let parsed = ColorWhen::parse(value)?;
-                color_override = Some(parsed);
-                idx += 2;
-            }
-            "-R" | "--repository" | "--at-operation" | "--at-op" => {
-                if idx + 1 >= args.len() {
-                    return None;
-                }
-                idx += 2;
-            }
-            "--ignore-working-copy"
-            | "--ignore-immutable"
-            | "--debug"
-            | "--quiet"
-            | "--no-pager" => {
-                idx += 1;
-            }
-            _ if arg.starts_with("--color=") => {
-                let (parsed, consumed) = parse_color_flag(args, idx)?;
-                color_override = Some(parsed);
-                idx += consumed;
-            }
-            _ if arg.starts_with("--repository=")
-                || arg.starts_with("--at-operation=")
-                || arg.starts_with("--at-op=") =>
-            {
-                idx += 1;
-            }
-            _ if arg.starts_with('-') => {
-                // Unknown leading option — don't try to reclassify.
-                return None;
-            }
-            _ => {
-                return Some((color_override, idx));
-            }
-        }
-    }
-
-    Some((color_override, idx))
-}
 
 fn parse_color_flag(args: &[String], idx: usize) -> Option<(ColorWhen, usize)> {
     let arg = args.get(idx)?.as_str();

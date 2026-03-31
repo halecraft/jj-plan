@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::stack_render::StackFormat;
 
-/// Discover the jj repo root by walking up from `cwd` looking for `.jj/`.
+/// Discover the jj repo root by walking up from an arbitrary starting path
+/// looking for `.jj/`.
 ///
 /// This replaces the `jj root` subprocess call (~15ms) with a pure
 /// filesystem walk (~0ms). Mirrors the logic in jj's own CLI:
@@ -10,11 +11,18 @@ use crate::stack_render::StackFormat;
 ///
 /// Returns `Some(path)` where `path` is the directory containing `.jj/`,
 /// or `None` if no `.jj/` directory is found in any ancestor.
-pub fn find_repo_root() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    cwd.ancestors()
+pub fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
         .find(|path| path.join(".jj").is_dir())
         .map(|p| p.to_path_buf())
+}
+
+/// Discover the jj repo root by walking up from the current working
+/// directory looking for `.jj/`.
+pub fn find_repo_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    find_repo_root_from(&cwd)
 }
 
 /// How the plan directory was resolved.
