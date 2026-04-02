@@ -418,6 +418,7 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
     let publish = has_flag(args, "--publish");
     let update_descriptions = has_flag(args, "--update-descriptions");
     let no_comments = has_flag(args, "--no-comments");
+    let continue_on_error = has_flag(args, "--continue-on-error");
     let allow_gaps = has_flag(args, "--allow-gaps");
     let remote_override = get_option(args, "--remote");
     let target_bookmark = first_positional(args);
@@ -508,7 +509,7 @@ fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistr
         })?;
 
     rt.block_on(async {
-        run_submit_async(workspace, &repo_root, registry, &target, remote_override, dry_run, draft, update_descriptions, publish, no_comments).await
+        run_submit_async(workspace, &repo_root, registry, &target, remote_override, dry_run, draft, update_descriptions, publish, no_comments, continue_on_error).await
     })
 }
 
@@ -524,6 +525,7 @@ async fn run_submit_async(
     update_descriptions: bool,
     publish: bool,
     no_comments: bool,
+    continue_on_error: bool,
 ) -> Result<i32> {
     let ctx = StackContext::new(workspace, repo_root, remote_override, registry).await?;
 
@@ -631,7 +633,8 @@ async fn run_submit_async(
         &CliProgress
     };
 
-    let result = execute_submission(&plan, workspace, ctx.platform.as_ref(), &mut pr_cache, progress, dry_run).await?;
+    let abort_on_error = !continue_on_error;
+    let result = execute_submission(&plan, workspace, ctx.platform.as_ref(), &mut pr_cache, progress, dry_run, abort_on_error).await?;
 
     // Save PR cache if we made changes
     if !dry_run && (!result.created.is_empty() || !result.updated.is_empty())
@@ -700,6 +703,7 @@ async fn run_submit_async(
                     &mut pr_cache,
                     progress,
                     dry_run,
+                    false, // comments are independent — don't abort on error
                 )
                 .await?,
             )
@@ -820,7 +824,7 @@ async fn run_sync_async(
 
     let target = narrowed.last().unwrap().bookmark.name.clone();
 
-    run_submit_async(workspace, repo_root, registry, &target, remote_override, dry_run, false, false, false, false).await
+    run_submit_async(workspace, repo_root, registry, &target, remote_override, dry_run, false, false, false, false, false).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,6 +1243,7 @@ fn print_submit_help() {
     eprintln!("  --publish               Convert existing draft PRs to ready-for-review");
     eprintln!("  --update-descriptions   Push current plan content to existing PR titles/bodies");
     eprintln!("  --no-comments           Skip adding/updating stack navigation comments");
+    eprintln!("  --continue-on-error     Don't abort on first failure (default: abort)");
     eprintln!("  --allow-gaps            Allow unbookmarked changes between bookmarks");
     eprintln!("  --remote <remote>       Specify the remote to push to (default: origin)");
     eprintln!("  --help, -h              Show this help message");
@@ -1246,6 +1251,7 @@ fn print_submit_help() {
     eprintln!("Notes:");
     eprintln!("  --draft and --publish are mutually exclusive.");
     eprintln!("  Stack comments are added by default for multi-PR stacks.");
+    eprintln!("  Execution aborts on first failure by default (stacked PRs are dependent).");
 }
 
 fn print_sync_help() {

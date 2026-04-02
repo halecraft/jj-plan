@@ -917,6 +917,14 @@ Need JWT and API key support
   [[ "$output" == *"no supported remotes"* ]] || [[ "$output" == *"authentication"* ]] || [[ "$output" == *"remote"* ]]
 }
 
+@test "jj stack submit --continue-on-error is accepted" {
+  run jj stack submit --continue-on-error
+  # Should fail for remote/auth reasons, NOT for unknown flag
+  [[ "$status" -ne 0 ]]
+  [[ "$output" == *"no supported remotes"* ]] || [[ "$output" == *"authentication"* ]] || [[ "$output" == *"remote"* ]]
+  [[ "$output" != *"unknown"* ]]
+}
+
 @test "jj stack sync without remote fails gracefully" {
   run jj stack sync
   [[ "$status" -ne 0 ]]

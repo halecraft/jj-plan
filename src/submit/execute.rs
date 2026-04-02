@@ -2,6 +2,12 @@
 //!
 //! Pushes bookmarks, creates/updates PRs, updates descriptions,
 //! publishes drafts, and adds stack comments.
+//!
+//! By default, execution aborts on the first error (`abort_on_error = true`).
+//! In a stacked PR model each bookmark depends on the one below it, so a
+//! mid-stack failure makes downstream steps nonsensical. Pass
+//! `abort_on_error = false` (via `--continue-on-error`) to collect all
+//! errors without stopping — useful for independent steps like comments.
 
 use crate::error::Result;
 use crate::platform::PlatformService;
@@ -24,6 +30,11 @@ pub struct SubmissionResult {
 }
 
 /// Execute the submission plan.
+///
+/// When `abort_on_error` is `true` (the default for stacked submit),
+/// execution stops at the first failure and reports how many steps were
+/// skipped. When `false`, all steps are attempted regardless of earlier
+/// failures (useful for independent operations like stack comments).
 pub async fn execute_submission(
     plan: &SubmissionPlan,
     workspace: &mut Workspace,
@@ -31,6 +42,7 @@ pub async fn execute_submission(
     pr_cache: &mut PrCache,
     progress: &dyn ProgressCallback,
     dry_run: bool,
+    abort_on_error: bool,
 ) -> Result<SubmissionResult> {
     let mut result = SubmissionResult::default();
 
@@ -117,8 +129,9 @@ pub async fn execute_submission(
 
     // Track whether we've emitted the AddingComments phase header yet.
     let mut in_comment_phase = false;
+    let total_steps = plan.steps.len();
 
-    for step in &plan.steps {
+    for (step_index, step) in plan.steps.iter().enumerate() {
         match step {
             ExecutionStep::Push { bookmark } => {
                 progress
@@ -293,6 +306,19 @@ pub async fn execute_submission(
                     }
                 }
             }
+        }
+
+        // Abort early if a step failed and abort_on_error is active.
+        if abort_on_error && !result.errors.is_empty() {
+            let remaining = total_steps - step_index - 1;
+            if remaining > 0 {
+                progress
+                    .on_error(&format!(
+                        "Aborting — {remaining} remaining step(s) skipped"
+                    ))
+                    .await?;
+            }
+            break;
         }
     }
 

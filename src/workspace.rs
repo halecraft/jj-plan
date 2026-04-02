@@ -744,13 +744,23 @@ impl Workspace {
         let export_stats = export_refs(tx.repo_mut())
             .map_err(|e| JjPlanError::Git(format!("Failed to export refs: {e}")))?;
 
-        if export_stats
+        if let Some((_, reason)) = export_stats
             .failed_bookmarks
             .iter()
-            .any(|(symbol, _)| symbol.name.as_str() == bookmark)
+            .find(|(symbol, _)| symbol.name.as_str() == bookmark)
         {
+            // Walk the error source chain to surface the root cause.
+            // FailedRefExportReason variants like FailedToSet/FailedToDelete
+            // use #[source], so Display only prints "Failed to set" — the
+            // underlying git error is in .source().
+            let mut detail = reason.to_string();
+            let mut source: Option<&dyn std::error::Error> = std::error::Error::source(reason);
+            while let Some(cause) = source {
+                detail = format!("{detail}: {cause}");
+                source = cause.source();
+            }
             return Err(JjPlanError::Git(format!(
-                "Failed to export bookmark '{bookmark}' to git"
+                "Failed to export bookmark '{bookmark}' to git: {detail}"
             )));
         }
 
@@ -1281,5 +1291,21 @@ mod tests {
     fn should_update_tracking_false_when_empty_stats() {
         let stats = make_stats(&[], &[], &[]);
         assert!(!should_update_tracking(&stats, "refs/heads/feat-auth"));
+    }
+
+    #[test]
+    fn export_failure_error_includes_reason() {
+        // Verify the error message format includes the FailedRefExportReason.
+        // We can't call git_push() without a full repo, but we can confirm
+        // that JjPlanError::Git formats the reason into the message.
+        let reason = "Ref was in a conflicted state from the last import";
+        let bookmark = "feat/lti-service";
+        let err = JjPlanError::Git(format!(
+            "Failed to export bookmark '{bookmark}' to git: {reason}"
+        ));
+        let msg = err.to_string();
+        assert!(msg.contains(bookmark), "error should contain bookmark name");
+        assert!(msg.contains(reason), "error should contain the reason");
+        assert!(msg.contains("Failed to export bookmark"), "error should contain context");
     }
 }

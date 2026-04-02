@@ -673,6 +673,10 @@ For each segment in the chain:
 
 **Pre-push fetch.** Before executing the plan, `run_submit_async` collects all bookmark names from `Push` steps and calls `workspace.git_fetch_bookmarks(remote, &bookmarks)`. This refreshes the local remote-tracking refs so that `git_push`'s `--force-with-lease` check uses up-to-date expectations. Fetch failure is non-fatal (logged as a warning) — the push may still succeed if tracking state happens to be correct.
 
+**Abort-on-error (default).** `execute_submission` accepts an `abort_on_error: bool` parameter. When `true` (the default for `jj stack submit` and `jj stack sync`), execution stops at the first step failure and reports how many remaining steps were skipped. This prevents cascading failures in stacked PRs — a mid-stack push failure would otherwise cause nonsensical downstream CreatePr errors (branch doesn't exist on remote) and leave GitHub in an inconsistent state. Pass `--continue-on-error` on the CLI to override this and attempt all steps regardless of failures. Pass 2 (stack comments) uses `abort_on_error = false` since comment steps are independent.
+
+**Export failure diagnostics.** When `git_push()` encounters a bookmark that fails `export_refs`, the error message includes the `FailedRefExportReason` from jj-lib (e.g., `"Failed to export bookmark 'feat/X' to git: Ref was in a conflicted state from the last import"`). This surfaces the specific variant (`ConflictedOldState`, `AddedInJjAddedInGit`, `InvalidGitName`, etc.) instead of a generic message.
+
 Processes steps sequentially:
 - `Push`: `workspace.git_push(bookmark, remote)` — returns `PushOutcome`. On `Rejected` or `RemoteRejected`, the error is reported via `PushStatus::Failed` with an actionable message (e.g., "try `jj git fetch` to refresh tracking state") and added to `result.errors`. The tracking ref is not corrupted.
 - `CreatePr`: `platform.create_pr_with_options(...)`
