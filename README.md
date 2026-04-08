@@ -67,8 +67,11 @@ jj plan done
 # Sync with remote (fetch + re-submit)
 jj stack sync
 
-# Merge approved PRs from the bottom of the stack
-jj stack merge
+# Merge approved PRs and rebase the stack
+jj stack merge                 # merge one PR, rebase+push the rest, stop
+jj stack merge --wait          # merge, rebase, wait for CI, repeat
+# After each merge: fetches trunk, rebases remaining stack, pushes, retargets
+# Re-run after CI passes to merge the next PR (or use --wait)
 
 # Test platform authentication
 jj stack auth github test     # GitHub (via gh CLI or GITHUB_TOKEN)

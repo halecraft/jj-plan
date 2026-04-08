@@ -515,10 +515,11 @@ jj stack sync --remote upstream
 
 ### `jj stack merge`
 
-Merge PRs from the bottom of the stack upward with just-in-time readiness assessment.
+Merge the next ready PR at the bottom of the stack, then prepare the rest of the stack for the following merge.
 
 ```
-jj stack merge                 # merge all ready PRs
+jj stack merge                 # merge one ready PR, rebase stack, stop
+jj stack merge --wait          # merge one, wait for CI, repeat until done
 jj stack merge --dry-run       # preview the merge plan
 jj stack merge --remote upstream
 ```
@@ -526,20 +527,27 @@ jj stack merge --remote upstream
 **What it does:**
 
 1. Looks up PR numbers for all bookmarks in the stack (from PR cache or by searching the forge).
-2. Creates a merge plan: the *intended* sequence of Merge + RetargetBase steps for all PRs, bottom-to-top.
+2. Creates a merge plan: the *intended* sequence of merges for all PRs, bottom-to-top.
 3. Previews the plan (e.g., `• Merge #1 (feat-auth)`, `→ Retarget #2 base → main`, `• Merge #2 (feat-session)`).
-4. Executes the plan with **just-in-time readiness polling**:
-   - Before each merge step, calls `check_merge_readiness` and classifies the result:
+4. Performs **just-in-time readiness polling** on the bottom-most unmerged PR:
+   - Calls `check_merge_readiness` and classifies the result:
      - **Ready** — proceed to merge.
-     - **Transient** — only `mergeable == false` with no other blockers (the forge is likely still recomputing after a retarget or preceding merge). Polls at 1-second intervals for up to 15 seconds.
+     - **Transient** — only `mergeable == false` with no other blockers (the forge is likely still recomputing after a retarget or preceding merge). Polls at 1-second intervals for up to 15 attempts.
      - **Blocked** — real blockers exist (draft, changes requested, CI failure). Stops execution immediately.
-   - After merging a PR, retargets the next PR's base to trunk so it becomes independently mergeable.
-5. Post-merge cleanup:
-   - Removes merged bookmarks from the PR cache.
-   - Unregisters merged bookmarks from the plan registry.
-   - Deletes merged local bookmarks.
-   - Removes merged plan files from `.jj-plan/`.
-   - Fetches the updated trunk.
+5. Merges the PR (`MergeMethod::Squash` is currently hardcoded; a `--method` flag is out of scope for now).
+6. Post-merge cleanup for the merged PR:
+   - Removes the merged bookmark from the PR cache.
+   - Unregisters the merged bookmark from the plan registry.
+   - Deletes the merged local bookmark.
+   - Removes the merged plan file from `.jj-plan/`.
+7. Between-merge lifecycle (prepares the stack for the next merge):
+   1. **Fetch updated trunk** — selective fetch of the default branch only.
+   2. **Rebase remaining stack** onto the updated trunk.
+   3. **Force-push all remaining bookmarks** so their PRs reflect the rebased commits.
+   4. **Retarget the next PR's base to trunk** so it becomes independently mergeable.
+8. **Stops.** The user re-runs `jj stack merge` after CI passes on the next PR.
+
+With `--wait`, step 8 is replaced by a polling loop: the command waits at 30-second intervals for the next PR to become ready, then repeats from step 4. There is no hard timeout — press Ctrl-C to abort. This is useful for running in a background terminal tab while you work on something else.
 
 **Merge readiness requirements:**
 
@@ -561,6 +569,7 @@ A PR is ready to merge when:
 | Flag | Description |
 |---|---|
 | `--dry-run` | Preview the merge plan without merging (readiness is checked at execution time) |
+| `--wait` | After each merge, poll CI at 30-second intervals and continue merging when the next PR is ready (no hard timeout; Ctrl-C to abort) |
 | `--remote <name>` | Specify the remote |
 
 ---
@@ -893,11 +902,11 @@ jj stack sync                      # fetch first, then re-submit
 ### Merge approved PRs and rebase the stack
 
 ```sh
-jj stack merge                     # merges from the bottom of the stack
-# Automatically: deletes merged bookmarks, fetches trunk, cleans plan files
+jj stack merge                     # merge one PR, rebase+push the rest, stop
+jj stack merge --wait              # merge, rebase, wait for CI, repeat
+# After each merge: fetches trunk, rebases remaining stack, pushes, retargets
+# Re-run after CI passes to merge the next PR (or use --wait)
 ```
-
-The merge engine polls readiness just-in-time before each merge, handling async forge recomputation after retargets automatically.
 
 ### Work with draft PRs
 

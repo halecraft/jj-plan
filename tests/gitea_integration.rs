@@ -18,7 +18,7 @@ use std::env;
 use reqwest::Client;
 use serde::Deserialize;
 
-use jj_plan::merge::{create_merge_plan, execute_merge, MergeCandidate, MergeStep};
+use jj_plan::merge::{create_merge_plan, poll_readiness, MergeCandidate, MergeStep, PollConfig, ReadinessOutcome};
 use jj_plan::platform::GiteaService;
 use jj_plan::platform::PlatformService;
 use jj_plan::types::{MergeMethod, Platform, PlatformConfig, PrState};
@@ -440,13 +440,13 @@ async fn test_service_config() {
     assert_eq!(config.host.as_deref(), Some(host.as_str()));
 }
 
-/// 3-PR stack merge using the merge engine (create_merge_plan + execute_merge).
+/// 3-PR stack merge using the merge engine (create_merge_plan + poll_readiness + merge_pr).
 ///
 /// This exercises the same code path as `jj stack merge`:
 /// - Builds MergeCandidates (bookmark + PR number pairs)
-/// - Calls `create_merge_plan` to produce a plan with Merge + RetargetBase steps
-/// - Calls `execute_merge` to run the plan against the live Gitea API
-///   (the executor handles readiness polling just-in-time)
+/// - Calls `create_merge_plan` to produce a plan with Merge steps
+/// - For each step: calls `poll_readiness` then `merge_pr` + `update_pr_base`
+///   (matching the imperative loop in `run_merge_async`)
 /// - Verifies all 3 PRs end up merged into main
 #[tokio::test]
 async fn test_merge_engine_3_stack() {
@@ -492,29 +492,48 @@ async fn test_merge_engine_3_stack() {
         .iter()
         .map(|s| match s {
             MergeStep::Merge { .. } => "merge",
-            MergeStep::RetargetBase { .. } => "retarget",
         })
         .collect();
     assert_eq!(
         step_kinds,
-        vec!["merge", "retarget", "merge", "retarget", "merge"],
-        "expected Merge/Retarget/Merge/Retarget/Merge, got: {step_kinds:?}"
+        vec!["merge", "merge", "merge"],
+        "expected Merge/Merge/Merge, got: {step_kinds:?}"
     );
 
-    // ── Execute merge plan ───────────────────────────────────────────────
-    // The executor polls readiness just-in-time before each merge step,
-    // handling async forge recomputation after retargets automatically.
-    let result = execute_merge(&plan, &svc).await.expect("execute merge");
+    // ── Execute merge plan (imperative loop matching run_merge_async) ────
+    // For each Merge step: poll readiness, merge, then retarget the next PR.
+    let config = PollConfig::transient();
+    let mut merged_bookmarks: Vec<String> = Vec::new();
+
+    for (i, step) in plan.steps.iter().enumerate() {
+        let MergeStep::Merge { bookmark, pr_number, method } = step;
+
+        // Poll readiness just-in-time.
+        let outcome = poll_readiness(&svc, *pr_number, bookmark, &config)
+            .await
+            .expect("poll readiness");
+        assert!(
+            matches!(outcome, ReadinessOutcome::Ready),
+            "PR #{pr_number} ({bookmark}) should be ready, got: {outcome:?}"
+        );
+
+        // Merge via forge API.
+        let merge_result = svc.merge_pr(*pr_number, *method).await.expect("merge PR");
+        assert!(merge_result.merged, "PR #{pr_number} ({bookmark}) should have merged");
+        merged_bookmarks.push(bookmark.clone());
+
+        // Retarget next PR's base to trunk (if more remain).
+        if let Some(next) = candidates.get(i + 1) {
+            svc.update_pr_base(next.pr_number, "main")
+                .await
+                .expect("retarget next PR base");
+        }
+    }
 
     assert_eq!(
-        result.merged_bookmarks,
+        merged_bookmarks,
         vec!["branch-a", "branch-b", "branch-c"],
         "all 3 bookmarks should be merged"
-    );
-    assert!(
-        result.failed_bookmark.is_none(),
-        "no bookmark should have failed: {:?}",
-        result.error_message
     );
 
     // ── Verify all 3 PRs are merged ─────────────────────────────────────

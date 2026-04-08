@@ -831,7 +831,9 @@ impl Workspace {
     }
 
     /// Rebase a bookmark and its descendants onto trunk.
-    #[allow(dead_code)] // 50-line jj-lib rebase — needed for future post-merge cleanup flow.
+    ///
+    /// Used by `run_merge_async` to rebase the remaining stack onto updated
+    /// trunk between successive squash merges.
     pub fn rebase_bookmark_onto_trunk(
         &mut self,
         bookmark: &str,
@@ -873,6 +875,17 @@ impl Workspace {
 
         move_commits(tx.repo_mut(), &location, &options)
             .map_err(|e| JjPlanError::RebaseFailed(format!("Failed to rebase: {e}")))?;
+
+        // move_commits() records rewrites but does not rebase descendants.
+        // jj-lib 0.38 requires rebase_descendants() before tx.commit(),
+        // otherwise it panics with "Descendants have not been rebased".
+        if tx.repo().has_rewrites() {
+            tx.repo_mut()
+                .rebase_descendants()
+                .map_err(|e| {
+                    JjPlanError::RebaseFailed(format!("Failed to rebase descendants: {e}"))
+                })?;
+        }
 
         let new_repo = tx
             .commit(format!("rebase {bookmark} onto trunk"))

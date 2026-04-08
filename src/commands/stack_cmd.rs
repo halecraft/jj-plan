@@ -1,6 +1,6 @@
 use crate::error::{JjPlanError, Result};
 use crate::jj_binary::JjBinary;
-use crate::merge::{create_merge_plan, execute_merge, MergeCandidate, MergeStep};
+use crate::merge::{create_merge_plan, poll_readiness, MergeCandidate, PollConfig, ReadinessOutcome};
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
 use crate::pr_cache::save_pr_cache;
@@ -831,6 +831,20 @@ async fn run_sync_async(
 // jj stack merge
 // ---------------------------------------------------------------------------
 
+/// Format an error message with PR URL appended if available in cache.
+fn format_pr_error(
+    pr_cache: &crate::pr_cache::PrCache,
+    bookmark: &str,
+    pr_number: u64,
+    message: &str,
+) -> String {
+    let url = pr_cache.get(bookmark).map(|c| c.url.as_str());
+    match url {
+        Some(u) => format!("{message}\n  → {u}"),
+        None => format!("{message}\n  → PR #{pr_number}"),
+    }
+}
+
 fn run_merge(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
     if has_flag(args, "--help") || has_flag(args, "-h") {
         print_merge_help();
@@ -838,6 +852,7 @@ fn run_merge(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry
     }
 
     let dry_run = has_flag(args, "--dry-run");
+    let wait = has_flag(args, "--wait");
     let remote_override = get_option(args, "--remote");
 
     let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
@@ -850,7 +865,7 @@ fn run_merge(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry
         })?;
 
     rt.block_on(async {
-        run_merge_async(workspace, &repo_root, remote_override, dry_run, registry).await
+        run_merge_async(workspace, &repo_root, remote_override, dry_run, wait, registry).await
     })
 }
 
@@ -859,6 +874,7 @@ async fn run_merge_async(
     repo_root: &std::path::Path,
     remote_override: Option<&str>,
     dry_run: bool,
+    wait: bool,
     registry: &PlanRegistry,
 ) -> Result<i32> {
     let ctx = StackContext::new(workspace, repo_root, remote_override, registry).await?;
@@ -879,7 +895,7 @@ async fn run_merge_async(
     }
 
     // Look up PR numbers for each segment (from cache or find_existing_pr).
-    // No readiness assessment here — the executor handles that just-in-time.
+    // No readiness assessment here — readiness is checked just-in-time.
     let mut candidates = Vec::new();
     for seg in &narrowed {
         let bookmark = &seg.bookmark.name;
@@ -913,32 +929,47 @@ async fn run_merge_async(
         return Ok(0);
     }
 
-    // Create merge plan — produces the intended sequence without
-    // readiness assessment. The executor evaluates readiness just-in-time.
+    // Create merge plan (functional core — only Merge steps, no retarget).
     let merge_plan = create_merge_plan(
         &candidates,
         &ctx.default_branch,
         MergeMethod::Squash,
     );
 
-    // Print the intended plan.
+    // Print the intended plan — show only what will actually happen.
     eprintln!("Merge plan:");
-    for step in &merge_plan.steps {
-        match step {
-            MergeStep::Merge {
-                bookmark,
-                pr_number,
-                ..
-            } => {
-                eprintln!("  • Merge #{pr_number} ({bookmark})");
+    if wait {
+        // --wait: show the full plan since all merges will be attempted.
+        for (i, candidate) in candidates.iter().enumerate() {
+            if i == 0 {
+                eprintln!("  • Merge #{} ({})", candidate.pr_number, candidate.bookmark);
+            } else {
+                eprintln!(
+                    "  • Merge #{} ({}) [after CI passes]",
+                    candidate.pr_number, candidate.bookmark
+                );
             }
-            MergeStep::RetargetBase {
-                bookmark,
-                pr_number,
-                new_base,
-            } => {
-                eprintln!("    → Retarget #{pr_number} ({bookmark}) base → {new_base}");
+            if i + 1 < candidates.len() {
+                eprintln!(
+                    "    ↳ fetch trunk, rebase remaining stack, push, retarget #{} base → {}",
+                    candidates[i + 1].pr_number, ctx.default_branch
+                );
             }
+        }
+    } else {
+        // Default: show only the first merge + rebase step.
+        let first = &candidates[0];
+        eprintln!("  • Merge #{} ({})", first.pr_number, first.bookmark);
+        let remaining = candidates.len() - 1;
+        if remaining > 0 {
+            eprintln!(
+                "    ↳ fetch trunk, rebase {} remaining PR(s), push",
+                remaining
+            );
+            eprintln!(
+                "  ({} more PR(s) will be ready after CI passes — use --wait to continue automatically)",
+                remaining
+            );
         }
     }
 
@@ -949,65 +980,278 @@ async fn run_merge_async(
         return Ok(0);
     }
 
-    // Execute merges — readiness is assessed just-in-time before each step,
-    // with polling for transient forge states.
+    // ── Imperative merge loop ────────────────────────────────────────
+    //
+    // For each candidate:
+    //   1. Poll readiness (short-poll for transient mergeable status)
+    //   2. Merge via forge API
+    //   3. Cleanup (registry, cache, bookmark, plan files)
+    //   4. If more remain: fetch trunk → rebase → push → retarget → stop or wait
+    //
     eprintln!();
     eprintln!("Executing merges...");
-    let merge_result = execute_merge(&merge_plan, ctx.platform.as_ref()).await?;
 
-    if !merge_result.merged_bookmarks.is_empty() {
-        eprintln!(
-            "Merged {} PR(s): {}",
-            merge_result.merged_bookmarks.len(),
-            merge_result.merged_bookmarks.join(", ")
-        );
+    let mut pr_cache = ctx.pr_cache;
+    let mut registry_mut = crate::plan_registry::load_registry(repo_root);
+    let mut merged_count: usize = 0;
 
-        // Post-merge cleanup: registry + cache mutations first, then bookmark deletions.
-        // Plan file removal is handled by sync::sync() via the sync_to_disk call below.
-        let mut pr_cache = ctx.pr_cache;
-        let mut registry_mut = crate::plan_registry::load_registry(repo_root);
-        for bookmark in &merge_result.merged_bookmarks {
-            pr_cache.remove(bookmark);
-            registry_mut.untrack(bookmark);
-        }
-        crate::plan_registry::save_registry(repo_root, &registry_mut);
+    for (i, step) in merge_plan.steps.iter().enumerate() {
+        let crate::merge::MergeStep::Merge {
+            bookmark,
+            pr_number,
+            method,
+        } = step;
 
-        if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
-            eprintln!("Warning: failed to save PR cache: {e}");
-        }
-
-        // Delete local bookmarks (separate pass — avoids interleaving
-        // registry mutation with workspace mutation).
-        for bookmark in &merge_result.merged_bookmarks {
-            if let Err(e) = workspace.delete_bookmark(bookmark) {
-                eprintln!("Warning: failed to delete bookmark {bookmark}: {e}");
+        // ── 1. Poll readiness ────────────────────────────────────
+        let transient_config = PollConfig::transient();
+        match poll_readiness(ctx.platform.as_ref(), *pr_number, bookmark, &transient_config).await {
+            Ok(ReadinessOutcome::Ready) => {
+                // Proceed to merge.
+            }
+            Ok(ReadinessOutcome::Transient) => {
+                // Shouldn't happen (poll_readiness returns Ready after exhaustion),
+                // but attempt anyway.
+                eprintln!(
+                    "Warning: #{} ({}) still transient after polling, attempting merge",
+                    pr_number, bookmark
+                );
+            }
+            Ok(ReadinessOutcome::Blocked(reasons)) => {
+                let reason_str = reasons.join(", ");
+                let msg = format!("#{} ({}) blocked: {}", pr_number, bookmark, reason_str);
+                eprintln!(
+                    "  ✗ {}",
+                    format_pr_error(&pr_cache, bookmark, *pr_number, &msg)
+                );
+                return Ok(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: readiness check failed for #{} ({}): {}",
+                    pr_number, bookmark, e
+                );
+                // Continue anyway — the merge attempt is the definitive test.
             }
         }
 
-        // Fetch to get updated trunk
-        eprintln!("Fetching updated trunk...");
-        if let Err(e) = workspace.git_fetch(&ctx.remote_name) {
-            eprintln!("Warning: failed to fetch after merge: {e}");
-        } else {
-            workspace.reload();
+        // ── 2. Merge via forge API ───────────────────────────────
+        eprintln!("  Merging #{} ({})...", pr_number, bookmark);
+        match ctx.platform.merge_pr(*pr_number, *method).await {
+            Ok(merge_result) => {
+                if merge_result.merged {
+                    eprintln!("  ✓ #{} ({}) merged", pr_number, bookmark);
+                    merged_count += 1;
+                } else {
+                    let reason = merge_result.message.as_deref().unwrap_or("unknown error");
+                    let msg = format!("Failed to merge #{} ({}): {}", pr_number, bookmark, reason);
+                    eprintln!(
+                        "  ✗ {}",
+                        format_pr_error(&pr_cache, bookmark, *pr_number, &msg)
+                    );
+                    if reason.to_lowercase().contains("conflict")
+                        || reason.to_lowercase().contains("not mergeable")
+                    {
+                        eprintln!(
+                            "  The PR has merge conflicts. This is unexpected after rebase — check the PR on GitHub."
+                        );
+                    }
+                    return Ok(1);
+                }
+            }
+            Err(e) => {
+                let msg = format!("Failed to merge #{} ({}): {}", pr_number, bookmark, e);
+                eprintln!(
+                    "  ✗ {}",
+                    format_pr_error(&pr_cache, bookmark, *pr_number, &msg)
+                );
+                return Ok(1);
+            }
         }
 
-        // Sync plan files: removes orphaned plan files for the just-untracked
-        // bookmarks and updates stack.md. Without this, cleanup would be
-        // deferred to the next command's sync cycle.
+        // ── 3. Per-merge cleanup ─────────────────────────────────
+        pr_cache.remove(bookmark);
+        registry_mut.untrack(bookmark);
+        crate::plan_registry::save_registry(repo_root, &registry_mut);
+        if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
+            eprintln!("Warning: failed to save PR cache: {e}");
+        }
+        if let Err(e) = workspace.delete_bookmark(bookmark) {
+            eprintln!("Warning: failed to delete bookmark {bookmark}: {e}");
+        }
+
+        // ── 4. Between-merge lifecycle ───────────────────────────
+        let remaining = &candidates[i + 1..];
+        if remaining.is_empty() {
+            // Last merge — just sync plan files and we're done.
+            let plan_dir = crate::plan_dir::resolve_plan_dir(Some(repo_root));
+            if let Some(ref pd) = plan_dir {
+                let _ = crate::wrap::sync_to_disk(pd, workspace, &registry_mut);
+            }
+            break;
+        }
+
+        // 4a. Fetch updated trunk (selective — only the default branch).
+        eprintln!("  Fetching updated trunk...");
+        if let Err(e) =
+            workspace.git_fetch_bookmarks(&ctx.remote_name, &[&ctx.default_branch])
+        {
+            eprintln!("Warning: failed to fetch trunk: {e}");
+            // Continue anyway — rebase will use whatever trunk we have.
+        }
+
+        // 4b. Rebase remaining stack onto new trunk.
+        let next_bookmark = &remaining[0].bookmark;
+        eprintln!("  Rebasing remaining stack onto trunk...");
+        if let Err(_e) = workspace.rebase_bookmark_onto_trunk(next_bookmark) {
+            let msg = format!(
+                "Rebase conflict: could not rebase {} onto trunk. Resolve manually with 'jj rebase' and re-push.",
+                next_bookmark
+            );
+            eprintln!(
+                "  ✗ {}",
+                format_pr_error(&pr_cache, next_bookmark, remaining[0].pr_number, &msg)
+            );
+            // Sync plan files before returning so the merged PR is cleaned up.
+            let plan_dir = crate::plan_dir::resolve_plan_dir(Some(repo_root));
+            if let Some(ref pd) = plan_dir {
+                let _ = crate::wrap::sync_to_disk(pd, workspace, &registry_mut);
+            }
+            return Ok(1);
+        }
+
+        // 4c. Force-push all remaining bookmarks.
+        eprintln!("  Pushing rebased bookmarks...");
+        let mut push_failed = false;
+        for rem in remaining {
+            match workspace.git_push(&rem.bookmark, &ctx.remote_name) {
+                Ok(crate::workspace::PushOutcome::Success) => {
+                    eprintln!("    ✓ pushed {}", rem.bookmark);
+                }
+                Ok(crate::workspace::PushOutcome::Rejected { reason }) => {
+                    let msg = format!(
+                        "Force-push rejected for {}: {}. Try 'jj git fetch' to refresh tracking state.",
+                        rem.bookmark, reason
+                    );
+                    eprintln!(
+                        "    ✗ {}",
+                        format_pr_error(&pr_cache, &rem.bookmark, rem.pr_number, &msg)
+                    );
+                    push_failed = true;
+                    break;
+                }
+                Ok(crate::workspace::PushOutcome::RemoteRejected { reason }) => {
+                    let msg = format!(
+                        "Force-push rejected by remote for {}: {}",
+                        rem.bookmark, reason
+                    );
+                    eprintln!(
+                        "    ✗ {}",
+                        format_pr_error(&pr_cache, &rem.bookmark, rem.pr_number, &msg)
+                    );
+                    push_failed = true;
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("    ✗ Failed to push {}: {}", rem.bookmark, e);
+                    push_failed = true;
+                    break;
+                }
+            }
+        }
+
+        if push_failed {
+            // Sync plan files before returning.
+            let plan_dir = crate::plan_dir::resolve_plan_dir(Some(repo_root));
+            if let Some(ref pd) = plan_dir {
+                let _ = crate::wrap::sync_to_disk(pd, workspace, &registry_mut);
+            }
+            return Ok(1);
+        }
+
+        // 4d. Retarget next PR's base to trunk.
+        let next_pr = remaining[0].pr_number;
+        eprintln!(
+            "  Retargeting #{} ({}) base → {}",
+            next_pr, next_bookmark, ctx.default_branch
+        );
+        if let Err(e) = ctx.platform.update_pr_base(next_pr, &ctx.default_branch).await {
+            eprintln!(
+                "  Warning: failed to retarget #{} ({}): {}",
+                next_pr, next_bookmark, e
+            );
+            // Non-fatal — readiness polling will detect if the retarget didn't take.
+        }
+
+        // 4e. Sync plan files (clean up merged PR's plan file).
         let plan_dir = crate::plan_dir::resolve_plan_dir(Some(repo_root));
         if let Some(ref pd) = plan_dir {
             let _ = crate::wrap::sync_to_disk(pd, workspace, &registry_mut);
         }
+
+        // ── 5. Stop or wait ──────────────────────────────────────
+        if !wait {
+            eprintln!();
+            eprintln!(
+                "Merged {} PR(s). {} remaining PR(s) rebased and pushed.",
+                merged_count,
+                remaining.len()
+            );
+            eprintln!("Run 'jj stack merge' again after CI passes.");
+            return Ok(0);
+        }
+
+        // --wait: poll CI on the next PR before continuing.
+        eprintln!();
+        eprintln!(
+            "Waiting for CI on #{} ({})...",
+            next_pr, next_bookmark
+        );
+        let ci_config = PollConfig::ci_wait();
+        match poll_readiness(ctx.platform.as_ref(), next_pr, next_bookmark, &ci_config).await {
+            Ok(ReadinessOutcome::Ready) => {
+                eprintln!(
+                    "  ✓ #{} ({}) ready — continuing",
+                    next_pr, next_bookmark
+                );
+                // Continue to next iteration.
+            }
+            Ok(ReadinessOutcome::Transient) => {
+                // Shouldn't happen with unlimited attempts, but proceed anyway.
+                eprintln!(
+                    "  #{} ({}) still transient, attempting merge anyway",
+                    next_pr, next_bookmark
+                );
+            }
+            Ok(ReadinessOutcome::Blocked(reasons)) => {
+                let reason_str = reasons.join(", ");
+                let msg = format!(
+                    "#{} ({}) blocked after CI wait: {}",
+                    next_pr, next_bookmark, reason_str
+                );
+                eprintln!(
+                    "  ✗ {}",
+                    format_pr_error(&pr_cache, next_bookmark, next_pr, &msg)
+                );
+                eprintln!();
+                eprintln!(
+                    "Merged {} PR(s). Remaining PR(s) blocked.",
+                    merged_count
+                );
+                return Ok(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: CI poll failed for #{} ({}): {}",
+                    next_pr, next_bookmark, e
+                );
+                // Continue anyway — the merge attempt is the definitive test.
+            }
+        }
     }
 
-    if let Some(ref failed) = merge_result.failed_bookmark {
-        eprintln!(
-            "Failed to merge {}: {}",
-            failed,
-            merge_result.error_message.as_deref().unwrap_or("unknown error")
-        );
-        return Ok(1);
+    eprintln!();
+    if merged_count > 0 {
+        eprintln!("Merged {} PR(s). All done.", merged_count);
     }
 
     Ok(0)
@@ -1273,11 +1517,12 @@ fn print_merge_help() {
     eprintln!();
     eprintln!("Usage: jj stack merge [options]");
     eprintln!();
-    eprintln!("Merges PRs that are approved and passing CI, starting from the");
-    eprintln!("bottom of the stack. Stops at the first non-mergeable PR.");
+    eprintln!("Merges the first ready PR, then rebases and pushes the remaining");
+    eprintln!("stack onto updated trunk. Re-run after CI passes to merge the next.");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --dry-run           Preview the merge plan without merging");
+    eprintln!("  --wait              After merge+rebase, poll CI and continue merging");
     eprintln!("  --remote <remote>   Specify the remote (default: origin)");
     eprintln!("  --help, -h          Show this help message");
 }
@@ -1416,6 +1661,51 @@ mod tests {
         let a = args(&["stack", "--format"]);
         let parsed = parse_stack_dispatch_args(&a);
         assert!(parsed.format_override.is_none());
+    }
+
+    // -- merge tests ---------------------------------------------------------
+
+    #[test]
+    fn merge_flags_parsed_independently() {
+        let with_wait = args(&["stack", "merge", "--wait", "--dry-run"]);
+        assert!(has_flag(&with_wait, "--wait"));
+        assert!(has_flag(&with_wait, "--dry-run"));
+
+        let without_wait = args(&["stack", "merge", "--dry-run"]);
+        assert!(!has_flag(&without_wait, "--wait"));
+    }
+
+    #[test]
+    fn format_pr_error_includes_url_from_cache() {
+        use crate::pr_cache::PrCache;
+        use crate::types::PullRequest;
+
+        let mut cache = PrCache::new();
+        let pr = PullRequest {
+            number: 42,
+            title: "feat".to_string(),
+            head_ref: "feat-a".to_string(),
+            base_ref: "main".to_string(),
+            html_url: "https://github.com/org/repo/pull/42".to_string(),
+            node_id: None,
+            is_draft: false,
+        };
+        cache.upsert("feat-a", &pr, "origin");
+
+        let msg = format_pr_error(&cache, "feat-a", 42, "merge failed");
+        assert!(msg.contains("merge failed"), "original message preserved");
+        assert!(
+            msg.contains("https://github.com/org/repo/pull/42"),
+            "URL appended from cache"
+        );
+    }
+
+    #[test]
+    fn format_pr_error_falls_back_to_pr_number() {
+        let cache = crate::pr_cache::PrCache::new();
+        let msg = format_pr_error(&cache, "unknown-bookmark", 99, "something broke");
+        assert!(msg.contains("something broke"));
+        assert!(msg.contains("PR #99"), "falls back to PR number when no cache entry");
     }
 
     #[test]

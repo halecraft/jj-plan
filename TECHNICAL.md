@@ -726,44 +726,82 @@ Pass 2 is skipped for single-PR stacks (no navigation needed) or when `--no-comm
 
 ## Merge Engine (`src/merge/`)
 
-The merge engine follows the FC/IS (Functional Core / Imperative Shell) pattern:
-- **Planner** (pure function): produces the *intended* merge sequence.
-- **Executor** (imperative shell): owns timing, readiness polling, and failure handling.
+### Architecture
 
-This separation is critical because forges (Gitea, GitHub, GitLab) recompute PR mergeable status **asynchronously** after any graph-changing event (PR creation, base retarget, preceding merge). An upfront readiness snapshot goes stale as the executor mutates the graph. The executor therefore assesses readiness **just-in-time** before each merge step.
+The merge engine uses an FC/IS (Functional Core / Imperative Shell) split, but the boundary has shifted compared to earlier versions:
+
+| Layer | Location | Role |
+|---|---|---|
+| `plan.rs` | `src/merge/plan.rs` | Pure function — produces the intended merge sequence |
+| `execute.rs` | `src/merge/execute.rs` | Library of reusable async helpers (no imperative loop) |
+| `run_merge_async()` | `src/commands/stack_cmd.rs` | **Sole imperative shell** — drives the merge loop |
+
+`execute.rs` exports two helpers: `classify_readiness` (pure — maps a `MergeReadiness` to `Ready` / `Transient` / `Blocked`) and `poll_readiness` (parameterized async polling via `PollConfig`). It does **not** own a loop or orchestrate side-effects. The imperative merge loop lives entirely in `run_merge_async()` in `stack_cmd.rs`, which calls these helpers alongside workspace operations (fetch, rebase, push, retarget, cleanup).
+
+This separation is critical because forges (Gitea, GitHub, GitLab) recompute PR mergeable status **asynchronously** after any graph-changing event (PR creation, base retarget, preceding merge). An upfront readiness snapshot goes stale as the shell mutates the graph. The shell therefore assesses readiness **just-in-time** before each merge step.
 
 ### Merge planning (`plan.rs`)
 
-Pure function. Accepts `MergeCandidate` pairs (bookmark name + PR number) — no readiness data. Produces the intended sequence:
+Pure function. Unchanged interface. Accepts `MergeCandidate` pairs (bookmark name + PR number) — no readiness data. Produces the intended sequence:
 
 1. For each candidate (bottom of stack first), emit a `Merge` step.
-2. After each `Merge` step (except the last), emit a `RetargetBase` step for the next PR (retarget to trunk, since the merged branch no longer exists on the forge).
 
-The planner does **not** decide feasibility — that changes between planning and execution. There is no `Skip` step; the executor stops on hard blocks at runtime.
+The planner emits **only** `Merge` steps. The `RetargetBase` step was removed — the between-merge lifecycle (fetch → rebase → push → retarget) is an imperative concern owned by `run_merge_async`, not a declarative plan step.
 
-### Merge execution (`execute.rs`)
+The planner does **not** decide feasibility — that changes between planning and execution. There is no `Skip` step; the shell stops on hard blocks at runtime.
 
-Processes steps sequentially. Before each `Merge` step:
+### `PollConfig` and unified polling
 
-1. Calls `check_merge_readiness` (single-shot observation — no polling in the platform service itself).
-2. Classifies the result via `classify_readiness` into one of:
-   - **`Ready`** — proceed to merge.
-   - **`Transient`** — only `mergeable == false` with no other blockers (draft, approval, CI). Likely the forge is still recomputing. Polls at 1-second intervals for up to 15 attempts.
-   - **`Blocked`** — real blockers exist (draft, changes requested, CI failure). Stops execution immediately.
-3. If `Transient` polling exhausts retries, attempts the merge anyway (the forge's merge endpoint is the final arbiter).
+`poll_readiness` accepts a `PollConfig` that controls interval and retry count. Two presets replace the old hardcoded polling constants:
 
-Retarget failures are non-fatal (warning only) — the next `Merge` step's readiness poll detects if the retarget didn't take effect.
+| Preset | Interval | Max attempts | Use case |
+|---|---|---|---|
+| `PollConfig::transient()` | 1 s | 15 | Mergeable status recomputation after retarget or preceding merge |
+| `PollConfig::ci_wait()` | 30 s | unlimited | Waiting for CI after rebase + push (used with `--wait`) |
 
-All platform `check_merge_readiness` implementations are single-shot observations. Polling logic lives exclusively in the executor, making it generic across all forges.
+If `transient()` polling exhausts retries, the merge is attempted anyway — the forge's merge endpoint is the final arbiter.
 
-### Post-merge cleanup (in `stack_cmd.rs`)
+All platform `check_merge_readiness` implementations are single-shot observations. Polling logic lives exclusively in `poll_readiness`, making it generic across all forges.
 
-After successful merges, `run_merge_async` performs cleanup in two passes to avoid interleaving registry mutation with workspace mutation:
+### Merge execution (`run_merge_async` in `stack_cmd.rs`)
 
-1. **Registry + cache pass**: For each merged bookmark, `pr_cache.remove()` + `registry_mut.untrack()`. Save registry and cache once after the loop.
-2. **Bookmark deletion pass**: For each merged bookmark, `workspace.delete_bookmark()`.
-3. **Fetch**: `workspace.git_fetch()` to get updated trunk.
-4. **Sync**: `sync_to_disk()` to remove orphaned plan files — plan file cleanup is delegated to `sync::sync()` rather than done manually. This matches the pattern used by `auto_cleanup_merged_stacks`.
+`run_merge_async` drives the loop. For each merge candidate (bottom of stack first):
+
+1. **Readiness**: `poll_readiness(PollConfig::transient())` → classifies into `Ready` / `Transient` / `Blocked`.
+   - **`Ready`** — proceed.
+   - **`Transient`** — poll until ready or retries exhausted, then attempt anyway.
+   - **`Blocked`** — real blockers exist (draft, changes requested, CI failure). Stop immediately.
+2. **Merge**: `platform.merge_pr(number)`.
+3. **Per-merge cleanup** (immediate, not batched):
+   - `registry_mut.untrack(bookmark)` + save registry
+   - `pr_cache.remove(bookmark)` + save cache
+   - `workspace.delete_bookmark(bookmark)`
+   - `sync_to_disk()` to remove orphaned plan files
+4. **If more candidates remain**:
+   - `git_fetch_bookmarks(remote, &[default_branch])` — selective fetch (see below).
+   - `rebase_bookmark_onto_trunk(next_bookmark)` — rebase the next candidate onto updated trunk.
+   - `git_push()` each remaining bookmark.
+   - `platform.update_pr_base(next_number, default_branch)` — retarget the next PR to trunk.
+   - **Default**: stop and let the user re-run after CI passes on the rebased PR.
+   - **`--wait`**: `poll_readiness(PollConfig::ci_wait())` to wait for CI, then continue the loop.
+
+### Why `git_fetch_bookmarks` not `git_fetch`
+
+After a merge, the forge deletes the merged branch. A full `git_fetch` runs `import_refs()` on **all** remote refs, which can cause tracking ref conflicts for branches just deleted by the forge. Selective fetch for just the default branch (`git_fetch_bookmarks(remote, &[default_branch])`) avoids this — it only imports the ref we actually need (updated trunk), sidestepping conflicts from stale remote-tracking refs.
+
+### `rebase_bookmark_onto_trunk`
+
+Now actively used (was previously `#[allow(dead_code)]`). Uses `MoveCommitsTarget::Roots` to rebase the target commit and all its descendants onto updated trunk. This ensures the next candidate in the stack has a clean linear history relative to the just-merged trunk.
+
+### Post-merge cleanup
+
+Cleanup is **per-merge** instead of batched. Each merge gets immediate cleanup (registry untrack, cache remove, bookmark delete, plan file sync) before proceeding to the next candidate. This ensures that if the loop stops mid-way (due to a block or `--wait` exit), the already-merged PRs are fully cleaned up and plan files reflect reality.
+
+Plan file cleanup is delegated to `sync::sync()` via `sync_to_disk()` rather than done manually. This matches the pattern used by `auto_cleanup_merged_stacks`.
+
+### `execute_merge()` is deprecated
+
+The old `execute_merge()` function in `execute.rs` is marked `#[deprecated]` and `#[allow(dead_code)]`. It is **not** re-exported from `src/merge/mod.rs`. All merge orchestration now flows through `run_merge_async()` in `stack_cmd.rs`, which calls `classify_readiness` and `poll_readiness` directly.
 
 ---
 

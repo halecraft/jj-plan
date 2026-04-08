@@ -1,14 +1,13 @@
-//! Merge execution.
+//! Merge readiness helpers.
 //!
-//! The executor is the imperative shell of the merge engine. It owns timing,
-//! retries, and real-world failure modes. Before each `Merge` step it
-//! assesses readiness **just-in-time** via `poll_until_ready`, which
-//! distinguishes transient "forge still computing" states from real blockers.
+//! This module provides reusable async building blocks for merge readiness
+//! assessment. The imperative merge loop lives in `run_merge_async()`
+//! (`stack_cmd.rs`), which calls these helpers alongside workspace operations.
 //!
-//! This design ensures that readiness is always evaluated against the
-//! *current* forge state — not a stale snapshot taken before execution
-//! began. This is critical for stacked merges where each merge + retarget
-//! triggers async recomputation on the forge.
+//! - **Pure**: `classify_readiness()` — classifies a readiness snapshot.
+//! - **Async helper**: `poll_readiness()` — parameterized polling with `PollConfig`.
+
+use std::time::Duration;
 
 use crate::error::Result;
 use crate::platform::PlatformService;
@@ -16,7 +15,8 @@ use crate::types::MergeReadiness;
 
 use super::plan::{MergePlan, MergeStep};
 
-/// Result of merge execution.
+/// Result of merge execution (legacy batch API).
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct MergeExecutionResult {
     /// Bookmarks that were successfully merged.
@@ -43,9 +43,13 @@ pub enum ReadinessOutcome {
     Blocked(Vec<String>),
 }
 
+// ---------------------------------------------------------------------------
+// Pure classification
+// ---------------------------------------------------------------------------
+
 /// Classify a `MergeReadiness` snapshot into an actionable outcome.
 ///
-/// This is a pure function — no I/O, no retries. The executor calls it
+/// This is a pure function — no I/O, no retries. The caller invokes it
 /// after each single-shot `check_merge_readiness` to decide what to do.
 ///
 /// Classification logic:
@@ -73,11 +77,52 @@ pub fn classify_readiness(readiness: &MergeReadiness) -> ReadinessOutcome {
     ReadinessOutcome::Transient
 }
 
-/// How long to wait between readiness polls (milliseconds).
-const POLL_INTERVAL_MS: u64 = 1000;
+// ---------------------------------------------------------------------------
+// Parameterized polling
+// ---------------------------------------------------------------------------
 
-/// Maximum number of polls before giving up.
-const MAX_POLL_ATTEMPTS: u32 = 15;
+/// Configuration for readiness polling.
+///
+/// Two presets cover the common cases:
+/// - `PollConfig::transient()` — short polls (1 s × 15) for forge
+///   recomputation after a retarget or merge.
+/// - `PollConfig::ci_wait()` — long polls (30 s, unlimited) for CI
+///   pipelines after a rebase + push.
+#[derive(Debug, Clone)]
+pub struct PollConfig {
+    /// How long to wait between polls.
+    pub interval: Duration,
+    /// Maximum number of polls. `None` = no limit (Ctrl-C to abort).
+    pub max_attempts: Option<u32>,
+    /// Human-readable label for log messages (e.g. "mergeable", "CI").
+    pub label: &'static str,
+}
+
+impl PollConfig {
+    /// Short-poll preset for transient mergeable status.
+    ///
+    /// 1-second intervals, 15 attempts max. Used before the first merge
+    /// in a stack (or after retarget) when the forge is likely still
+    /// recomputing.
+    pub fn transient() -> Self {
+        Self {
+            interval: Duration::from_secs(1),
+            max_attempts: Some(15),
+            label: "mergeable",
+        }
+    }
+
+    /// Long-poll preset for CI completion after rebase + push.
+    ///
+    /// 30-second intervals, no max attempts. The user aborts via Ctrl-C.
+    pub fn ci_wait() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            max_attempts: None,
+            label: "CI",
+        }
+    }
+}
 
 /// Poll a PR's merge readiness until it's `Ready` or we determine it's
 /// `Blocked`.
@@ -86,12 +131,14 @@ const MAX_POLL_ATTEMPTS: u32 = 15;
 /// 2. Classifies the result via `classify_readiness`.
 /// 3. If `Ready` → returns immediately.
 /// 4. If `Blocked` → returns immediately with blocking reasons.
-/// 5. If `Transient` → polls at `POLL_INTERVAL_MS` intervals up to
-///    `MAX_POLL_ATTEMPTS`, then returns the last outcome.
-async fn poll_until_ready(
+/// 5. If `Transient` → polls at `config.interval` intervals up to
+///    `config.max_attempts` (or indefinitely if `None`), then returns
+///    `Ready` so the forge's merge endpoint can be the final arbiter.
+pub async fn poll_readiness(
     platform: &dyn PlatformService,
     pr_number: u64,
     bookmark: &str,
+    config: &PollConfig,
 ) -> Result<ReadinessOutcome> {
     // First check without delay — often the status is already settled.
     let readiness = platform.check_merge_readiness(pr_number).await?;
@@ -104,8 +151,24 @@ async fn poll_until_ready(
         }
     }
 
-    for attempt in 1..=MAX_POLL_ATTEMPTS {
-        tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+
+        let is_last = config.max_attempts.is_some_and(|max| attempt >= max);
+
+        tokio::time::sleep(config.interval).await;
+
+        // For long polls (CI wait), print elapsed time.
+        if config.max_attempts.is_none() {
+            let elapsed_secs = u64::from(attempt) * config.interval.as_secs();
+            let mins = elapsed_secs / 60;
+            let secs = elapsed_secs % 60;
+            eprintln!(
+                "  Waiting for {} on #{} ({})... [{}m{:02}s]",
+                config.label, pr_number, bookmark, mins, secs
+            );
+        }
 
         match platform.check_merge_readiness(pr_number).await {
             Ok(readiness) => {
@@ -114,14 +177,17 @@ async fn poll_until_ready(
                     ReadinessOutcome::Ready => return Ok(outcome),
                     ReadinessOutcome::Blocked(_) => return Ok(outcome),
                     ReadinessOutcome::Transient => {
-                        if attempt == MAX_POLL_ATTEMPTS {
+                        if is_last {
+                            let total_secs =
+                                u64::from(attempt) * config.interval.as_secs();
                             eprintln!(
-                                "Warning: #{} ({}) mergeable status did not settle after {}s, proceeding anyway",
+                                "Warning: #{} ({}) {} status did not settle after {}s, proceeding anyway",
                                 pr_number,
                                 bookmark,
-                                (POLL_INTERVAL_MS * u64::from(MAX_POLL_ATTEMPTS)) / 1000
+                                config.label,
+                                total_secs,
                             );
-                            // Return Ready so the executor attempts the merge —
+                            // Return Ready so the caller can attempt the merge —
                             // the forge's merge endpoint is the final arbiter.
                             return Ok(ReadinessOutcome::Ready);
                         }
@@ -129,35 +195,41 @@ async fn poll_until_ready(
                 }
             }
             Err(e) => {
-                if attempt == MAX_POLL_ATTEMPTS {
+                if is_last {
                     return Err(e);
                 }
+                let max_str = config
+                    .max_attempts
+                    .map_or("∞".to_string(), |m| m.to_string());
                 eprintln!(
-                    "Warning: readiness poll {}/{} for #{} ({}) failed: {}",
-                    attempt, MAX_POLL_ATTEMPTS, pr_number, bookmark, e
+                    "Warning: {} poll {}/{} for #{} ({}) failed: {}",
+                    config.label, attempt, max_str, pr_number, bookmark, e
                 );
             }
         }
     }
-
-    // Shouldn't reach here (loop returns on MAX_POLL_ATTEMPTS), but be safe.
-    Ok(ReadinessOutcome::Ready)
 }
 
-/// Execute a merge plan.
+// ---------------------------------------------------------------------------
+// Legacy batch executor (deprecated)
+// ---------------------------------------------------------------------------
+
+/// Execute a merge plan in a single batch pass.
 ///
-/// Processes steps sequentially. Before each `Merge` step, the executor
-/// polls the PR's readiness to handle async forge recomputation. Stops
-/// at the first hard block or failure.
-///
-/// Retarget failures are non-fatal (warning only) — the subsequent
-/// `Merge` step's readiness poll will detect if the retarget didn't
-/// take effect.
+/// **Deprecated**: Use `poll_readiness` + `platform.merge_pr()` from
+/// `run_merge_async` instead. The new merge loop in `stack_cmd.rs`
+/// rebases the remaining stack between successive merges, which this
+/// batch function cannot do (it has no access to the workspace).
+#[deprecated(
+    note = "Use poll_readiness + platform.merge_pr() from run_merge_async instead"
+)]
+#[allow(deprecated, dead_code)]
 pub async fn execute_merge(
     plan: &MergePlan,
     platform: &dyn PlatformService,
 ) -> Result<MergeExecutionResult> {
     let mut result = MergeExecutionResult::default();
+    let config = PollConfig::transient();
 
     for step in &plan.steps {
         match step {
@@ -167,12 +239,12 @@ pub async fn execute_merge(
                 method,
             } => {
                 // Assess readiness just-in-time, with polling for transient states.
-                match poll_until_ready(platform, *pr_number, bookmark).await {
+                match poll_readiness(platform, *pr_number, bookmark, &config).await {
                     Ok(ReadinessOutcome::Ready) => {
                         // Proceed to merge.
                     }
                     Ok(ReadinessOutcome::Transient) => {
-                        // poll_until_ready exhausted retries but returned Transient
+                        // poll_readiness exhausted retries but returned Transient
                         // (shouldn't happen — it returns Ready after max polls).
                         // Attempt the merge anyway.
                         eprintln!(
@@ -216,35 +288,22 @@ pub async fn execute_merge(
                     }
                 }
             }
-            MergeStep::RetargetBase {
-                bookmark,
-                pr_number,
-                new_base,
-            } => {
-                eprintln!(
-                    "  → Retargeting #{} ({}) base → {}",
-                    pr_number, bookmark, new_base
-                );
-                if let Err(e) = platform.update_pr_base(*pr_number, new_base).await {
-                    eprintln!(
-                        "  Warning: failed to retarget #{} ({}): {}",
-                        pr_number, bookmark, e
-                    );
-                    // Continue — retarget failure is non-fatal.
-                    // The next Merge step's readiness poll will detect
-                    // if the PR is still not mergeable.
-                }
-            }
         }
     }
 
     Ok(result)
 }
 
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::MergeReadiness;
+
+    // ── Test helper ──────────────────────────────────────────────────
 
     fn readiness(
         is_approved: bool,
@@ -275,6 +334,8 @@ mod tests {
         }
     }
 
+    // ── classify_readiness tests (pure) ──────────────────────────────
+
     #[test]
     fn test_classify_ready() {
         let r = readiness(true, true, Some(true), false);
@@ -299,19 +360,28 @@ mod tests {
     #[test]
     fn test_classify_blocked_draft() {
         let r = readiness(true, true, Some(true), true);
-        assert!(matches!(classify_readiness(&r), ReadinessOutcome::Blocked(_)));
+        assert!(matches!(
+            classify_readiness(&r),
+            ReadinessOutcome::Blocked(_)
+        ));
     }
 
     #[test]
     fn test_classify_blocked_not_approved() {
         let r = readiness(false, true, Some(true), false);
-        assert!(matches!(classify_readiness(&r), ReadinessOutcome::Blocked(_)));
+        assert!(matches!(
+            classify_readiness(&r),
+            ReadinessOutcome::Blocked(_)
+        ));
     }
 
     #[test]
     fn test_classify_blocked_ci_failed() {
         let r = readiness(true, false, Some(true), false);
-        assert!(matches!(classify_readiness(&r), ReadinessOutcome::Blocked(_)));
+        assert!(matches!(
+            classify_readiness(&r),
+            ReadinessOutcome::Blocked(_)
+        ));
     }
 
     #[test]
@@ -320,7 +390,10 @@ mod tests {
         match classify_readiness(&r) {
             ReadinessOutcome::Blocked(reasons) => {
                 // Should have multiple reasons: draft, not approved, CI, conflicts
-                assert!(reasons.len() >= 3, "expected multiple blocking reasons, got: {reasons:?}");
+                assert!(
+                    reasons.len() >= 3,
+                    "expected multiple blocking reasons, got: {reasons:?}"
+                );
             }
             other => panic!("expected Blocked, got: {other:?}"),
         }
@@ -330,6 +403,199 @@ mod tests {
     fn test_classify_blocked_draft_plus_mergeable_false() {
         // Draft + mergeable false → Blocked (not Transient), because draft is a hard blocker.
         let r = readiness(true, true, Some(false), true);
-        assert!(matches!(classify_readiness(&r), ReadinessOutcome::Blocked(_)));
+        assert!(matches!(
+            classify_readiness(&r),
+            ReadinessOutcome::Blocked(_)
+        ));
+    }
+
+    // ── poll_readiness tests (async, with mock) ──────────────────────
+
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
+    use std::collections::VecDeque;
+    use crate::types::{
+        MergeMethod, MergeResult, PlatformConfig, PullRequest, PullRequestDetails,
+        PrComment,
+    };
+
+    /// Minimal mock platform for testing `poll_readiness`.
+    ///
+    /// Scripted responses: each call to `check_merge_readiness` pops the
+    /// next `MergeReadiness` from the queue. If the queue is empty, it
+    /// returns a "ready" response.
+    struct MockPlatform {
+        responses: Arc<Mutex<VecDeque<MergeReadiness>>>,
+    }
+
+    impl MockPlatform {
+        fn new(responses: Vec<MergeReadiness>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformService for MockPlatform {
+        async fn find_existing_pr(&self, _head_branch: &str) -> Result<Option<PullRequest>> {
+            unimplemented!("not needed for poll_readiness tests")
+        }
+        async fn create_pr_with_options(
+            &self, _head: &str, _base: &str, _title: &str, _body: Option<&str>, _draft: bool,
+        ) -> Result<PullRequest> {
+            unimplemented!()
+        }
+        async fn update_pr_base(&self, _pr_number: u64, _new_base: &str) -> Result<PullRequest> {
+            unimplemented!()
+        }
+        async fn update_pr_description(
+            &self, _pr_number: u64, _title: &str, _body: &str,
+        ) -> Result<PullRequest> {
+            unimplemented!()
+        }
+        async fn publish_pr(&self, _pr_number: u64) -> Result<PullRequest> {
+            unimplemented!()
+        }
+        async fn list_pr_comments(&self, _pr_number: u64) -> Result<Vec<PrComment>> {
+            unimplemented!()
+        }
+        async fn create_pr_comment(&self, _pr_number: u64, _body: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn update_pr_comment(
+            &self, _pr_number: u64, _comment_id: u64, _body: &str,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        fn config(&self) -> &PlatformConfig {
+            unimplemented!()
+        }
+        async fn get_pr_details(&self, _pr_number: u64) -> Result<PullRequestDetails> {
+            unimplemented!()
+        }
+        async fn check_merge_readiness(&self, _pr_number: u64) -> Result<MergeReadiness> {
+            let mut queue = self.responses.lock().unwrap();
+            Ok(queue.pop_front().unwrap_or_else(|| {
+                // Default: fully ready
+                readiness(true, true, Some(true), false)
+            }))
+        }
+        async fn merge_pr(&self, _pr_number: u64, _method: MergeMethod) -> Result<MergeResult> {
+            unimplemented!()
+        }
+    }
+
+    /// Fast poll config for tests — 1 ms intervals.
+    fn test_poll_config(max_attempts: Option<u32>) -> PollConfig {
+        PollConfig {
+            interval: Duration::from_millis(1),
+            max_attempts,
+            label: "test",
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_ready_immediately() {
+        let platform = MockPlatform::new(vec![readiness(true, true, Some(true), false)]);
+        let config = test_poll_config(Some(5));
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+
+        // Only one response consumed — no polling needed.
+        assert_eq!(platform.responses.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_blocked_immediately() {
+        let platform = MockPlatform::new(vec![readiness(false, true, Some(true), false)]);
+        let config = test_poll_config(Some(5));
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReadinessOutcome::Blocked(_)));
+
+        // Only one response consumed.
+        assert_eq!(platform.responses.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_transient_then_ready() {
+        let platform = MockPlatform::new(vec![
+            // First check: transient (mergeable=false, everything else fine)
+            readiness(true, true, Some(false), false),
+            // Poll 1: still transient
+            readiness(true, true, Some(false), false),
+            // Poll 2: ready!
+            readiness(true, true, Some(true), false),
+        ]);
+        let config = test_poll_config(Some(5));
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+
+        // All 3 responses consumed.
+        assert_eq!(platform.responses.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_exhausts_max_attempts() {
+        // 3 transient responses, max_attempts = 2 (so initial + 2 polls = 3 checks).
+        let platform = MockPlatform::new(vec![
+            readiness(true, true, Some(false), false),
+            readiness(true, true, Some(false), false),
+            readiness(true, true, Some(false), false),
+        ]);
+        let config = test_poll_config(Some(2));
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        // After exhausting max_attempts on Transient, returns Ready
+        // (proceed anyway — the forge's merge endpoint is the final arbiter).
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_transient_then_blocked() {
+        let platform = MockPlatform::new(vec![
+            // First: transient
+            readiness(true, true, Some(false), false),
+            // Poll 1: now blocked (CI failed)
+            readiness(true, false, Some(false), false),
+        ]);
+        let config = test_poll_config(Some(5));
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReadinessOutcome::Blocked(_)));
+    }
+
+    #[tokio::test]
+    async fn test_poll_readiness_unlimited_terminates_on_ready() {
+        let platform = MockPlatform::new(vec![
+            // First check: transient
+            readiness(true, true, Some(false), false),
+            // Poll 1: still transient
+            readiness(true, true, Some(false), false),
+            // Poll 2: ready!
+            readiness(true, true, Some(true), false),
+        ]);
+        let config = test_poll_config(None);
+
+        let outcome = poll_readiness(&platform, 1, "feat-a", &config)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReadinessOutcome::Ready);
+
+        // All 3 responses consumed — unlimited polling terminates on Ready.
+        assert_eq!(platform.responses.lock().unwrap().len(), 0);
     }
 }
