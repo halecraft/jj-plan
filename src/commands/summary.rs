@@ -76,6 +76,7 @@ pub struct CrossReference {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StackSummary {
+    /// 1-based position of the target entry from tip. Tip = 1.
     pub position: usize,
     pub total: usize,
     pub entries: Vec<StackSummaryEntry>,
@@ -292,7 +293,7 @@ pub fn build_stack_summary(
     views: &[SyncChangeView],
     target_change_id: &str,
 ) -> StackSummary {
-    let entries: Vec<StackSummaryEntry> = views
+    let mut entries: Vec<StackSummaryEntry> = views
         .iter()
         .map(|v| StackSummaryEntry {
             bookmark: v.bookmark_name.clone(),
@@ -304,10 +305,13 @@ pub fn build_stack_summary(
         })
         .collect();
 
+    // Reverse so tip (working copy) is first, matching jj log / jj stack display order.
+    entries.reverse();
+
     let position = entries
         .iter()
         .position(|e| e.is_target)
-        .map(|i| i + 1) // 1-based
+        .map(|i| i + 1) // 1-based from tip
         .unwrap_or(0);
 
     StackSummary {
@@ -815,12 +819,13 @@ Long jj:stuvwxyz is fine.
 
     #[test]
     fn test_build_stack_summary() {
+        // Input views are trunk-to-tip: feat-a (trunk), feat-b, feat-c (tip/wc)
         let views = vec![
             SyncChangeView {
                 change_id: "aaa".to_string(),
-                bookmark_name: "feat-c".to_string(),
-                description: "feat: c\n\n> [!plan]\n> status: 🔴\n".to_string(),
-                is_working_copy: true,
+                bookmark_name: "feat-a".to_string(),
+                description: "feat: a\n\n> [!plan]\n> status: ✅\n".to_string(),
+                is_working_copy: false,
             },
             SyncChangeView {
                 change_id: "bbb".to_string(),
@@ -830,27 +835,35 @@ Long jj:stuvwxyz is fine.
             },
             SyncChangeView {
                 change_id: "ccc".to_string(),
-                bookmark_name: "feat-a".to_string(),
-                description: "feat: a\n\n> [!plan]\n> status: ✅\n".to_string(),
-                is_working_copy: false,
+                bookmark_name: "feat-c".to_string(),
+                description: "feat: c\n\n> [!plan]\n> status: 🔴\n".to_string(),
+                is_working_copy: true,
             },
         ];
 
+        // Target is "bbb" (feat-b, middle of stack)
         let summary = build_stack_summary(&views, "bbb");
 
         assert_eq!(summary.total, 3);
-        assert_eq!(summary.position, 2); // 1-based position of "bbb"
+        // After reversal, entries are tip-first: [feat-c, feat-b, feat-a]
+        // "bbb" (feat-b) is at index 1 → position = 2
+        assert_eq!(summary.position, 2);
 
+        // entries[0] = feat-c (tip, working copy)
         assert!(summary.entries[0].is_working_copy);
         assert!(!summary.entries[0].is_target);
         assert!(!summary.entries[0].is_done);
+        assert_eq!(summary.entries[0].bookmark, "feat-c");
 
+        // entries[1] = feat-b (middle, target)
         assert!(summary.entries[1].is_target);
         assert!(summary.entries[1].is_done);
         assert_eq!(summary.entries[1].bookmark, "feat-b");
 
+        // entries[2] = feat-a (trunk-nearest)
         assert!(!summary.entries[2].is_target);
         assert!(summary.entries[2].is_done);
+        assert_eq!(summary.entries[2].bookmark, "feat-a");
     }
 
     // ── build_summary (integration) ───────────────────────────────────

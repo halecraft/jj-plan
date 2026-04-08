@@ -208,11 +208,11 @@ fn plan_sync(
             }
 
             // 2. For each stack change, plan renames and writes
+            let num_changes = changes.len();
             for (idx, change) in changes.iter().enumerate() {
-                let padded_idx = format!("{:02}", idx + 1);
                 let encoded_name = plan_file::encode_bookmark_for_filename(&change.bookmark_name);
                 let target_filename =
-                    format!("{}-{}.md", padded_idx, encoded_name);
+                    plan_file::format_plan_filename(idx, num_changes, &encoded_name);
 
                 // Check if a file exists with the right bookmark name but wrong
                 // index — if so, rename rather than delete+recreate
@@ -433,9 +433,12 @@ mod tests {
         assert!(plan.error.is_none());
         assert!(plan.clear_error);
         assert_eq!(plan.files_to_write.len(), 2);
-        assert_eq!(plan.files_to_write[0].filename, "01-feat-auth.md");
+        // 2-item stack: [feat-auth (trunk, idx=0), fix-login (tip, idx=1)]
+        // feat-auth: dependency_index=0, position_from_tip=1 → 'b'
+        // fix-login: dependency_index=1, position_from_tip=0 → 'a'
+        assert_eq!(plan.files_to_write[0].filename, "b-01-feat-auth.md");
         assert_eq!(plan.files_to_write[0].content, "desc A");
-        assert_eq!(plan.files_to_write[1].filename, "02-fix-login.md");
+        assert_eq!(plan.files_to_write[1].filename, "a-02-fix-login.md");
         assert_eq!(plan.files_to_write[1].content, "desc B");
 
     }
@@ -443,9 +446,9 @@ mod tests {
     #[test]
     fn test_plan_sync_removes_stale_files() {
         let state = state_with(&[
-            ("01-feat-auth.md", "feat-auth"),
-            ("02-feat-session.md", "feat-session"),
-            ("03-feat-api.md", "feat-api"),
+            ("b-01-feat-auth.md", "feat-auth"),
+            ("c-02-feat-session.md", "feat-session"),
+            ("a-03-feat-api.md", "feat-api"),
         ]);
         // Stack now only has feat-auth and feat-api — feat-session is stale
         let changes = vec![
@@ -454,13 +457,13 @@ mod tests {
         ];
         let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new(), None);
 
-        assert_eq!(plan.files_to_remove, vec!["02-feat-session.md"]);
+        assert_eq!(plan.files_to_remove, vec!["c-02-feat-session.md"]);
     }
 
     #[test]
     fn test_plan_sync_renames_reordered_files() {
-        // File exists as 02-feat-auth.md but should be 01-feat-auth.md after reorder
-        let state = state_with(&[("02-feat-auth.md", "feat-auth"), ("01-fix-login.md", "fix-login")]);
+        // Files exist with old names, should be renamed to new format
+        let state = state_with(&[("a-02-feat-auth.md", "feat-auth"), ("b-01-fix-login.md", "fix-login")]);
         let changes = vec![
             change_with_bookmark("aaa", "feat-auth", "a", true, true),
             change_with_bookmark("bbb", "fix-login", "b", true, false),
@@ -468,17 +471,17 @@ mod tests {
         let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new(), None);
 
         assert_eq!(plan.files_to_rename.len(), 2);
-        // feat-auth: 02 → 01
-        assert!(plan.files_to_rename.iter().any(|r| r.from == "02-feat-auth.md"
-            && r.to == "01-feat-auth.md"));
-        // fix-login: 01 → 02
-        assert!(plan.files_to_rename.iter().any(|r| r.from == "01-fix-login.md"
-            && r.to == "02-fix-login.md"));
+        // feat-auth: was tip (a-02) but now trunk-nearest → b-01
+        assert!(plan.files_to_rename.iter().any(|r| r.from == "a-02-feat-auth.md"
+            && r.to == "b-01-feat-auth.md"));
+        // fix-login: was trunk-nearest (b-01) but now tip → a-02
+        assert!(plan.files_to_rename.iter().any(|r| r.from == "b-01-fix-login.md"
+            && r.to == "a-02-fix-login.md"));
     }
 
     #[test]
     fn test_plan_sync_no_rename_when_index_matches() {
-        let state = state_with(&[("01-feat-auth.md", "feat-auth")]);
+        let state = state_with(&[("a-01-feat-auth.md", "feat-auth")]);
         let changes = vec![change_with_bookmark("aaa", "feat-auth", "a", true, true)];
         let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new(), None);
 
@@ -508,7 +511,7 @@ mod tests {
         let plan = plan_sync(&state, Some(&changes), 50, &PlanRegistry::new(), None);
 
         assert_eq!(plan.files_to_write.len(), 1);
-        assert_eq!(plan.files_to_write[0].filename, "01-feat--auth.md");
+        assert_eq!(plan.files_to_write[0].filename, "a-01-feat--auth.md");
 
     }
 }

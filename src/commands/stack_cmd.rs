@@ -680,7 +680,7 @@ async fn run_submit_async(
                     None
                 };
 
-                let comment_body = comments::generate_stack_comment(&chain, bookmark);
+                let comment_body = comments::generate_stack_comment(&chain, bookmark, &ctx.default_branch);
 
                 comment_steps.push(ExecutionStep::AddStackComment {
                     bookmark: bookmark.clone(),

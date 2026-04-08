@@ -23,6 +23,7 @@ pub const STACK_COMMENT_MARKER: &str = "<!-- jj-plan stack -->";
 pub fn generate_stack_comment(
     chain: &[(String, u64, String)], // (bookmark, pr_number, title)
     current_bookmark: &str,
+    default_branch: &str,
 ) -> String {
     let mut lines = vec![
         // Marker (invisible in rendered markdown)
@@ -35,19 +36,28 @@ pub fn generate_stack_comment(
         "|---|---|---|".to_string(),
     ];
 
-    // Table rows (1-indexed, trunk-to-tip order)
-    for (i, (bookmark, pr_number, title)) in chain.iter().enumerate() {
-        let ordinal = i + 1;
+    // Table rows in tip-to-trunk display order.
+    // The ordinal is the dependency index (01 = trunk-nearest, matching
+    // `jj plan go <N>` and the NN in filenames).
+    let num = chain.len();
+    let reversed: Vec<_> = chain.iter().rev().collect();
+    for (i, (bookmark, pr_number, title)) in reversed.iter().enumerate() {
+        // display position i=0 is tip, i=num-1 is trunk-nearest
+        // dependency index: tip = num, trunk-nearest = 1
+        let dep_index = num - i;
         let is_current = bookmark == current_bookmark;
 
         if is_current {
             lines.push(format!(
-                "| **{ordinal}** | **#{pr_number} {bookmark}** | **{title}** 👈 |"
+                "| **{dep_index}** | **#{pr_number} {bookmark}** | **{title}** 👈 |"
             ));
         } else {
-            lines.push(format!("| {ordinal} | #{pr_number} {bookmark} | {title} |"));
+            lines.push(format!("| {dep_index} | #{pr_number} {bookmark} | {title} |"));
         }
     }
+
+    // Base branch row (trunk)
+    lines.push(format!("| | ◆ {default_branch} | |"));
 
     lines.join("\n")
 }
@@ -70,18 +80,24 @@ mod tests {
     #[test]
     fn test_generate_stack_comment_single_pr() {
         let chain = vec![("feat-auth".to_string(), 42, "Extract auth module".to_string())];
-        let result = generate_stack_comment(&chain, "feat-auth");
+        let result = generate_stack_comment(&chain, "feat-auth", "main");
 
         assert!(result.contains(STACK_COMMENT_MARKER));
         assert!(result.contains("### Stack"));
-        // Single PR is always "current", so it should be bold with 👈
+        // Single PR: dependency index = 1, bold with 👈
         assert!(result.contains("**1**"));
         assert!(result.contains("**#42 feat-auth**"));
         assert!(result.contains("👈"));
+        // Base branch row
+        assert!(result.contains("◆ main"));
     }
 
     #[test]
     fn test_generate_stack_comment_highlights_current() {
+        // Chain is passed in trunk-to-tip order (from call site):
+        // [feat-auth (trunk, dep=1), feat-session (middle, dep=2), feat-api (tip, dep=3)]
+        // After internal reversal, display is tip-first:
+        // Row: dep=3 feat-api, dep=2 feat-session (👈), dep=1 feat-auth, ◆ main
         let chain = vec![
             ("feat-auth".to_string(), 42, "Extract auth module".to_string()),
             (
@@ -91,20 +107,22 @@ mod tests {
             ),
             ("feat-api".to_string(), 44, "Add API endpoints".to_string()),
         ];
-        let result = generate_stack_comment(&chain, "feat-session");
+        let result = generate_stack_comment(&chain, "feat-session", "main");
 
-        // Row 1 should NOT be bold
-        assert!(result.contains("| 1 | #42 feat-auth | Extract auth module |"));
-        // Row 2 should be bold with 👈
-        assert!(result.contains("| **2** | **#43 feat-session** | **Implement session management** 👈 |"));
-        // Row 3 should NOT be bold
+        // Row dep=3: feat-api (tip), NOT bold
         assert!(result.contains("| 3 | #44 feat-api | Add API endpoints |"));
+        // Row dep=2: feat-session (middle), bold with 👈
+        assert!(result.contains("| **2** | **#43 feat-session** | **Implement session management** 👈 |"));
+        // Row dep=1: feat-auth (trunk-nearest), NOT bold
+        assert!(result.contains("| 1 | #42 feat-auth | Extract auth module |"));
+        // Base branch row at bottom
+        assert!(result.contains("◆ main"));
     }
 
     #[test]
     fn test_generate_stack_comment_includes_marker() {
         let chain = vec![("feat-a".to_string(), 1, "Title A".to_string())];
-        let result = generate_stack_comment(&chain, "feat-a");
+        let result = generate_stack_comment(&chain, "feat-a", "main");
 
         assert!(result.starts_with(STACK_COMMENT_MARKER));
     }
@@ -154,15 +172,18 @@ mod tests {
     #[test]
     fn test_generate_stack_comment_no_current_match() {
         // If current_bookmark doesn't match any entry, no row is highlighted.
+        // Chain trunk-to-tip: [feat-a (dep=1), feat-b (dep=2)]. After reversal: [feat-b, feat-a].
         let chain = vec![
             ("feat-a".to_string(), 1, "Title A".to_string()),
             ("feat-b".to_string(), 2, "Title B".to_string()),
         ];
-        let result = generate_stack_comment(&chain, "feat-nonexistent");
+        let result = generate_stack_comment(&chain, "feat-nonexistent", "main");
 
-        // Neither row should be bold
-        assert!(result.contains("| 1 | #1 feat-a | Title A |"));
+        // Neither row should be bold; tip-first with dependency indices
         assert!(result.contains("| 2 | #2 feat-b | Title B |"));
+        assert!(result.contains("| 1 | #1 feat-a | Title A |"));
         assert!(!result.contains("👈"));
+        // Base branch row
+        assert!(result.contains("◆ main"));
     }
 }

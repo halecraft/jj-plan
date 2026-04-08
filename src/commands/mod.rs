@@ -159,7 +159,7 @@ fn build_orientation_message(change_id: &str, stack_plans: Option<&[SyncChangeVi
             "No plan at @ ({}). {} plan{} in stack:\n",
             change_id, n, plural
         ));
-        for view in plans {
+        for view in plans.iter().rev() {
             out.push_str(&format!("  ○ {} (jj:{})\n", view.bookmark_name, view.change_id));
         }
         out.push_str("\nNavigate to a plan:\n");

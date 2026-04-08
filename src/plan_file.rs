@@ -17,38 +17,96 @@ pub fn encode_bookmark_for_filename(name: &str) -> String {
     name.replace('/', "--")
 }
 
-/// Parse a plan filename like `01-feat-auth.md` and return the encoded
-/// bookmark portion.
+/// Compute a single-letter filesystem sort key from a position-from-tip index.
 ///
-/// Returns `None` if the filename doesn't match the expected pattern.
+/// `position_from_tip` is 0 for the tip (working copy), 1 for the next
+/// toward trunk, etc. Returns `'a'` for 0, `'b'` for 1, ..., `'z'` for 25.
+/// Positions ≥ 25 are clamped to `'z'`.
 ///
-/// Pattern: `NN-ENCODED.md` where NN is two digits and ENCODED is a
-/// non-empty string. The returned value is the raw encoded portion —
-/// callers use `PlanRegistry::resolve_encoded()` to map it back to the
-/// canonical bookmark name.
+/// The letter ensures `ls .jj-plan/` shows tip first (matching `jj stack`
+/// display order), while the numeric dependency index in the filename
+/// retains its dependency-chain meaning (`01` = trunk-nearest).
+pub fn sort_letter(position_from_tip: usize) -> char {
+    let offset = position_from_tip.min(25) as u8;
+    (b'a' + offset) as char
+}
+
+/// Build a plan filename in the `L-NN-ENCODED.md` format.
 ///
-/// Excluded filenames: `error.md`, `current.md`, `stack.md`, `template.md`,
-/// `problem.md`, and any file that doesn't start with two digits + dash
-/// or doesn't end with `.md`.
+/// - `dependency_index`: 0-based, trunk-nearest = 0.
+/// - `num_total`: total number of plans in the stack.
+/// - `encoded_bookmark`: bookmark name already encoded via `encode_bookmark_for_filename`.
+///
+/// The letter prefix controls filesystem sort order (tip = `'a'`, sorts first).
+/// The numeric index carries semantic meaning (`01` = trunk-nearest = first to merge,
+/// matches `jj plan go 1`).
+///
+/// Example for a 3-plan stack:
+/// - `dependency_index=0` (trunk-nearest) → `c-01-feat-auth.md`
+/// - `dependency_index=1` (middle)        → `b-02-feat-session.md`
+/// - `dependency_index=2` (tip)           → `a-03-feat-api.md`
+pub fn format_plan_filename(dependency_index: usize, num_total: usize, encoded_bookmark: &str) -> String {
+    let position_from_tip = num_total.saturating_sub(1).saturating_sub(dependency_index);
+    let letter = sort_letter(position_from_tip);
+    let padded = format!("{:02}", dependency_index + 1);
+    format!("{letter}-{padded}-{encoded_bookmark}.md")
+}
+
+/// Parse a plan filename and return the encoded bookmark portion.
+///
+/// Returns `None` if the filename doesn't match a recognized pattern.
+///
+/// Accepts two formats:
+/// - **New**: `L-NN-ENCODED.md` — single lowercase letter, dash, two digits,
+///   dash, encoded bookmark, `.md`. Example: `a-03-feat-api.md`.
+/// - **Legacy**: `NN-ENCODED.md` — two digits, dash, encoded bookmark, `.md`.
+///   Example: `01-feat-auth.md`. Recognized for backward compatibility during
+///   migration; the sync pipeline renames these to the new format.
+///
+/// The returned value is the raw encoded portion — callers use
+/// `PlanRegistry::resolve_encoded()` to map it back to the canonical
+/// bookmark name.
 pub fn parse_plan_filename(name: &str) -> Option<&str> {
-    if name.len() > 6
-        && name.as_bytes()[0].is_ascii_digit()
-        && name.as_bytes()[1].is_ascii_digit()
-        && name.as_bytes()[2] == b'-'
-        && name.ends_with(".md")
-        && name != "error.md"
-    {
-        // Extract bookmark name (encoded): everything between the dash and .md
-        Some(&name[3..name.len() - 3])
-    } else {
-        None
+    if !name.ends_with(".md") || name == "error.md" {
+        return None;
     }
+
+    let bytes = name.as_bytes();
+
+    // New format: L-NN-ENCODED.md (minimum length: 1 + 1 + 2 + 1 + 1 + 3 = 9)
+    if bytes.len() > 8
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1] == b'-'
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+        && bytes[4] == b'-'
+    {
+        let encoded = &name[5..name.len() - 3];
+        if !encoded.is_empty() {
+            return Some(encoded);
+        }
+    }
+
+    // Legacy format: NN-ENCODED.md (minimum length: 2 + 1 + 1 + 3 = 7)
+    if bytes.len() > 6
+        && bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2] == b'-'
+    {
+        let encoded = &name[3..name.len() - 3];
+        if !encoded.is_empty() {
+            return Some(encoded);
+        }
+    }
+
+    None
 }
 
 /// A plan file entry from a directory listing.
 #[derive(Debug, Clone)]
 pub struct PlanFileEntry {
-    /// The full filename, e.g. `01-feat-auth.md`.
+    /// The full filename, e.g. `a-03-feat-api.md` (new format) or
+    /// `01-feat-auth.md` (legacy format, recognized for migration).
     pub filename: String,
     /// The canonical bookmark name from the PlanRegistry, or the raw
     /// encoded string for orphan files (no matching registry entry).
@@ -268,39 +326,90 @@ mod tests {
         reg
     }
 
-    // -- parse_plan_filename tests --
+    // -- sort_letter tests --
 
     #[test]
-    fn test_parse_plan_filename_valid() {
-        // Bookmark-named files
-        assert_eq!(parse_plan_filename("01-feat-auth.md"), Some("feat-auth"));
-        assert_eq!(parse_plan_filename("02-fix-login.md"), Some("fix-login"));
-        assert_eq!(
-            parse_plan_filename("10-my-feature.md"),
-            Some("my-feature")
-        );
-        assert_eq!(
-            parse_plan_filename("99-long-bookmark-name.md"),
-            Some("long-bookmark-name")
-        );
+    fn test_sort_letter_tip() {
+        assert_eq!(sort_letter(0), 'a');
     }
 
     #[test]
-    fn test_parse_plan_filename_with_encoded_slash() {
-        // Filenames with `--` encoding for `/`
-        assert_eq!(
-            parse_plan_filename("01-feat--auth.md"),
-            Some("feat--auth")
-        );
-        assert_eq!(
-            parse_plan_filename("03-user--duane--exp.md"),
-            Some("user--duane--exp")
-        );
+    fn test_sort_letter_sequence() {
+        assert_eq!(sort_letter(1), 'b');
+        assert_eq!(sort_letter(2), 'c');
+        assert_eq!(sort_letter(24), 'y');
+        assert_eq!(sort_letter(25), 'z');
+    }
+
+    #[test]
+    fn test_sort_letter_clamped() {
+        assert_eq!(sort_letter(26), 'z');
+        assert_eq!(sort_letter(100), 'z');
+    }
+
+    // -- format_plan_filename tests --
+
+    #[test]
+    fn test_format_plan_filename_single_item() {
+        // 1 plan: dependency_index=0 is both trunk-nearest and tip → position_from_tip=0 → 'a'
+        assert_eq!(format_plan_filename(0, 1, "feat-auth"), "a-01-feat-auth.md");
+    }
+
+    #[test]
+    fn test_format_plan_filename_two_items() {
+        // 2 plans: [feat-auth (trunk, idx=0), fix-login (tip, idx=1)]
+        assert_eq!(format_plan_filename(0, 2, "feat-auth"), "b-01-feat-auth.md");
+        assert_eq!(format_plan_filename(1, 2, "fix-login"), "a-02-fix-login.md");
+    }
+
+    #[test]
+    fn test_format_plan_filename_three_items() {
+        // 3 plans: idx=0 trunk-nearest → 'c', idx=1 middle → 'b', idx=2 tip → 'a'
+        assert_eq!(format_plan_filename(0, 3, "feat-auth"), "c-01-feat-auth.md");
+        assert_eq!(format_plan_filename(1, 3, "feat-session"), "b-02-feat-session.md");
+        assert_eq!(format_plan_filename(2, 3, "feat-api"), "a-03-feat-api.md");
+    }
+
+    #[test]
+    fn test_format_plan_filename_encodes_slash() {
+        assert_eq!(format_plan_filename(0, 1, "feat--auth"), "a-01-feat--auth.md");
+    }
+
+    // -- parse_plan_filename tests --
+
+    #[test]
+    fn test_parse_plan_filename_new_format() {
+        // New L-NN-ENCODED.md format
+        assert_eq!(parse_plan_filename("a-03-feat-api.md"), Some("feat-api"));
+        assert_eq!(parse_plan_filename("b-02-feat-session.md"), Some("feat-session"));
+        assert_eq!(parse_plan_filename("c-01-feat-auth.md"), Some("feat-auth"));
+        assert_eq!(parse_plan_filename("z-99-long-name.md"), Some("long-name"));
+    }
+
+    #[test]
+    fn test_parse_plan_filename_new_format_with_encoded_slash() {
+        assert_eq!(parse_plan_filename("a-01-feat--auth.md"), Some("feat--auth"));
+        assert_eq!(parse_plan_filename("c-03-user--duane--exp.md"), Some("user--duane--exp"));
+    }
+
+    #[test]
+    fn test_parse_plan_filename_legacy_format() {
+        // Legacy NN-ENCODED.md format still recognized
+        assert_eq!(parse_plan_filename("01-feat-auth.md"), Some("feat-auth"));
+        assert_eq!(parse_plan_filename("02-fix-login.md"), Some("fix-login"));
+        assert_eq!(parse_plan_filename("10-my-feature.md"), Some("my-feature"));
+        assert_eq!(parse_plan_filename("99-long-bookmark-name.md"), Some("long-bookmark-name"));
+    }
+
+    #[test]
+    fn test_parse_plan_filename_legacy_with_encoded_slash() {
+        assert_eq!(parse_plan_filename("01-feat--auth.md"), Some("feat--auth"));
+        assert_eq!(parse_plan_filename("03-user--duane--exp.md"), Some("user--duane--exp"));
     }
 
     #[test]
     fn test_parse_plan_filename_legacy_change_id() {
-        // Old-style change-ID filenames still parse (same pattern)
+        // Old-style change-ID filenames still parse (same legacy pattern)
         assert_eq!(parse_plan_filename("01-kpqxywon.md"), Some("kpqxywon"));
         assert_eq!(parse_plan_filename("02-mtzrlpvq.md"), Some("mtzrlpvq"));
     }
@@ -310,18 +419,19 @@ mod tests {
         assert_eq!(parse_plan_filename("current.md"), None);
         assert_eq!(parse_plan_filename("error.md"), None);
         assert_eq!(parse_plan_filename(".stack"), None);
-        assert_eq!(parse_plan_filename("ab-test.md"), None); // non-digit prefix
-        assert_eq!(parse_plan_filename("1-short.md"), None); // single digit
-        assert_eq!(parse_plan_filename("01-.md"), None); // empty name (len <= 6)
+        assert_eq!(parse_plan_filename("1-short.md"), None); // single digit, no letter prefix
+        assert_eq!(parse_plan_filename("01-.md"), None); // empty name (legacy)
+        assert_eq!(parse_plan_filename("a-01-.md"), None); // empty name (new format)
+        assert_eq!(parse_plan_filename("A-01-feat.md"), None); // uppercase letter
     }
 
     // -- collect_plan_files tests --
 
     #[test]
-    fn test_collect_plan_files() {
+    fn test_collect_plan_files_new_format() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat-auth.md"), "a").unwrap();
-        fs::write(tmp.path().join("02-fix-login.md"), "b").unwrap();
+        fs::write(tmp.path().join("a-02-fix-login.md"), "b").unwrap();
+        fs::write(tmp.path().join("b-01-feat-auth.md"), "a").unwrap();
         fs::write(tmp.path().join("current.md"), "link").unwrap();
         fs::write(tmp.path().join(".stack"), "stack").unwrap();
 
@@ -335,23 +445,39 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_plan_files_slash_via_registry() {
-        // File `01-feat--auth.md` with registry entry `feat/auth` → resolves to `feat/auth`
+    fn test_collect_plan_files_legacy_format() {
+        // Legacy NN-ENCODED.md files are still collected
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat--auth.md"), "a").unwrap();
+        fs::write(tmp.path().join("01-feat-auth.md"), "a").unwrap();
+        fs::write(tmp.path().join("02-fix-login.md"), "b").unwrap();
+
+        let registry = make_registry(&["feat-auth", "fix-login"]);
+        let files = collect_plan_files(tmp.path(), &registry);
+        assert_eq!(files.len(), 2);
+
+        let names: Vec<&str> = files.iter().map(|f| f.bookmark_name.as_str()).collect();
+        assert!(names.contains(&"feat-auth"));
+        assert!(names.contains(&"fix-login"));
+    }
+
+    #[test]
+    fn test_collect_plan_files_slash_via_registry() {
+        // File `a-01-feat--auth.md` with registry entry `feat/auth` → resolves to `feat/auth`
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a-01-feat--auth.md"), "a").unwrap();
 
         let registry = make_registry(&["feat/auth"]);
         let files = collect_plan_files(tmp.path(), &registry);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].bookmark_name, "feat/auth");
-        assert_eq!(files[0].filename, "01-feat--auth.md");
+        assert_eq!(files[0].filename, "a-01-feat--auth.md");
     }
 
     #[test]
     fn test_collect_plan_files_double_dash_literal() {
-        // File `01-feat--auth.md` with registry entry `feat--auth` → resolves to `feat--auth`
+        // File `a-01-feat--auth.md` with registry entry `feat--auth` → resolves to `feat--auth`
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-feat--auth.md"), "a").unwrap();
+        fs::write(tmp.path().join("a-01-feat--auth.md"), "a").unwrap();
 
         let registry = make_registry(&["feat--auth"]);
         let files = collect_plan_files(tmp.path(), &registry);
@@ -363,7 +489,7 @@ mod tests {
     fn test_collect_plan_files_orphan() {
         // File with no matching registry entry → raw encoded string as bookmark_name
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("01-orphan-file.md"), "a").unwrap();
+        fs::write(tmp.path().join("a-01-orphan-file.md"), "a").unwrap();
 
         let registry = make_registry(&["something-else"]);
         let files = collect_plan_files(tmp.path(), &registry);
@@ -510,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_idempotent_on_bookmark_files() {
+    fn test_migrate_idempotent_on_new_format_files() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("01-feat-auth.md"), "already migrated").unwrap();
 

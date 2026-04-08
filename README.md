@@ -41,7 +41,7 @@ mkdir .jj-plan
 jj plan new feat-auth
 
 # Write the plan (see stack.md for plan filenames)
-$EDITOR .jj-plan/01-feat-auth.md
+$EDITOR .jj-plan/a-01-feat-auth.md
 
 # Implement — every jj command syncs plan files automatically
 # Edit code... jj status shows your plan stack on every invocation
@@ -158,7 +158,7 @@ The AI writes analysis, alternatives explored, and debugging notes in scratch se
 
 ### The closed loop
 
-When the agent reads the plan file (e.g. `.jj-plan/01-feat-auth.md`), it has the full decision record. When it's done, the clean plan becomes the permanent historical record. The code links back to it:
+When the agent reads the plan file (e.g. `.jj-plan/a-01-feat-auth.md`), it has the full decision record. When it's done, the clean plan becomes the permanent historical record. The code links back to it:
 
 ```
 Plan (jj description) → Code (references jj:CHANGE_ID) → PR (plan = description) → Archaeology (jj show → full plan)
@@ -221,7 +221,7 @@ Each bookmarked change in a stack is one unit of work: the description *is* the 
 
 ```sh
 jj plan new feat-auth          # create a change + bookmark + plan file
-# Edit .jj-plan/01-feat-auth.md — write the plan
+# Edit .jj-plan/a-01-feat-auth.md — write the plan
 jj plan new feat-session       # add another plan to the stack
 jj plan done                   # mark current plan done
 jj stack submit                # push as stacked PRs
@@ -284,14 +284,14 @@ The binary maintains a directory of markdown files synced with change descriptio
 
 ```
 .jj-plan/
-  stack.md            → browsable stack overview with clickable markdown links
-  01-feat-auth.md     — first plan (closest to trunk)
-  02-feat-session.md
-  03-feat-api.md      — tip
-  template.md         — optional: custom plan template
+  stack.md              → browsable stack overview with clickable markdown links
+  a-03-feat-api.md      — tip (working copy, sorts first)
+  b-02-feat-session.md
+  c-01-feat-auth.md     — trunk-nearest (first to merge, sorts last)
+  template.md           — optional: custom plan template
 ```
 
-Files are named `NN-BOOKMARKNAME.md` where `NN` is the position in the stack. Bookmarks containing `/` have slashes encoded as `--` in filenames (e.g., `stack/auth` → `01-stack--auth.md`).
+Files are named `L-NN-BOOKMARKNAME.md` where `L` is a letter sort key (tip = `a`, sorts first in `ls`), `NN` is the dependency index (`01` = trunk-nearest = first to merge), and `BOOKMARKNAME` is the bookmark with `/` encoded as `--`. The letter ensures `ls` output matches `jj stack` display order (tip at top). The number matches `jj plan go <N>` navigation.
 
 You and an AI agent both edit these markdown files — no `jj describe` clobbering, no modal editor sessions. The binary flushes edits to jj descriptions automatically. `jj describe -m "..."` is also intercepted and routed through the plan file, so the file is always the source of truth.
 

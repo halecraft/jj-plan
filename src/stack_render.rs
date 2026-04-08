@@ -856,7 +856,7 @@ pub fn prepare_display_rows(
 ) -> Vec<DisplayRow> {
     // Reverse to get tip-to-trunk order for display.
     // enumerate() after rev() gives display_idx 0 = tip, 1 = next, etc.
-    // Plan file index is 1-based from trunk: narrowed.len() - display_idx.
+    // dependency_index is trunk-first (0 = trunk-nearest), used for filename generation.
     let num_segments = narrowed.len();
     narrowed
         .iter()
@@ -916,8 +916,12 @@ pub fn prepare_display_rows(
                 indicators,
                 first_line,
                 plan_filename: {
-                    let plan_idx = num_segments - display_idx;
-                    Some(format!("{:02}-{}.md", plan_idx, encode_bookmark_for_filename(bookmark_name)))
+                    let dependency_index = num_segments - 1 - display_idx;
+                    Some(crate::plan_file::format_plan_filename(
+                        dependency_index,
+                        num_segments,
+                        &encode_bookmark_for_filename(bookmark_name),
+                    ))
                 },
                 metadata,
             }
@@ -1411,7 +1415,7 @@ mod tests {
                     is_wc: true,
                     indicators: vec!["@".to_string()],
                     first_line: "Add API".to_string(),
-                    plan_filename: Some("02-feat-api.md".to_string()),
+                    plan_filename: Some("a-02-feat-api.md".to_string()),
                     metadata: BTreeMap::new(),
                 },
                 DisplayRow {
@@ -1421,7 +1425,7 @@ mod tests {
                     is_wc: false,
                     indicators: vec![],
                     first_line: "Auth module".to_string(),
-                    plan_filename: Some("01-feat-auth.md".to_string()),
+                    plan_filename: Some("b-01-feat-auth.md".to_string()),
                     metadata: BTreeMap::new(),
                 },
             ],
@@ -1435,11 +1439,11 @@ mod tests {
 
         // Markdown output should contain clickable links to plan files
         assert!(
-            md_output.contains("[feat-api](./02-feat-api.md)"),
+            md_output.contains("[feat-api](./a-02-feat-api.md)"),
             "single-stack markdown should link feat-api to its plan file"
         );
         assert!(
-            md_output.contains("[feat-auth](./01-feat-auth.md)"),
+            md_output.contains("[feat-auth](./b-01-feat-auth.md)"),
             "single-stack markdown should link feat-auth to its plan file"
         );
         // Markdown output must NOT contain → path text (show_paths: false).
@@ -1794,8 +1798,8 @@ mod tests {
     #[test]
     fn compact_single_column_shows_plan_path() {
         let col = make_path_column("auth", vec![
-            make_path_row("feat-api", "Add API", true, "02-feat-api.md"),
-            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+            make_path_row("feat-api", "Add API", true, "a-02-feat-api.md"),
+            make_path_row("feat-auth", "Auth module", false, "b-01-feat-auth.md"),
         ]);
         let lines = format_plain(&render_stack(&[col], &RenderOptions {
             format: StackFormat::Compact,
@@ -1805,12 +1809,12 @@ mod tests {
         // Each path must appear on the same line as its bookmark
         let api_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
         assert!(
-            api_line.contains("→ .jj-plan/02-feat-api.md"),
+            api_line.contains("→ .jj-plan/a-02-feat-api.md"),
             "compact: path should be on same line as bookmark: '{api_line}'"
         );
         let auth_line = lines.iter().find(|l| l.contains("feat-auth")).unwrap();
         assert!(
-            auth_line.contains("→ .jj-plan/01-feat-auth.md"),
+            auth_line.contains("→ .jj-plan/b-01-feat-auth.md"),
             "compact: path should be on same line as bookmark: '{auth_line}'"
         );
     }
@@ -1818,8 +1822,8 @@ mod tests {
     #[test]
     fn regular_single_column_shows_plan_path_on_node_line() {
         let col = make_path_column("auth", vec![
-            make_path_row("feat-api", "Add API", true, "02-feat-api.md"),
-            make_path_row("feat-auth", "Auth module", false, "01-feat-auth.md"),
+            make_path_row("feat-api", "Add API", true, "a-02-feat-api.md"),
+            make_path_row("feat-auth", "Auth module", false, "b-01-feat-auth.md"),
         ]);
         let lines = format_plain(&render_stack(&[col], &RenderOptions {
             format: StackFormat::Regular,
@@ -1828,13 +1832,13 @@ mod tests {
         let output = lines.join("\n");
 
         assert!(
-            output.contains("→ .jj-plan/02-feat-api.md"),
+            output.contains("→ .jj-plan/a-02-feat-api.md"),
             "regular should show plan path: {output}"
         );
         // Path must be on the node line (same line as bookmark), not on description line
         let node_line = lines.iter().find(|l| l.contains("feat-api")).unwrap();
         assert!(
-            node_line.contains("→ .jj-plan/02-feat-api.md"),
+            node_line.contains("→ .jj-plan/a-02-feat-api.md"),
             "path should be on the node line: '{node_line}'"
         );
         // Description line should NOT contain the path
