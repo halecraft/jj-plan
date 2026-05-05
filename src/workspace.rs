@@ -412,6 +412,52 @@ impl Workspace {
         Some(short_change_id(&self.repo, &commit))
     }
 
+    /// Return all local bookmarks pointing at the working copy commit.
+    ///
+    /// Useful for auto-detecting which bookmark to track when only one exists.
+    pub fn bookmarks_at_wc(&self) -> Vec<crate::types::Bookmark> {
+        let view = self.repo.view();
+        let wc_commit_id = match view.get_wc_commit_id(self.workspace.workspace_name()) {
+            Some(id) => id.clone(),
+            None => return Vec::new(),
+        };
+        let commit = match self.repo.store().get_commit(&wc_commit_id) {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut result = Vec::new();
+        for (name, _) in view.local_bookmarks_for_commit(commit.id()) {
+            let name_str = name.as_str().to_string();
+
+            // Check remote tracking
+            let name_matcher =
+                jj_lib::str_util::StringPattern::exact(name.as_str()).to_matcher();
+            let remote_matcher = jj_lib::str_util::StringMatcher::All;
+            let has_remote = view
+                .remote_bookmarks_matching(&name_matcher, &remote_matcher)
+                .any(|(symbol, _)| symbol.remote.as_str() != "git");
+            let is_synced = view
+                .remote_bookmarks_matching(&name_matcher, &remote_matcher)
+                .filter(|(symbol, _)| symbol.remote.as_str() != "git")
+                .any(|(_, remote_ref)| {
+                    remote_ref
+                        .target
+                        .as_normal()
+                        .is_some_and(|id| id == &wc_commit_id)
+                });
+
+            result.push(crate::types::Bookmark {
+                name: name_str,
+                commit_id: wc_commit_id.hex(),
+                change_id: commit.change_id().hex(),
+                has_remote,
+                is_synced,
+            });
+        }
+        result
+    }
+
     /// Read a change's description by evaluating a revset target.
     ///
     /// Returns the description with trailing newline stripped.

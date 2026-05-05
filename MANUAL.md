@@ -163,7 +163,7 @@ jj plan new auth-tests                   # inherits parent plan's stack
 | `--after <rev>` | Insert the plan after a specific revision |
 | `--help`, `-h` | Show help |
 
-### `jj plan track <bookmark>`
+### `jj plan track [bookmark]`
 
 Register an existing bookmarked change as a plan.
 

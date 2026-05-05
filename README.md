@@ -334,7 +334,7 @@ Any heading marked `[scratch]` is working memory. `jj plan done` strips all scra
 The stack is everything between `trunk()` and your working copy (including descendants): `trunk()..(@  | descendants(@))`. Bookmarks mark PR boundaries — each bookmark = one plan = one PR.
 
 - **`jj plan new <bookmark>`** creates a new change with a bookmark and registers it as a plan.
-- **`jj plan track <bookmark>`** registers an existing bookmarked change as a plan.
+- **`jj plan track [bookmark]`** registers an existing bookmarked change as a plan (auto-detects from @ if omitted).
 - **`jj plan untrack <bookmark>`** removes a bookmark from plan tracking (the bookmark itself remains).
 
 Unbookmarked changes between bookmarks are *not* plans — they're free-form work (WIP commits, experiments). At submit time, `jj stack submit` flags these as **gaps**:

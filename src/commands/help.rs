@@ -231,8 +231,8 @@ pub fn build_plan_help() -> PlanHelp {
                 description: "Create a plan (change + bookmark + plan file + registry entry)",
             },
             HelpEntry {
-                label: "track <bookmark>",
-                description: "Adopt an existing bookmark as a plan",
+                label: "track [bookmark]",
+                description: "Adopt an existing bookmark as a plan (auto-detects from @)",
             },
             HelpEntry {
                 label: "untrack <bookmark>",
@@ -597,7 +597,7 @@ mod tests {
 
         assert!(text.contains("One bookmark = one plan = one PR."));
         assert!(text.contains("jj plan new <bookmark>"));
-        assert!(text.contains("track <bookmark>"));
+        assert!(text.contains("track [bookmark]"));
         assert!(text.contains("untrack <bookmark>"));
         assert!(text.contains("$EDITOR .jj-plan/NN-bookmark.md"));
         assert!(text.contains("`jj status` shows the current plan stack"));

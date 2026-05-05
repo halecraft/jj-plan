@@ -5,7 +5,7 @@ use crate::stack_render::StackFormat;
 use crate::types::{PlanRegistry, PlannedBookmark};
 use crate::workspace::Workspace;
 
-/// Run `jj plan track <bookmark-name>` — adopt an existing bookmark as a plan.
+/// Run `jj plan track [bookmark-name]` — adopt an existing bookmark as a plan.
 ///
 /// This registers an existing bookmark in the PlanRegistry so it appears
 /// in the `stack.md` summary, gets plan files, and is a navigation target.
@@ -15,9 +15,12 @@ use crate::workspace::Workspace;
 /// `args` contains everything after `plan track`, e.g. for
 /// `jj plan track feat-auth`, args is `["feat-auth"]`.
 ///
+/// If no bookmark name is given and the working copy has exactly one
+/// untracked local bookmark, it is auto-detected and used.
+///
 /// ## Steps
 ///
-/// 1. Parse args: required positional `<bookmark-name>`
+/// 1. Parse args: positional `<bookmark-name>` or auto-detect from working copy
 /// 2. Validate bookmark exists
 /// 3. Validate bookmark is not already registered
 /// 4. Resolve bookmark's change ID
@@ -33,18 +36,63 @@ pub fn run_track(
     format: StackFormat,
 ) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
-    // 1. Parse args: bookmark name (required positional)
+    // 1. Parse args: bookmark name (positional, or auto-detect from @)
     // ------------------------------------------------------------------
     let bookmark_name = match args.first() {
         Some(name) if !name.starts_with('-') => name.clone(),
         _ => {
-            eprintln!("jj plan track: missing required <bookmark-name> argument");
-            eprintln!();
-            eprintln!("Usage: jj plan track <bookmark-name>");
-            eprintln!();
-            eprintln!("Adopts an existing bookmark as a plan. The bookmark must already");
-            eprintln!("exist in the repository (create it with `jj bookmark create`).");
-            return Ok(1);
+            // No bookmark specified — try to auto-detect from the working copy.
+            // If the current commit has exactly one untracked local bookmark, use it.
+            let wc_bookmarks = workspace.bookmarks_at_wc();
+            // Filter out any that are already tracked as plans
+            let untracked: Vec<_> = wc_bookmarks
+                .iter()
+                .filter(|b| !registry.is_tracked(&b.name))
+                .collect();
+            match untracked.len() {
+                1 => {
+                    let name = untracked[0].name.clone();
+                    eprintln!(
+                        "jj plan track: auto-detected bookmark '{}' on working copy",
+                        name
+                    );
+                    name
+                }
+                0 if !wc_bookmarks.is_empty() => {
+                    // All bookmarks on the working copy are already tracked
+                    eprintln!(
+                        "jj plan track: all bookmarks on the working copy are already tracked as plans"
+                    );
+                    for b in &wc_bookmarks {
+                        eprintln!("  {} (already tracked)", b.name);
+                    }
+                    return Ok(0);
+                }
+                0 => {
+                    eprintln!("jj plan track: missing required <bookmark-name> argument");
+                    eprintln!();
+                    eprintln!("Usage: jj plan track [bookmark-name]");
+                    eprintln!();
+                    eprintln!("Adopts an existing bookmark as a plan. The bookmark must already");
+                    eprintln!("exist in the repository (create it with `jj bookmark create`).");
+                    eprintln!();
+                    eprintln!(
+                        "Tip: If the working copy has exactly one untracked bookmark, it will be"
+                    );
+                    eprintln!("     auto-detected. Currently no bookmarks point at @.");
+                    return Ok(1);
+                }
+                _ => {
+                    eprintln!(
+                        "jj plan track: multiple untracked bookmarks on working copy — specify one:"
+                    );
+                    eprintln!();
+                    for b in &untracked {
+                        eprintln!("  jj plan track {}", b.name);
+                    }
+                    return Ok(1);
+                }
+            }
         }
     };
 
@@ -113,7 +161,10 @@ pub fn run_track(
     // ------------------------------------------------------------------
     // 6. Reload, sync, and show
     // ------------------------------------------------------------------
-    eprintln!("Tracking plan: {} (jj:{})", bookmark_name, bookmark.change_id);
+    eprintln!(
+        "Tracking plan: {} (jj:{})",
+        bookmark_name, bookmark.change_id
+    );
     workspace.reload();
     let post_registry = plan_registry::load_registry(&repo_root);
     crate::wrap::full_sync_and_show(plan_dir, workspace, &post_registry, format);
