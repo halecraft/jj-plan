@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::jj_binary::JjBinary;
 use crate::plan_dir::{self, PlanDir};
 use crate::plan_registry;
-use crate::pr_cache::load_pr_cache;
+use crate::pr_cache::{load_pr_cache, save_pr_cache};
 use crate::stack_render::{self, RenderOptions, StackColumn, StackFormat};
 use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
@@ -266,11 +266,13 @@ pub fn sync_and_show(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanR
 // Composable prerequisite: cleanup_stale_and_migrate
 // ---------------------------------------------------------------------------
 
-/// Cleanup: untrack stale bookmarks and migrate legacy filenames.
+/// Cleanup: untrack stale bookmarks, migrate legacy filenames, prune PR cache.
 ///
-/// Performs the two imperative side effects that must run before sync:
+/// Performs three imperative side effects that must run before sync:
 /// 1. Detect and untrack registry entries whose bookmarks no longer exist in jj.
 /// 2. Migrate legacy change-ID-based filenames to bookmark-named files.
+/// 3. Prune orphaned PR cache entries whose bookmarks no longer exist in jj
+///    or the plan registry.
 ///
 /// Idempotent: safe to call multiple times (second call finds nothing to do).
 ///
@@ -320,6 +322,32 @@ pub fn cleanup_stale_and_migrate(
         }
         None
     });
+
+    // 3. Prune orphaned PR cache entries.
+    // A cache entry is orphaned when its bookmark exists in neither the live
+    // jj bookmarks nor the plan registry. The registry parameter is the
+    // original snapshot from before this function was called — intentionally
+    // conservative: a bookmark just untracked in step 1 still appears in this
+    // registry, so its cache entry survives one extra cycle.
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let mut cache_live: HashSet<&str> = live_bookmark_names; // already has local bookmarks
+    for bm in &registry.bookmarks {
+        cache_live.insert(&bm.name);
+    }
+    if let Ok(mut pr_cache) = load_pr_cache(&repo_root) {
+        let pruned = pr_cache.retain_bookmarks(&cache_live);
+        if !pruned.is_empty() {
+            if let Err(e) = save_pr_cache(&repo_root, &pr_cache) {
+                eprintln!("Warning: failed to save PR cache after pruning: {e}");
+            } else {
+                eprintln!(
+                    "jj-plan: pruned {} stale PR cache entry(ies): {}",
+                    pruned.len(),
+                    pruned.join(", ")
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

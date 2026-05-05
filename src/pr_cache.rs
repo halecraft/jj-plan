@@ -68,7 +68,20 @@ impl PrCache {
         self.prs.len() < len_before
     }
 
-
+    /// Remove cache entries whose bookmarks are not in the given set.
+    /// Returns the list of bookmark names that were removed.
+    pub fn retain_bookmarks(&mut self, live: &std::collections::HashSet<&str>) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.prs.retain(|p| {
+            if live.contains(p.bookmark.as_str()) {
+                true
+            } else {
+                removed.push(p.bookmark.clone());
+                false
+            }
+        });
+        removed
+    }
 }
 
 /// Get path to the PR cache file.
@@ -230,5 +243,42 @@ mod tests {
         let content = fs::read_to_string(pr_cache_path(temp.path())).unwrap();
         assert!(content.contains("PR association cache"));
         assert!(content.contains("Safe to delete"));
+    }
+
+    #[test]
+    fn test_retain_bookmarks_removes_orphans() {
+        let mut cache = PrCache::new();
+        cache.upsert("feat-a", &make_test_pr(1), "origin");
+        cache.upsert("feat-b", &make_test_pr(2), "origin");
+        cache.upsert("feat-c", &make_test_pr(3), "origin");
+
+        let live: std::collections::HashSet<&str> = ["feat-a", "feat-c"].into();
+        let mut removed = cache.retain_bookmarks(&live);
+        removed.sort();
+        assert_eq!(removed, vec!["feat-b"]);
+        assert!(cache.get("feat-a").is_some());
+        assert!(cache.get("feat-b").is_none());
+        assert!(cache.get("feat-c").is_some());
+    }
+
+    #[test]
+    fn test_retain_bookmarks_no_op_when_all_live() {
+        let mut cache = PrCache::new();
+        cache.upsert("feat-a", &make_test_pr(1), "origin");
+        cache.upsert("feat-b", &make_test_pr(2), "origin");
+
+        let live: std::collections::HashSet<&str> = ["feat-a", "feat-b", "feat-c"].into();
+        let removed = cache.retain_bookmarks(&live);
+        assert!(removed.is_empty());
+        assert_eq!(cache.prs.len(), 2);
+    }
+
+    #[test]
+    fn test_retain_bookmarks_empty_cache() {
+        let mut cache = PrCache::new();
+        let live: std::collections::HashSet<&str> = ["feat-a"].into();
+        let removed = cache.retain_bookmarks(&live);
+        assert!(removed.is_empty());
+        assert!(cache.prs.is_empty());
     }
 }

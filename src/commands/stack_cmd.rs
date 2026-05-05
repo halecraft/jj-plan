@@ -662,8 +662,9 @@ async fn run_submit_async(
             }
         }
 
-        if chain.len() >= 2 {
-            // Only add stack comments for multi-PR stacks (single PR has no stack to navigate).
+        if !chain.is_empty() {
+            // Add stack comments for any non-empty chain, including single-PR stacks
+            // (replaces stale multi-PR comments when a stack shrinks).
             let mut comment_steps = Vec::new();
 
             for (bookmark, pr_number, _title) in &chain {

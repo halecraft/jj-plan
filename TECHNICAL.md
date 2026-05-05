@@ -385,10 +385,11 @@ Callers that need cleanup without the single-stack display (e.g. `jj stack --all
 
 ### Composable prerequisite: `cleanup_stale_and_migrate`
 
-`cleanup_stale_and_migrate(plan_dir, workspace, registry)` performs two imperative side effects that must run before sync:
+`cleanup_stale_and_migrate(plan_dir, workspace, registry)` performs three imperative side effects that must run before sync:
 
 1. **Detect stale bookmarks** (`find_stale_bookmarks`, pure): identify registry entries whose bookmarks no longer exist in jj (e.g. deleted by `jj abandon`). Untrack and save if any found.
 2. **Migrate legacy filenames** (`plan_file::migrate_legacy_filenames`): rename old change-ID-based filenames to bookmark-named files.
+3. **Prune orphaned PR cache entries** (`pr_cache::retain_bookmarks`): remove cache entries whose bookmarks no longer exist in jj or the plan registry. This catches PRs merged via GitHub's UI, where `jj stack merge` cleanup never ran.
 
 This function is idempotent — safe to call multiple times (the second call finds nothing to do). It is not a sync tier itself, but a composable prerequisite that any caller can invoke before choosing which sync tier to use.
 
@@ -720,7 +721,7 @@ Stack comments depend on PR numbers from freshly-created PRs, which aren't known
 1. **Pass 1**: Execute the main plan (Push, CreatePr, UpdateBase, UpdateDescription, PublishPr).
 2. **Pass 2**: Build `AddStackComment` steps from the now-known PR numbers (from cache + freshly created), then execute them.
 
-Pass 2 is skipped for single-PR stacks (no navigation needed) or when `--no-comments` is specified.
+Pass 2 is skipped for empty chains or when `--no-comments` is specified. Single-PR stacks receive a stack comment to replace any stale multi-PR comment from a previous submit.
 
 ---
 
@@ -822,7 +823,7 @@ updated_at = "2025-01-15T12:00:00Z"
 
 - **Populated** by `jj stack submit` after creating or finding PRs.
 - **Consulted** by `jj stack submit` (create vs update decision), `jj stack merge` (PR number lookup), and `jj stack` visualization (PR status display).
-- **Cleaned** by `jj stack merge` (removes entries for merged bookmarks).
+- **Cleaned** by `jj stack merge` (removes entries for merged bookmarks) and by `cleanup_stale_and_migrate` (prunes entries whose bookmarks no longer exist locally or in the plan registry).
 - **Safe to delete** — rebuilt on next submit.
 
 Uses `resolve_repo_path()` from `plan_registry.rs` for workspace indirection.
