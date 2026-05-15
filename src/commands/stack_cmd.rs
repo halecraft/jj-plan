@@ -17,6 +17,15 @@ use crate::workspace::Workspace;
 
 use async_trait::async_trait;
 
+/// Render an `err.hint()` result as an indented `Hint:` line suffix suitable
+/// for `eprintln!`-style warning sites. Returns empty string when `None`.
+fn hint_suffix(err: &JjPlanError) -> String {
+    match err.hint() {
+        Some(h) => format!("\n  Hint: {h}"),
+        None => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dispatch-level argument parsing
 // ---------------------------------------------------------------------------
@@ -673,7 +682,10 @@ async fn run_submit_async(
                     match ctx.platform.list_pr_comments(*pr_number).await {
                         Ok(pr_comments) => comments::find_existing_comment(&pr_comments),
                         Err(e) => {
-                            eprintln!("Warning: failed to list comments on #{pr_number}: {e}");
+                            eprintln!(
+                                "Warning: failed to list comments on #{pr_number}: {e}{}",
+                                hint_suffix(&e)
+                            );
                             None
                         }
                     }
@@ -911,7 +923,10 @@ async fn run_merge_async(
                     None
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to find PR for {bookmark}: {e}");
+                    eprintln!(
+                        "Warning: failed to find PR for {bookmark}: {e}{}",
+                        hint_suffix(&e)
+                    );
                     None
                 }
             }
@@ -1028,8 +1043,8 @@ async fn run_merge_async(
             }
             Err(e) => {
                 eprintln!(
-                    "Warning: readiness check failed for #{} ({}): {}",
-                    pr_number, bookmark, e
+                    "Warning: readiness check failed for #{} ({}): {}{}",
+                    pr_number, bookmark, e, hint_suffix(&e)
                 );
                 // Continue anyway — the merge attempt is the definitive test.
             }
@@ -1062,8 +1077,9 @@ async fn run_merge_async(
             Err(e) => {
                 let msg = format!("Failed to merge #{} ({}): {}", pr_number, bookmark, e);
                 eprintln!(
-                    "  ✗ {}",
-                    format_pr_error(&pr_cache, bookmark, *pr_number, &msg)
+                    "  ✗ {}{}",
+                    format_pr_error(&pr_cache, bookmark, *pr_number, &msg),
+                    hint_suffix(&e)
                 );
                 return Ok(1);
             }
@@ -1293,7 +1309,7 @@ fn run_auth(args: &[String]) -> Result<i32> {
                                 Ok(0)
                             }
                             Err(e) => {
-                                eprintln!("  ✗ Authentication failed: {e}");
+                                eprintln!("  ✗ Authentication failed: {e}{}", hint_suffix(&e));
                                 Ok(1)
                             }
                         }
@@ -1334,7 +1350,7 @@ fn run_auth(args: &[String]) -> Result<i32> {
                                 Ok(0)
                             }
                             Err(e) => {
-                                eprintln!("  ✗ Authentication failed: {e}");
+                                eprintln!("  ✗ Authentication failed: {e}{}", hint_suffix(&e));
                                 Ok(1)
                             }
                         }
@@ -1378,7 +1394,7 @@ fn run_auth(args: &[String]) -> Result<i32> {
                                 Ok(0)
                             }
                             Err(e) => {
-                                eprintln!("  ✗ Authentication failed: {e}");
+                                eprintln!("  ✗ Authentication failed: {e}{}", hint_suffix(&e));
                                 Ok(1)
                             }
                         }

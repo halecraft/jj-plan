@@ -795,16 +795,11 @@ impl Workspace {
             .iter()
             .find(|(symbol, _)| symbol.name.as_str() == bookmark)
         {
-            // Walk the error source chain to surface the root cause.
             // FailedRefExportReason variants like FailedToSet/FailedToDelete
             // use #[source], so Display only prints "Failed to set" — the
-            // underlying git error is in .source().
-            let mut detail = reason.to_string();
-            let mut source: Option<&dyn std::error::Error> = std::error::Error::source(reason);
-            while let Some(cause) = source {
-                detail = format!("{detail}: {cause}");
-                source = cause.source();
-            }
+            // underlying git error is in .source(). Flatten the chain to
+            // surface the root cause.
+            let detail = crate::error::flatten_error_chain(reason);
             return Err(JjPlanError::Git(format!(
                 "Failed to export bookmark '{bookmark}' to git: {detail}"
             )));

@@ -7,7 +7,10 @@ use octocrab::models::pulls::ReviewState;
 use octocrab::params::repos::Commitish;
 use tokio::process::Command;
 
-use crate::error::{JjPlanError, Result};
+use crate::error::{ForgeCliFailure, JjPlanError, Result, flatten_error_chain};
+use crate::platform::error::{
+    Operation, PlatformApiError, build_platform_api_error,
+};
 use crate::types::{
     MergeMethod, MergeReadiness, MergeResult, Platform, PlatformConfig, PrComment, PrState,
     PullRequest, PullRequestDetails,
@@ -20,6 +23,83 @@ pub struct GitHubService {
     client: octocrab::Octocrab,
     config: PlatformConfig,
 }
+
+// ─── Error adapter (pure builder + thin extractor) ────────────────────────
+
+/// Extract HTTP status, server message, and optional detail from an
+/// `octocrab::Error`. Thin extractor — easy to compose with
+/// `build_platform_api_error` at call sites.
+///
+/// For `octocrab::Error::GitHub`, pulls the `GitHubError`'s status/message/
+/// field-errors. For all other variants (Hyper, Service, Json, ...), walks
+/// the source chain via `flatten_error_chain` and returns `status: None`.
+fn extract_github_error_fields(err: &octocrab::Error) -> (Option<u16>, String, Option<String>) {
+    if let octocrab::Error::GitHub { source, .. } = err {
+        let status = Some(source.status_code.as_u16());
+        let message = source.message.clone();
+        let detail = format_github_field_errors(source);
+        (status, message, detail)
+    } else {
+        (None, flatten_error_chain(err), None)
+    }
+}
+
+/// Render `GitHubError.errors` as a human-readable string. Appends the
+/// `documentation_url` (when present) on its own line. Returns `None` if
+/// neither piece is present.
+fn format_github_field_errors(err: &octocrab::GitHubError) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(errors) = err.errors.as_ref().filter(|e| !e.is_empty()) {
+        for e in errors {
+            if let Some(obj) = e.as_object() {
+                let resource = obj.get("resource").and_then(|v| v.as_str());
+                let field = obj.get("field").and_then(|v| v.as_str());
+                let code = obj.get("code").and_then(|v| v.as_str());
+                let message = obj.get("message").and_then(|v| v.as_str());
+
+                let key = match (resource, field) {
+                    (Some(r), Some(f)) => format!("{r}.{f}"),
+                    (Some(r), None) => r.to_string(),
+                    (None, Some(f)) => f.to_string(),
+                    (None, None) => "error".to_string(),
+                };
+                let body = message.or(code).unwrap_or("invalid");
+                parts.push(format!("{key}: {body}"));
+            } else {
+                parts.push(e.to_string());
+            }
+        }
+    }
+    if let Some(url) = &err.documentation_url {
+        parts.push(format!("see: {url}"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// Convert an `octocrab::Error` into a `PlatformApiError` tagged with the
+/// given `Operation` and `target`. The full pipeline:
+/// `extract_github_error_fields` → `build_platform_api_error`.
+fn octocrab_err(
+    operation: Operation,
+    target: Option<String>,
+    err: octocrab::Error,
+) -> PlatformApiError {
+    let (status, message, detail) = extract_github_error_fields(&err);
+    build_platform_api_error(
+        Platform::GitHub,
+        operation,
+        target,
+        status,
+        message,
+        detail,
+    )
+}
+
+// ─── Service ──────────────────────────────────────────────────────────────
 
 impl GitHubService {
     /// Create a new GitHub service.
@@ -35,15 +115,15 @@ impl GitHubService {
         let mut builder = octocrab::Octocrab::builder().personal_token(token.to_string());
 
         if let Some(ref h) = host {
-            let base_url = format!("https://{}/api/v3/", h);
+            let base_url = format!("https://{h}/api/v3/");
             builder = builder.base_uri(base_url).map_err(|e| {
-                JjPlanError::GitHubApi(format!("invalid GitHub Enterprise host: {e}"))
+                JjPlanError::Config(format!("invalid GitHub Enterprise host '{h}': {e}"))
             })?;
         }
 
         let client = builder
             .build()
-            .map_err(|e| JjPlanError::GitHubApi(format!("failed to build GitHub client: {e}")))?;
+            .map_err(|e| JjPlanError::Config(format!("failed to build GitHub client: {e}")))?;
 
         Ok(Self {
             client,
@@ -57,8 +137,7 @@ impl GitHubService {
     }
 
     fn pulls(&self) -> octocrab::pulls::PullRequestHandler<'_> {
-        self.client
-            .pulls(&self.config.owner, &self.config.repo)
+        self.client.pulls(&self.config.owner, &self.config.repo)
     }
 
     /// Convert an octocrab `PullRequest` into our domain type.
@@ -86,6 +165,7 @@ impl GitHubService {
     /// and no CHANGES_REQUESTED reviews. Returns `true` if there are no
     /// reviews at all (no required reviewers).
     async fn check_reviews(&self, pr_number: u64) -> Result<bool> {
+        let target = format!("#{pr_number}");
         let reviews: Vec<octocrab::models::pulls::Review> = self
             .client
             .get(
@@ -95,7 +175,8 @@ impl GitHubService {
                 ),
                 None::<&()>,
             )
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::CheckMergeReadiness, Some(target.clone()), e))?;
 
         if reviews.is_empty() {
             return Ok(true); // No reviews → no required reviewers → approved
@@ -120,19 +201,20 @@ impl GitHubService {
     /// In-progress runs are not treated as failures — they produce an
     /// uncertainty note in the caller.
     async fn check_ci_status(&self, head_sha: &str) -> Result<bool> {
+        let target = head_sha.to_string();
         let check_runs = self
             .client
             .checks(&self.config.owner, &self.config.repo)
             .list_check_runs_for_git_ref(Commitish(head_sha.to_string()))
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::CheckMergeReadiness, Some(target), e))?;
 
         if check_runs.total_count == 0 {
             return Ok(true); // No CI configured
         }
 
         let all_completed_ok = check_runs.check_runs.iter().all(|cr| {
-            // A run without a conclusion is still in progress — don't fail on it.
             cr.conclusion
                 .as_deref()
                 .is_none_or(|c| c == "success" || c == "skipped" || c == "neutral")
@@ -147,6 +229,7 @@ impl PlatformService for GitHubService {
     async fn find_existing_pr(&self, head_branch: &str) -> Result<Option<PullRequest>> {
         let owner = &self.config.owner;
         let head_filter = format!("{owner}:{head_branch}");
+        let target = head_branch.to_string();
 
         let page = self
             .pulls()
@@ -154,7 +237,8 @@ impl PlatformService for GitHubService {
             .head(head_filter)
             .state(octocrab::params::State::Open)
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::FindExistingPr, Some(target), e))?;
 
         Ok(page.items.first().map(Self::convert_pr))
     }
@@ -167,6 +251,7 @@ impl PlatformService for GitHubService {
         body: Option<&str>,
         draft: bool,
     ) -> Result<PullRequest> {
+        let target = head.to_string();
         let pulls = self.pulls();
         let mut builder = pulls.create(title, head, base);
 
@@ -177,7 +262,10 @@ impl PlatformService for GitHubService {
             builder = builder.draft(true);
         }
 
-        let pr = builder.send().await?;
+        let pr = builder
+            .send()
+            .await
+            .map_err(|e| octocrab_err(Operation::CreatePr, Some(target), e))?;
         Ok(Self::convert_pr(&pr))
     }
 
@@ -187,24 +275,28 @@ impl PlatformService for GitHubService {
         title: &str,
         body: &str,
     ) -> Result<PullRequest> {
+        let target = format!("#{pr_number}");
         let pr = self
             .pulls()
             .update(pr_number)
             .title(title)
             .body(body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::UpdateDescription, Some(target), e))?;
 
         Ok(Self::convert_pr(&pr))
     }
 
     async fn update_pr_base(&self, pr_number: u64, new_base: &str) -> Result<PullRequest> {
+        let target = format!("#{pr_number}");
         let pr = self
             .pulls()
             .update(pr_number)
             .base(new_base)
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::UpdateBase, Some(target), e))?;
 
         Ok(Self::convert_pr(&pr))
     }
@@ -213,8 +305,14 @@ impl PlatformService for GitHubService {
         // REST v3 PATCH cannot clear draft status. Use GraphQL mutation
         // `markPullRequestReadyForReview`, falling back to `gh pr ready`.
 
+        let target = format!("#{pr_number}");
+
         // Fetch the PR to get its node_id for GraphQL.
-        let pr = self.pulls().get(pr_number).await?;
+        let pr = self
+            .pulls()
+            .get(pr_number)
+            .await
+            .map_err(|e| octocrab_err(Operation::PublishPr, Some(target.clone()), e))?;
         let node_id = pr.node_id.clone().unwrap_or_default();
 
         if !node_id.is_empty() {
@@ -238,7 +336,13 @@ impl PlatformService for GitHubService {
 
                     if is_draft == Some(false) {
                         // Success — refetch via REST to get the full PR object.
-                        let refreshed = self.pulls().get(pr_number).await?;
+                        let refreshed = self
+                            .pulls()
+                            .get(pr_number)
+                            .await
+                            .map_err(|e| {
+                                octocrab_err(Operation::PublishPr, Some(target.clone()), e)
+                            })?;
                         return Ok(Self::convert_pr(&refreshed));
                     }
 
@@ -259,35 +363,47 @@ impl PlatformService for GitHubService {
 
         // Fallback: shell out to `gh pr ready`.
         let repo_slug = format!("{}/{}", self.config.owner, self.config.repo);
+        let command = format!("pr ready {pr_number} --repo {repo_slug}");
         let output = Command::new("gh")
             .args(["pr", "ready", &pr_number.to_string(), "--repo", &repo_slug])
             .output()
             .await
-            .map_err(|e| {
-                JjPlanError::GitHubApi(format!(
-                    "failed to run `gh pr ready`: {e}. Install GitHub CLI or use a fine-grained token with GraphQL access."
-                ))
+            .map_err(|io_err| JjPlanError::ForgeCli {
+                tool: "gh",
+                command: command.clone(),
+                kind: ForgeCliFailure::NotInstalled(io_err),
             })?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(JjPlanError::GitHubApi(format!(
-                "`gh pr ready #{pr_number}` failed: {stderr}"
-            )));
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(JjPlanError::ForgeCli {
+                tool: "gh",
+                command,
+                kind: ForgeCliFailure::Failed {
+                    exit_code: output.status.code(),
+                    stderr,
+                },
+            });
         }
 
         // Refetch the PR to return updated state.
-        let refreshed = self.pulls().get(pr_number).await?;
+        let refreshed = self
+            .pulls()
+            .get(pr_number)
+            .await
+            .map_err(|e| octocrab_err(Operation::PublishPr, Some(target), e))?;
         Ok(Self::convert_pr(&refreshed))
     }
 
     async fn list_pr_comments(&self, pr_number: u64) -> Result<Vec<PrComment>> {
+        let target = format!("#{pr_number}");
         let comments = self
             .client
             .issues(&self.config.owner, &self.config.repo)
             .list_comments(pr_number)
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::ListComments, Some(target), e))?;
 
         Ok(comments
             .items
@@ -300,25 +416,30 @@ impl PlatformService for GitHubService {
     }
 
     async fn create_pr_comment(&self, pr_number: u64, body: &str) -> Result<()> {
+        let target = format!("#{pr_number}");
         self.client
             .issues(&self.config.owner, &self.config.repo)
             .create_comment(pr_number, body)
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::CreateComment, Some(target), e))?;
         Ok(())
     }
 
     async fn update_pr_comment(
         &self,
-        _pr_number: u64,
+        pr_number: u64,
         comment_id: u64,
         body: &str,
     ) -> Result<()> {
-        // Issue comments are repo-scoped, so pr_number is unused.
+        let target = format!("#{pr_number}");
+        // Issue comments are repo-scoped, so pr_number is unused in the URL —
+        // we still tag it as the target for hint context.
         let comment_id = octocrab::models::CommentId(comment_id);
         self.client
             .issues(&self.config.owner, &self.config.repo)
             .update_comment(comment_id, body)
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::UpdateComment, Some(target), e))?;
         Ok(())
     }
 
@@ -327,7 +448,12 @@ impl PlatformService for GitHubService {
     }
 
     async fn get_pr_details(&self, pr_number: u64) -> Result<PullRequestDetails> {
-        let pr = self.pulls().get(pr_number).await?;
+        let target = format!("#{pr_number}");
+        let pr = self
+            .pulls()
+            .get(pr_number)
+            .await
+            .map_err(|e| octocrab_err(Operation::GetPrDetails, Some(target), e))?;
 
         let state = match &pr.state {
             Some(octocrab::models::IssueState::Open) => PrState::Open,
@@ -360,7 +486,12 @@ impl PlatformService for GitHubService {
     }
 
     async fn check_merge_readiness(&self, pr_number: u64) -> Result<MergeReadiness> {
-        let pr = self.pulls().get(pr_number).await?;
+        let target = format!("#{pr_number}");
+        let pr = self
+            .pulls()
+            .get(pr_number)
+            .await
+            .map_err(|e| octocrab_err(Operation::CheckMergeReadiness, Some(target), e))?;
 
         let details = PullRequestDetails {
             number: pr.number,
@@ -433,6 +564,7 @@ impl PlatformService for GitHubService {
     }
 
     async fn merge_pr(&self, pr_number: u64, method: MergeMethod) -> Result<MergeResult> {
+        let target = format!("#{pr_number}");
         let merge_method = match method {
             MergeMethod::Squash => octocrab::params::pulls::MergeMethod::Squash,
             MergeMethod::Merge => octocrab::params::pulls::MergeMethod::Merge,
@@ -444,7 +576,8 @@ impl PlatformService for GitHubService {
             .merge(pr_number)
             .method(merge_method)
             .send()
-            .await?;
+            .await
+            .map_err(|e| octocrab_err(Operation::MergePr, Some(target), e))?;
 
         Ok(MergeResult {
             merged: result.merged,
@@ -453,3 +586,4 @@ impl PlatformService for GitHubService {
         })
     }
 }
+

@@ -2,6 +2,8 @@
 
 use crate::auth::AuthSource;
 use crate::error::{JjPlanError, Result};
+use crate::platform::error::{Operation, checked_response};
+use crate::types::Platform;
 use reqwest::Client;
 use serde::Deserialize;
 use std::env;
@@ -56,17 +58,21 @@ pub async fn test_gitea_auth(config: &GiteaAuthConfig) -> Result<String> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| JjPlanError::GiteaApi(format!("failed to create HTTP client: {e}")))?;
+        .map_err(|e| JjPlanError::Config(format!("failed to build Gitea HTTP client: {e}")))?;
 
-    let user: GiteaUser = client
+    let response = client
         .get(&url)
         .header("Authorization", format!("token {}", config.token))
         .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| JjPlanError::Auth(format!("Invalid token: {e}")))?
-        .json()
         .await?;
+
+    let user: GiteaUser = checked_response(
+        response,
+        Platform::Gitea,
+        Operation::TestAuth,
+        Some(config.host.clone()),
+    )
+    .await?;
 
     Ok(user.login)
 }

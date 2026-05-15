@@ -9,13 +9,59 @@
 //! `abort_on_error = false` (via `--continue-on-error`) to collect all
 //! errors without stopping — useful for independent steps like comments.
 
-use crate::error::Result;
+use std::borrow::Cow;
+
+use crate::error::{JjPlanError, Result};
 use crate::platform::PlatformService;
 use crate::pr_cache::PrCache;
 use crate::submit::plan::{ExecutionStep, SubmissionPlan};
 use crate::submit::progress::{Phase, ProgressCallback, PushStatus};
 use crate::types::PullRequest;
 use crate::workspace::{PushOutcome, Workspace};
+
+/// Pure stage 1: derive the diagnostic and hint for a failed forge-API step.
+///
+/// For `JjPlanError::PlatformApi`, the diagnostic comes from the error's own
+/// `Display` (which renders `{Platform} {Operation} failed (status): message`).
+/// For other variants the caller-supplied `fallback_summary` is used. The hint
+/// is sourced from `err.hint()` regardless of variant — the single entry
+/// point for all hint extraction.
+fn step_failure_parts<'a>(
+    fallback_summary: &'a str,
+    err: &'a JjPlanError,
+) -> (String, Option<Cow<'static, str>>) {
+    let diagnostic = match err {
+        JjPlanError::PlatformApi(_) => err.to_string(),
+        _ => format!("{fallback_summary}: {err}"),
+    };
+    (diagnostic, err.hint())
+}
+
+/// Pure stage 2: format diagnostic + optional hint into a single rendered
+/// string. The two-tier format is `diagnostic` on the first line and
+/// `Hint: ...` on a following line when present.
+fn format_step_failure(diagnostic: &str, hint: Option<&str>) -> String {
+    match hint {
+        Some(h) => format!("{diagnostic}\n  Hint: {h}"),
+        None => diagnostic.to_string(),
+    }
+}
+
+/// Imperative shell: emit the progress event and record the message in
+/// `result.errors`. Composes the two-tier output via `step_failure_parts` +
+/// `format_step_failure`.
+async fn report_step_failure(
+    progress: &dyn ProgressCallback,
+    result: &mut SubmissionResult,
+    fallback_summary: &str,
+    err: &JjPlanError,
+) -> Result<()> {
+    let (diagnostic, hint) = step_failure_parts(fallback_summary, err);
+    let msg = format_step_failure(&diagnostic, hint.as_deref());
+    progress.on_error(&msg).await?;
+    result.errors.push(msg);
+    Ok(())
+}
 
 /// Result of submission execution.
 #[derive(Debug, Default)]
@@ -192,9 +238,8 @@ pub async fn execute_submission(
                         result.created.push((bookmark.clone(), pr));
                     }
                     Err(e) => {
-                        let msg = format!("Failed to create PR for {bookmark}: {e}");
-                        progress.on_error(&msg).await?;
-                        result.errors.push(msg);
+                        let fallback = format!("Failed to create PR for {bookmark}");
+                        report_step_failure(progress, &mut result, &fallback, &e).await?;
                     }
                 }
             }
@@ -209,9 +254,8 @@ pub async fn execute_submission(
                         result.updated.push(bookmark.clone());
                     }
                     Err(e) => {
-                        let msg = format!("Failed to retarget #{pr_number} ({bookmark}): {e}");
-                        progress.on_error(&msg).await?;
-                        result.errors.push(msg);
+                        let fallback = format!("Failed to retarget #{pr_number} ({bookmark})");
+                        report_step_failure(progress, &mut result, &fallback, &e).await?;
                     }
                 }
             }
@@ -234,11 +278,10 @@ pub async fn execute_submission(
                         result.description_updated.push(bookmark.clone());
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "Failed to update description for #{pr_number} ({bookmark}): {e}"
+                        let fallback = format!(
+                            "Failed to update description for #{pr_number} ({bookmark})"
                         );
-                        progress.on_error(&msg).await?;
-                        result.errors.push(msg);
+                        report_step_failure(progress, &mut result, &fallback, &e).await?;
                     }
                 }
             }
@@ -256,10 +299,9 @@ pub async fn execute_submission(
                         result.published.push(bookmark.clone());
                     }
                     Err(e) => {
-                        let msg =
-                            format!("Failed to publish #{pr_number} ({bookmark}): {e}");
-                        progress.on_error(&msg).await?;
-                        result.errors.push(msg);
+                        let fallback =
+                            format!("Failed to publish #{pr_number} ({bookmark})");
+                        report_step_failure(progress, &mut result, &fallback, &e).await?;
                     }
                 }
             }
@@ -298,11 +340,10 @@ pub async fn execute_submission(
                         result.comments.push(bookmark.clone());
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "Failed to add stack comment on #{pr_number} ({bookmark}): {e}"
+                        let fallback = format!(
+                            "Failed to add stack comment on #{pr_number} ({bookmark})"
                         );
-                        progress.on_error(&msg).await?;
-                        result.errors.push(msg);
+                        report_step_failure(progress, &mut result, &fallback, &e).await?;
                     }
                 }
             }
@@ -324,4 +365,66 @@ pub async fn execute_submission(
 
     progress.on_phase(Phase::Complete).await?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::error::{Operation, build_platform_api_error};
+    use crate::types::Platform;
+
+    #[test]
+    fn step_failure_parts_platform_api_with_hint_derives_diagnostic_from_error() {
+        let pae = build_platform_api_error(
+            Platform::GitHub,
+            Operation::CreatePr,
+            Some("feat/x".to_string()),
+            Some(422),
+            "Validation Failed".to_string(),
+            None,
+        );
+        let err = JjPlanError::PlatformApi(pae);
+        let (diag, hint) = step_failure_parts("UNUSED FALLBACK", &err);
+        assert!(diag.contains("GitHub CreatePr failed (422): Validation Failed"));
+        assert!(!diag.contains("UNUSED FALLBACK"));
+        let h = hint.expect("hint should be present for 422 + CreatePr with target");
+        assert!(h.contains("feat/x"));
+    }
+
+    #[test]
+    fn step_failure_parts_platform_api_without_hint() {
+        let pae = build_platform_api_error(
+            Platform::GitHub,
+            Operation::MergePr,
+            None,
+            Some(409),
+            "Conflict".to_string(),
+            None,
+        );
+        let err = JjPlanError::PlatformApi(pae);
+        let (diag, hint) = step_failure_parts("fallback", &err);
+        assert!(diag.contains("GitHub MergePr failed (409): Conflict"));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn step_failure_parts_non_platform_api_uses_fallback_summary() {
+        let err = JjPlanError::Git("ref export failed".to_string());
+        let (diag, hint) = step_failure_parts("Failed to push feat/x", &err);
+        assert!(diag.contains("Failed to push feat/x"));
+        assert!(diag.contains("ref export failed"));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn format_step_failure_with_hint() {
+        let s = format_step_failure("diag line", Some("do the thing"));
+        assert!(s.starts_with("diag line"));
+        assert!(s.contains("Hint: do the thing"));
+    }
+
+    #[test]
+    fn format_step_failure_without_hint() {
+        assert_eq!(format_step_failure("diag line", None), "diag line");
+    }
 }

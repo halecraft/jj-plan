@@ -2,6 +2,8 @@
 
 use crate::auth::AuthSource;
 use crate::error::{JjPlanError, Result};
+use crate::platform::error::{Operation, build_platform_api_error};
+use crate::types::Platform;
 use std::env;
 use tokio::process::Command;
 
@@ -74,16 +76,38 @@ async fn get_gh_cli_token() -> Option<String> {
 
 /// Test GitHub authentication.
 pub async fn test_github_auth(config: &GitHubAuthConfig) -> Result<String> {
+    let host = "github.com".to_string();
+
     let octocrab = octocrab::Octocrab::builder()
         .personal_token(config.token.clone())
         .build()
-        .map_err(|e| JjPlanError::GitHubApi(e.to_string()))?;
+        .map_err(|e| JjPlanError::Config(format!("failed to build GitHub client: {e}")))?;
 
-    let user = octocrab
-        .current()
-        .user()
-        .await
-        .map_err(|e| JjPlanError::Auth(format!("Invalid token: {e}")))?;
+    let user = octocrab.current().user().await.map_err(|e| {
+        let (status, message, detail) = extract_octocrab_fields(&e);
+        JjPlanError::PlatformApi(build_platform_api_error(
+            Platform::GitHub,
+            Operation::TestAuth,
+            Some(host),
+            status,
+            message,
+            detail,
+        ))
+    })?;
 
     Ok(user.login)
+}
+
+/// Local copy of GitHub error-field extraction so this module doesn't depend
+/// on `platform::github`'s private helpers.
+fn extract_octocrab_fields(err: &octocrab::Error) -> (Option<u16>, String, Option<String>) {
+    if let octocrab::Error::GitHub { source, .. } = err {
+        (
+            Some(source.status_code.as_u16()),
+            source.message.clone(),
+            None,
+        )
+    } else {
+        (None, crate::error::flatten_error_chain(err), None)
+    }
 }

@@ -614,10 +614,12 @@ An async trait (via `async_trait`) with 12 methods covering the full PR lifecycl
 
 Uses `octocrab` (typed GitHub client) for REST and GraphQL operations:
 
-- **`publish_pr`**: Uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API cannot clear draft status. Fetches the PR's `node_id` via REST, then issues the mutation. Falls back to `gh pr ready` subprocess if GraphQL fails (e.g., classic tokens without GraphQL permissions).
+- **`publish_pr`**: Uses a GraphQL mutation (`markPullRequestReadyForReview`) since the REST API cannot clear draft status. Fetches the PR's `node_id` via REST, then issues the mutation. Falls back to `gh pr ready` subprocess if GraphQL fails (e.g., classic tokens without GraphQL permissions). Subprocess failures from the fallback path are surfaced as `JjPlanError::ForgeCli { tool: "gh", command, kind }` rather than `PlatformApiError` — they're not HTTP API calls. The `kind` distinguishes `NotInstalled` (binary not on PATH; `hint()` suggests installing the CLI or granting GraphQL access) from `Failed { exit_code, stderr }` (binary ran but exited non-zero; stderr typically speaks for itself, so no hint).
 - **`update_pr_description`**: Uses octocrab's `pulls().update(number).title(...).body(...).send()`.
 - **`convert_pr`**: Maps octocrab PR model to our `PullRequest` type. Uses `base.ref_field` (bare branch name) rather than `base.label` (`owner:branch` format) to ensure correct comparison in the submit plan phase.
-- **`check_merge_readiness`**: Now queries the reviews API (`GET /pulls/{number}/reviews`) and check runs API (`GET /commits/{sha}/check-runs`) instead of hardcoding `is_approved: false` / `ci_passed: false`. Reviews are approved if any has state `APPROVED` and none has `CHANGES_REQUESTED`. CI passes if no check runs exist or all completed runs have `conclusion` of `success`, `skipped`, or `neutral`. Failures to query either API result in a permissive fallback with an uncertainty note.
+- **`check_merge_readiness`**: Queries the reviews API (`GET /pulls/{number}/reviews`) and check runs API (`GET /commits/{sha}/check-runs`). Reviews are approved if any has state `APPROVED` and none has `CHANGES_REQUESTED`. CI passes if no check runs exist or all completed runs have `conclusion` of `success`, `skipped`, or `neutral`. Failures to query either API result in a permissive fallback with an uncertainty note recorded in `MergeReadiness.uncertainties`.
+
+**octocrab error Display quirk.** `octocrab::Error::GitHub { source, .. }` lacks `#[snafu(display(...))]`, so its `Display` produces only the variant name (`"GitHub"`) — the actual `GitHubError` (status code, message, field errors) is reachable only via `Error::source()`. This is correct snafu 0.8 behaviour (variants without explicit display strings use the variant name) but a footgun when combined with `#[from]` auto-conversion: a `?`-propagated octocrab error would surface as `"jj-plan: GitHub client error: GitHub"`. The mitigation is `octocrab_err` in `platform/github.rs`, which splits into a thin extractor (`extract_github_error_fields`) — pulling status / message / field-errors from `Error::GitHub`, falling back to `flatten_error_chain` for other variants — and a pure builder (`build_platform_api_error`). Every `.await?` site in `github.rs` wraps the octocrab error through this helper, tagging it with the appropriate `Operation` and `target` so `PlatformApiError::Display` and `hint()` can produce a rich diagnostic line plus optional guidance.
 
 ### GitLab implementation (`src/platform/gitlab.rs`)
 
@@ -640,6 +642,33 @@ Key Gitea-specific patterns:
 - **`check_merge_readiness`**: Single-shot observation (no polling). Queries `/pulls/{index}/reviews` for approval status. If no reviews exist, treats as approved (self-hosted Gitea typically has no required reviews). CI status is assumed passing with an uncertainty note, since Gitea Actions status is not easily available per-PR. Polling for transient `mergeable == false` states (forge still recomputing after retargets/merges) is handled generically by the merge executor's `poll_until_ready`.
 - **`mergeable`**: Gitea reports this synchronously in the PR response, but the value may be stale immediately after graph-changing events. The executor's transient-state polling handles this.
 - **Branch refs**: `base.label` / `head.label` are bare branch names (not `owner:branch` like GitHub).
+
+### Platform error layer (`src/platform/error.rs`)
+
+Single source of truth for forge-API error handling across GitHub, GitLab, and Gitea.
+
+- **`Operation` enum** — names the high-level API call (`CreatePr`, `MergePr`, `TestAuth`, ...). Replaces `&'static str` operation tags at each call site and provides `Display` for diagnostic rendering. Constructed directly at each platform-method call site (no `From<&ExecutionStep>` — the mapping isn't bijective: `Push` has no `Operation`, `AddStackComment` is bivalent depending on `existing_comment_id`).
+- **`PlatformApiError`** — structured error carrying `platform`, `operation`, `status: Option<u16>`, `message`, optional `detail`, and an optional `target` identifier (bookmark name, `#42`, host). `Display` renders `"{Platform} {Operation} failed ({status}): {message}"` with optional detail on a following line.
+- **`PlatformApiError::hint()`** — pure function pattern-matching on `(status, operation)`. Covers 401 (platform-specific auth-command suggestion), 403 (scopes), 404 (repo/branch), and 422 + CreatePr (parameterised by `target` when present). Returns `Cow<'static, str>` so static hints don't allocate. **No `status: None` row** — connectivity hints live on `JjPlanError::Http` (see below).
+- **`classify_response(status, body, platform, operation, target) -> Option<PlatformApiError>`** — pure: returns `Some(err)` on 4xx/5xx, `None` on 2xx. Extracts `message` and `detail` from the body via a best-effort JSON parse (GitLab `{"message": ..., "error": ...}`; Gitea `{"message": ...}`; array-typed `message` joined with commas; falls back to the raw body string).
+- **`checked_response<T: DeserializeOwned>(response, ...)`** — async shell: reads status + body once, delegates to `classify_response`, deserializes JSON on success. Shared between GitLab and Gitea — the auth-header difference happens before the response exists, so the helper is platform-agnostic.
+- **`checked_status(response, ...)`** — sibling helper that returns `()` on success without attempting JSON deserialization. Used for endpoints whose response body we don't consume: GitLab/Gitea `create_pr_comment`, `update_pr_comment`, and Gitea `merge_pr` (which re-fetches via `get_pr`).
+
+reqwest's `error_for_status()` is deliberately not used. Calling it consumes the response — only the status code and URL remain in the resulting `reqwest::Error`. The server's error message body is lost. `checked_response`/`checked_status` read the body before checking status so the body is available for `classify_response` to extract `message` and `detail`.
+
+### Error type & hint system (`src/error.rs`)
+
+- **`JjPlanError::PlatformApi(#[from] PlatformApiError)`** — single variant for forge HTTP API failures across all three platforms. Replaced the lossy `GitHubApi(String)` / `GitLabApi(String)` / `GiteaApi(String)` / `Octocrab(#[from] octocrab::Error)` variants.
+- **`JjPlanError::ForgeCli { tool, command, kind: ForgeCliFailure }`** — variant for forge-CLI subprocess failures (today: `gh pr ready` fallback in `publish_pr`). `kind = NotInstalled(io::Error) | Failed { exit_code, stderr }`, with distinct `Display` output per arm.
+- **`JjPlanError::hint() -> Option<Cow<'static, str>>`** — single entry point for hint extraction. Every rendering site (submit executor, merge command, auth probe, comment-listing warnings) calls `err.hint()` uniformly without first matching on the variant. Three arms:
+  - `PlatformApi(e)` → delegates to `PlatformApiError::hint()`.
+  - `Http(e)` where `e.is_connect() || e.is_timeout()` → connectivity hint. The guard keeps body-decode failures out of the network bucket.
+  - `ForgeCli { kind: NotInstalled(_), tool, .. }` → install/workaround hint, parameterised by `tool`.
+- **`flatten_error_chain(err)`** — walks `Error::source()` and joins messages with `": "`. Replaces an inline walker in `workspace.rs` and is used by `extract_github_error_fields` for non-`Error::GitHub` octocrab variants.
+
+The deliberate connectivity-hint asymmetry: octocrab's wrapped `Hyper`/`Service` connect failures don't surface as `reqwest::Error`, so they land on `PlatformApi { status: None }` with no hint. This is accepted — GitHub connect errors are rare, octocrab's chained Display already identifies them, and walking the source chain for hyper errors costs more than it buys. Network hints belong on the layer that carries the transport signal.
+
+**Push errors and API errors take different hint paths.** `PushOutcome::Rejected/RemoteRejected` errors originate in `workspace.rs` (jj-lib write ops), aren't `PlatformApiError`, and have their own inline guidance (`"try \`jj git fetch\` to refresh tracking state"`). The hint system is forge-API-specific. The `report_step_failure` helper in `execute.rs` falls back to caller-supplied summaries for non-`PlatformApi` variants, preserving push errors' inline guidance.
 
 ### Platform detection (`src/platform/detection.rs`)
 

@@ -2,6 +2,8 @@
 
 use crate::auth::AuthSource;
 use crate::error::{JjPlanError, Result};
+use crate::platform::error::{Operation, checked_response};
+use crate::types::Platform;
 use reqwest::Client;
 use serde::Deserialize;
 use std::env;
@@ -95,17 +97,21 @@ pub async fn test_gitlab_auth(config: &GitLabAuthConfig) -> Result<String> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| JjPlanError::GitLabApi(format!("failed to create HTTP client: {e}")))?;
+        .map_err(|e| JjPlanError::Config(format!("failed to build GitLab HTTP client: {e}")))?;
 
-    let user: GitLabUser = client
+    let response = client
         .get(&url)
         .header("PRIVATE-TOKEN", &config.token)
         .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| JjPlanError::Auth(format!("Invalid token: {e}")))?
-        .json()
         .await?;
+
+    let user: GitLabUser = checked_response(
+        response,
+        Platform::GitLab,
+        Operation::TestAuth,
+        Some(config.host.clone()),
+    )
+    .await?;
 
     Ok(user.username)
 }

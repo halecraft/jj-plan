@@ -6,6 +6,7 @@ use std::env;
 
 use crate::error::{JjPlanError, Result};
 use crate::platform::PlatformService;
+use crate::platform::error::{Operation, checked_response, checked_status};
 use crate::types::{
     MergeMethod, MergeReadiness, MergeResult, Platform, PlatformConfig, PrComment, PrState,
     PullRequest, PullRequestDetails,
@@ -102,7 +103,9 @@ impl GiteaService {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .build()
-            .map_err(|e| JjPlanError::GiteaApi(format!("failed to create HTTP client: {e}")))?;
+            .map_err(|e| {
+                JjPlanError::Config(format!("failed to build Gitea HTTP client: {e}"))
+            })?;
 
         let config_host = if host == "codeberg.org" {
             None
@@ -132,28 +135,36 @@ impl GiteaService {
     }
 
     fn repo_path(&self) -> String {
-        format!(
-            "/repos/{}/{}",
-            self.config.owner, self.config.repo
-        )
+        format!("/repos/{}/{}", self.config.owner, self.config.repo)
     }
 
-    /// Fetch a single PR by index.
-    async fn get_pr(&self, pr_number: u64) -> Result<GiteaPullRequest> {
-        let url = self.api_url(&format!("{}/pulls/{}", self.repo_path(), pr_number));
+    // ── authed_* helpers ───────────────────────────────────────────────
+    // Apply Gitea's `Authorization: token <T>` header at a single point.
 
-        let pr: GiteaPullRequest = self
-            .client
-            .get(&url)
+    fn authed_request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        self.client
+            .request(method, url)
             .header("Authorization", format!("token {}", self.token))
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
-            .await?;
+    }
+    fn authed_get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::GET, url)
+    }
+    fn authed_post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::POST, url)
+    }
+    fn authed_patch(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::PATCH, url)
+    }
 
-        Ok(pr)
+    /// Fetch a single PR by index. `op` is the caller's operation, so that
+    /// errors attribute to the user-visible operation (e.g. `Operation::MergePr`)
+    /// rather than the internal helper call.
+    async fn get_pr(&self, pr_number: u64, op: Operation) -> Result<GiteaPullRequest> {
+        let url = self.api_url(&format!("{}/pulls/{}", self.repo_path(), pr_number));
+        let target = format!("#{pr_number}");
+
+        let response = self.authed_get(&url).send().await?;
+        checked_response(response, Platform::Gitea, op, Some(target)).await
     }
 }
 
@@ -165,17 +176,18 @@ impl PlatformService for GiteaService {
         // Gitea's `head` query parameter is a loose filter — it matches PRs
         // where the head OR base branch contains the value. We must fetch
         // candidates and then client-side filter to the exact head branch.
-        let prs: Vec<GiteaPullRequest> = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_get(&url)
             .query(&[("state", "open"), ("head", head_branch)])
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
             .await?;
+        let prs: Vec<GiteaPullRequest> = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::FindExistingPr,
+            Some(head_branch.to_string()),
+        )
+        .await?;
 
         Ok(prs
             .into_iter()
@@ -213,35 +225,34 @@ impl PlatformService for GiteaService {
             payload["body"] = serde_json::Value::String(body_text.to_string());
         }
 
-        let pr: GiteaPullRequest = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
-            .await?;
+        let response = self.authed_post(&url).json(&payload).send().await?;
+        let pr: GiteaPullRequest = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::CreatePr,
+            Some(head.to_string()),
+        )
+        .await?;
 
         Ok(pr.into())
     }
 
     async fn update_pr_base(&self, pr_number: u64, new_base: &str) -> Result<PullRequest> {
         let url = self.api_url(&format!("{}/pulls/{}", self.repo_path(), pr_number));
+        let target = format!("#{pr_number}");
 
-        let pr: GiteaPullRequest = self
-            .client
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_patch(&url)
             .json(&serde_json::json!({ "base": new_base }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
             .await?;
+        let pr: GiteaPullRequest = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::UpdateBase,
+            Some(target),
+        )
+        .await?;
 
         Ok(pr.into())
     }
@@ -253,27 +264,30 @@ impl PlatformService for GiteaService {
         body: &str,
     ) -> Result<PullRequest> {
         let url = self.api_url(&format!("{}/pulls/{}", self.repo_path(), pr_number));
+        let target = format!("#{pr_number}");
 
-        let pr: GiteaPullRequest = self
-            .client
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_patch(&url)
             .json(&serde_json::json!({ "title": title, "body": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
             .await?;
+        let pr: GiteaPullRequest = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::UpdateDescription,
+            Some(target),
+        )
+        .await?;
 
         Ok(pr.into())
     }
 
     async fn publish_pr(&self, pr_number: u64) -> Result<PullRequest> {
         let url = self.api_url(&format!("{}/pulls/{}", self.repo_path(), pr_number));
+        let target = format!("#{pr_number}");
 
-        // Fetch current PR to get its title.
-        let current = self.get_pr(pr_number).await?;
+        // Fetch current PR to get its title — attributes errors to PublishPr.
+        let current = self.get_pr(pr_number, Operation::PublishPr).await?;
 
         // Strip the draft prefix that we applied on creation, and also
         // try `draft: false` in the PATCH body for newer Gitea versions.
@@ -285,17 +299,18 @@ impl PlatformService for GiteaService {
             .unwrap_or(&current.title)
             .to_string();
 
-        let pr: GiteaPullRequest = self
-            .client
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_patch(&url)
             .json(&serde_json::json!({ "title": new_title, "draft": false }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
             .await?;
+        let pr: GiteaPullRequest = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::PublishPr,
+            Some(target),
+        )
+        .await?;
 
         Ok(pr.into())
     }
@@ -307,17 +322,16 @@ impl PlatformService for GiteaService {
             self.repo_path(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        let comments: Vec<GiteaComment> = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("token {}", self.token))
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?
-            .json()
-            .await?;
+        let response = self.authed_get(&url).send().await?;
+        let comments: Vec<GiteaComment> = checked_response(
+            response,
+            Platform::Gitea,
+            Operation::ListComments,
+            Some(target),
+        )
+        .await?;
 
         Ok(comments
             .into_iter()
@@ -334,20 +348,23 @@ impl PlatformService for GiteaService {
             self.repo_path(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        self.client
-            .post(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_post(&url)
             .json(&serde_json::json!({ "body": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?;
-
-        Ok(())
+            .await?;
+        checked_status(
+            response,
+            Platform::Gitea,
+            Operation::CreateComment,
+            Some(target),
+        )
+        .await
     }
 
-    async fn update_pr_comment(&self, _pr_number: u64, comment_id: u64, body: &str) -> Result<()> {
+    async fn update_pr_comment(&self, pr_number: u64, comment_id: u64, body: &str) -> Result<()> {
         // Gitea uses /repos/{owner}/{repo}/issues/comments/{id} for updating —
         // the comment ID is globally unique, so pr_number is not needed in the URL.
         let url = self.api_url(&format!(
@@ -355,17 +372,20 @@ impl PlatformService for GiteaService {
             self.repo_path(),
             comment_id
         ));
+        let target = format!("#{pr_number}");
 
-        self.client
-            .patch(&url)
-            .header("Authorization", format!("token {}", self.token))
+        let response = self
+            .authed_patch(&url)
             .json(&serde_json::json!({ "body": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(e.to_string()))?;
-
-        Ok(())
+            .await?;
+        checked_status(
+            response,
+            Platform::Gitea,
+            Operation::UpdateComment,
+            Some(target),
+        )
+        .await
     }
 
     fn config(&self) -> &PlatformConfig {
@@ -377,7 +397,7 @@ impl PlatformService for GiteaService {
     // =========================================================================
 
     async fn get_pr_details(&self, pr_number: u64) -> Result<PullRequestDetails> {
-        let pr = self.get_pr(pr_number).await?;
+        let pr = self.get_pr(pr_number, Operation::GetPrDetails).await?;
 
         let state = if pr.merged {
             PrState::Merged
@@ -403,47 +423,41 @@ impl PlatformService for GiteaService {
     }
 
     async fn check_merge_readiness(&self, pr_number: u64) -> Result<MergeReadiness> {
-        // Single-shot observation — no polling. The merge executor handles
-        // transient states (forge still recomputing mergeable status after
-        // graph-changing events) generically via `poll_until_ready`.
         let details = self.get_pr_details(pr_number).await?;
+        let target = format!("#{pr_number}");
+        let mut uncertainties: Vec<String> = Vec::new();
 
-        // Fetch reviews to check approval status.
+        // ── Reviews (secondary; record-and-continue on failure) ─────
         let reviews_url = self.api_url(&format!(
             "{}/pulls/{}/reviews",
             self.repo_path(),
             pr_number
         ));
 
-        let (is_approved, has_changes_requested) = match self
-            .client
-            .get(&reviews_url)
-            .header("Authorization", format!("token {}", self.token))
-            .send()
-            .await
+        let (is_approved, has_changes_requested) = match try_checked_response::<Vec<GiteaReview>>(
+            self.authed_get(&reviews_url),
+            Operation::CheckMergeReadiness,
+            Some(target.clone()),
+        )
+        .await
         {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let reviews: Vec<GiteaReview> =
-                        response.json().await.unwrap_or_default();
-
-                    if reviews.is_empty() {
-                        // No reviews at all — self-hosted Gitea typically has no
-                        // required reviews, so treat as approved.
-                        (true, false)
-                    } else {
-                        let any_approved = reviews.iter().any(|r| r.state == "APPROVED");
-                        let any_changes_requested =
-                            reviews.iter().any(|r| r.state == "REQUEST_CHANGES");
-                        let approved = any_approved && !any_changes_requested;
-                        (approved, any_changes_requested)
-                    }
-                } else {
-                    // Cannot fetch reviews — default to approved (permissive).
+            Ok(reviews) => {
+                if reviews.is_empty() {
+                    // No reviews at all — self-hosted Gitea typically has no
+                    // required reviews, so treat as approved.
                     (true, false)
+                } else {
+                    let any_approved = reviews.iter().any(|r| r.state == "APPROVED");
+                    let any_changes_requested =
+                        reviews.iter().any(|r| r.state == "REQUEST_CHANGES");
+                    let approved = any_approved && !any_changes_requested;
+                    (approved, any_changes_requested)
                 }
             }
-            Err(_) => (true, false),
+            Err(e) => {
+                uncertainties.push(format!("could not fetch reviews: {e}"));
+                (true, false) // Permissive — don't block on a reviews fetch failure
+            }
         };
 
         // Gitea Actions status is not easily available per-PR, so we
@@ -467,7 +481,9 @@ impl PlatformService for GiteaService {
         }
 
         // Gitea doesn't expose CI status per-PR easily — note the uncertainty.
-        let uncertainties = vec!["CI status not checked (Gitea Actions status not available per-PR)".to_string()];
+        uncertainties.push(
+            "CI status not checked (Gitea Actions status not available per-PR)".to_string(),
+        );
 
         Ok(MergeReadiness {
             is_approved,
@@ -480,11 +496,8 @@ impl PlatformService for GiteaService {
     }
 
     async fn merge_pr(&self, pr_number: u64, method: MergeMethod) -> Result<MergeResult> {
-        let url = self.api_url(&format!(
-            "{}/pulls/{}/merge",
-            self.repo_path(),
-            pr_number
-        ));
+        let url = self.api_url(&format!("{}/pulls/{}/merge", self.repo_path(), pr_number));
+        let target = format!("#{pr_number}");
 
         let do_method = match method {
             MergeMethod::Squash => "squash",
@@ -494,20 +507,23 @@ impl PlatformService for GiteaService {
 
         // Gitea merge endpoint uses uppercase "Do" key.
         let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("token {}", self.token))
+            .authed_post(&url)
             .json(&serde_json::json!({ "Do": do_method }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GiteaApi(format!("Merge failed: {e}")))?;
+            .await?;
 
-        // Gitea returns an empty body on successful merge (HTTP 200).
-        // We must GET the PR afterwards to confirm merged status and get the SHA.
-        drop(response);
+        // Gitea returns an empty body on successful merge (HTTP 200), so use
+        // `checked_status` (skips JSON deserialization) and re-fetch the PR
+        // for the result fields.
+        checked_status(
+            response,
+            Platform::Gitea,
+            Operation::MergePr,
+            Some(target),
+        )
+        .await?;
 
-        let pr = self.get_pr(pr_number).await?;
+        let pr = self.get_pr(pr_number, Operation::MergePr).await?;
 
         Ok(MergeResult {
             merged: pr.merged,
@@ -515,4 +531,17 @@ impl PlatformService for GiteaService {
             message: None,
         })
     }
+}
+
+/// Helper: send a request and run `checked_response`, capturing both pre-send
+/// `reqwest::Error`s and classified `PlatformApiError`s into a single `Result`.
+/// Used by `check_merge_readiness` to gather secondary-endpoint failures into
+/// `uncertainties` rather than aborting the whole assessment.
+async fn try_checked_response<T: serde::de::DeserializeOwned>(
+    rb: reqwest::RequestBuilder,
+    operation: Operation,
+    target: Option<String>,
+) -> Result<T> {
+    let response = rb.send().await?;
+    checked_response(response, Platform::Gitea, operation, target).await
 }

@@ -4,6 +4,7 @@
 
 use crate::error::{JjPlanError, Result};
 use crate::platform::PlatformService;
+use crate::platform::error::{Operation, checked_response, checked_status};
 use crate::types::{
     MergeMethod, MergeReadiness, MergeResult, Platform, PlatformConfig, PrComment, PrState,
     PullRequest, PullRequestDetails,
@@ -111,7 +112,9 @@ impl GitLabService {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS))
             .build()
-            .map_err(|e| JjPlanError::GitLabApi(format!("failed to create HTTP client: {e}")))?;
+            .map_err(|e| {
+                JjPlanError::Config(format!("failed to build GitLab HTTP client: {e}"))
+            })?;
 
         let config_host = if host == "gitlab.com" {
             None
@@ -140,6 +143,23 @@ impl GitLabService {
     fn encoded_project(&self) -> String {
         urlencoding::encode(&self.project_path).into_owned()
     }
+
+    // ── authed_* helpers ───────────────────────────────────────────────
+    // Apply the GitLab PRIVATE-TOKEN header at a single point so callers
+    // can't accidentally make an unauthenticated request.
+
+    fn authed_request(&self, method: reqwest::Method, url: &str) -> reqwest::RequestBuilder {
+        self.client.request(method, url).header("PRIVATE-TOKEN", &self.token)
+    }
+    fn authed_get(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::GET, url)
+    }
+    fn authed_post(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::POST, url)
+    }
+    fn authed_put(&self, url: &str) -> reqwest::RequestBuilder {
+        self.authed_request(reqwest::Method::PUT, url)
+    }
 }
 
 #[async_trait]
@@ -150,17 +170,19 @@ impl PlatformService for GitLabService {
             self.encoded_project()
         ));
 
-        let mrs: Vec<MergeRequest> = self
-            .client
-            .get(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_get(&url)
             .query(&[("source_branch", head_branch), ("state", "opened")])
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
             .await?;
+
+        let mrs: Vec<MergeRequest> = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::FindExistingPr,
+            Some(head_branch.to_string()),
+        )
+        .await?;
 
         Ok(mrs.into_iter().next().map(Into::into))
     }
@@ -186,17 +208,14 @@ impl PlatformService for GitLabService {
             draft: if draft { Some(true) } else { None },
         };
 
-        let mr: MergeRequest = self
-            .client
-            .post(&url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .json(&payload)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
-            .await?;
+        let response = self.authed_post(&url).json(&payload).send().await?;
+        let mr: MergeRequest = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::CreatePr,
+            Some(head.to_string()),
+        )
+        .await?;
 
         Ok(mr.into())
     }
@@ -207,18 +226,20 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        let mr: MergeRequest = self
-            .client
-            .put(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_put(&url)
             .json(&serde_json::json!({ "target_branch": new_base }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
             .await?;
+        let mr: MergeRequest = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::UpdateBase,
+            Some(target),
+        )
+        .await?;
 
         Ok(mr.into())
     }
@@ -234,18 +255,20 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        let mr: MergeRequest = self
-            .client
-            .put(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_put(&url)
             .json(&serde_json::json!({ "title": title, "description": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
             .await?;
+        let mr: MergeRequest = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::UpdateDescription,
+            Some(target),
+        )
+        .await?;
 
         Ok(mr.into())
     }
@@ -256,20 +279,22 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
         // Remove draft status. GitLab's state_event only accepts "close"/"reopen";
         // the correct way to un-draft is { "draft": false } (since GitLab 15.0).
-        let mr: MergeRequest = self
-            .client
-            .put(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_put(&url)
             .json(&serde_json::json!({ "draft": false }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
             .await?;
+        let mr: MergeRequest = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::PublishPr,
+            Some(target),
+        )
+        .await?;
 
         Ok(mr.into())
     }
@@ -280,17 +305,16 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        let notes: Vec<MrNote> = self
-            .client
-            .get(&url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
-            .await?;
+        let response = self.authed_get(&url).send().await?;
+        let notes: Vec<MrNote> = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::ListComments,
+            Some(target),
+        )
+        .await?;
 
         let comments: Vec<PrComment> = notes
             .into_iter()
@@ -310,17 +334,20 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        self.client
-            .post(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_post(&url)
             .json(&serde_json::json!({ "body": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?;
-
-        Ok(())
+            .await?;
+        checked_status(
+            response,
+            Platform::GitLab,
+            Operation::CreateComment,
+            Some(target),
+        )
+        .await
     }
 
     async fn update_pr_comment(&self, pr_number: u64, comment_id: u64, body: &str) -> Result<()> {
@@ -330,17 +357,20 @@ impl PlatformService for GitLabService {
             pr_number,
             comment_id
         ));
+        let target = format!("#{pr_number}");
 
-        self.client
-            .put(&url)
-            .header("PRIVATE-TOKEN", &self.token)
+        let response = self
+            .authed_put(&url)
             .json(&serde_json::json!({ "body": body }))
             .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?;
-
-        Ok(())
+            .await?;
+        checked_status(
+            response,
+            Platform::GitLab,
+            Operation::UpdateComment,
+            Some(target),
+        )
+        .await
     }
 
     fn config(&self) -> &PlatformConfig {
@@ -357,17 +387,16 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
-        let mr: MergeRequestDetails = self
-            .client
-            .get(&url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(e.to_string()))?
-            .json()
-            .await?;
+        let response = self.authed_get(&url).send().await?;
+        let mr: MergeRequestDetails = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::GetPrDetails,
+            Some(target),
+        )
+        .await?;
 
         let state = match mr.state.as_str() {
             "opened" => PrState::Open,
@@ -390,60 +419,40 @@ impl PlatformService for GitLabService {
     }
 
     async fn check_merge_readiness(&self, pr_number: u64) -> Result<MergeReadiness> {
-        // Get MR details first
+        // Get MR details first.
         let details = self.get_pr_details(pr_number).await?;
+        let target = format!("#{pr_number}");
+        let mut uncertainties: Vec<String> = Vec::new();
 
-        // Check approvals
+        // ── Approvals (secondary; record-and-continue on failure) ─────
         let approvals_url = self.api_url(&format!(
             "/projects/{}/merge_requests/{}/approvals",
             self.encoded_project(),
             pr_number
         ));
-
-        let is_approved = match self
-            .client
-            .get(&approvals_url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let approvals: MrApprovals =
-                        response.json().await.unwrap_or(MrApprovals { approved: false });
-                    approvals.approved
-                } else {
+        let is_approved =
+            match try_checked_response::<MrApprovals>(self.authed_get(&approvals_url), Operation::CheckMergeReadiness, Some(target.clone())).await {
+                Ok(a) => a.approved,
+                Err(e) => {
+                    uncertainties.push(format!("could not fetch approvals: {e}"));
                     false
                 }
-            }
-            Err(_) => false,
-        };
+            };
 
-        // Check pipelines (most recent)
+        // ── Pipelines (secondary; record-and-continue on failure) ─────
         let pipelines_url = self.api_url(&format!(
             "/projects/{}/merge_requests/{}/pipelines",
             self.encoded_project(),
             pr_number
         ));
-
-        let ci_passed = match self
-            .client
-            .get(&pipelines_url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let pipelines: Vec<Pipeline> = response.json().await.unwrap_or_default();
-                    // No pipeline = not blocking, otherwise check most recent
-                    pipelines.first().is_none_or(|p| p.status == "success")
-                } else {
-                    true
+        let ci_passed =
+            match try_checked_response::<Vec<Pipeline>>(self.authed_get(&pipelines_url), Operation::CheckMergeReadiness, Some(target.clone())).await {
+                Ok(pipelines) => pipelines.first().is_none_or(|p| p.status == "success"),
+                Err(e) => {
+                    uncertainties.push(format!("could not fetch pipelines: {e}"));
+                    true // Permissive — don't block on a pipelines fetch failure
                 }
-            }
-            Err(_) => true,
-        };
+            };
 
         // Build blocking reasons
         let mut blocking_reasons = Vec::new();
@@ -460,14 +469,13 @@ impl PlatformService for GitLabService {
             blocking_reasons.push("Has merge conflicts".to_string());
         }
 
-        // GitLab always computes merge_status synchronously, so no uncertainties
         Ok(MergeReadiness {
             is_approved,
             ci_passed,
             is_mergeable: details.mergeable,
             is_draft: details.is_draft,
             blocking_reasons,
-            uncertainties: vec![],
+            uncertainties,
         })
     }
 
@@ -480,6 +488,7 @@ impl PlatformService for GitLabService {
             self.encoded_project(),
             pr_number
         ));
+        let target = format!("#{pr_number}");
 
         let body = match method {
             MergeMethod::Squash => serde_json::json!({
@@ -497,22 +506,32 @@ impl PlatformService for GitLabService {
             }),
         };
 
-        let response: MergeResponse = self
-            .client
-            .put(&url)
-            .header("PRIVATE-TOKEN", &self.token)
-            .json(&body)
-            .send()
-            .await?
-            .error_for_status()
-            .map_err(|e| JjPlanError::GitLabApi(format!("Merge failed: {e}")))?
-            .json()
-            .await?;
+        let response = self.authed_put(&url).json(&body).send().await?;
+        let merge_response: MergeResponse = checked_response(
+            response,
+            Platform::GitLab,
+            Operation::MergePr,
+            Some(target),
+        )
+        .await?;
 
         Ok(MergeResult {
-            merged: response.state == "merged",
-            sha: response.merge_commit_sha,
+            merged: merge_response.state == "merged",
+            sha: merge_response.merge_commit_sha,
             message: None,
         })
     }
+}
+
+/// Helper: send a request and run `checked_response`, capturing both pre-send
+/// `reqwest::Error`s and classified `PlatformApiError`s into a single `Result`.
+/// Used by `check_merge_readiness` to gather secondary-endpoint failures into
+/// `uncertainties` rather than aborting the whole assessment.
+async fn try_checked_response<T: serde::de::DeserializeOwned>(
+    rb: reqwest::RequestBuilder,
+    operation: Operation,
+    target: Option<String>,
+) -> Result<T> {
+    let response = rb.send().await?;
+    checked_response(response, Platform::GitLab, operation, target).await
 }
