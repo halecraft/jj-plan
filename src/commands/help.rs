@@ -255,6 +255,10 @@ pub fn build_plan_help() -> PlanHelp {
                 description: "Show what would change without modifying anything",
             },
             HelpEntry {
+                label: "  --show-stripped=<mode>",
+                description: "Report stripped scratch sections: full | toc | headings | none (default: toc)",
+            },
+            HelpEntry {
                 label: "next",
                 description: "Advance @ to the next plan in the stack",
             },

@@ -1333,6 +1333,94 @@ Final results"
   [[ "$descs" == *"plan-status: ✅"* ]]
 }
 
+@test "jj plan done --show-stripped=toc lists top-level scratch + descendants" {
+  jj describe -m "My plan
+
+> [!plan]
+> status: 🔴
+
+# Background
+
+Real content.
+
+# Notes [scratch]
+
+These are my learnings.
+
+## Sub-finding
+
+Nested content.
+
+# Conclusion
+
+Wrap-up."
+  run jj plan done
+  [[ "$output" == *"Stripped scratch sections:"* ]]
+  [[ "$output" == *"# Notes [scratch]"* ]]
+  [[ "$output" == *"## Sub-finding"* ]]
+  [[ "$output" == *"Recover with: jj evolog -r"* ]]
+}
+
+@test "jj plan done --show-stripped=headings omits descendants" {
+  jj describe -m "My plan
+
+> [!plan]
+> status: 🔴
+
+# Background
+
+Real content.
+
+# Notes [scratch]
+
+These are my learnings.
+
+## Sub-finding
+
+Nested content."
+  run jj plan done --show-stripped=headings
+  [[ "$output" == *"# Notes [scratch]"* ]]
+  [[ "$output" != *"## Sub-finding"* ]]
+}
+
+@test "jj plan done --show-stripped=none is silent on strip side" {
+  jj describe -m "My plan
+
+> [!plan]
+> status: 🔴
+
+# Notes [scratch]
+
+Hidden learnings."
+  run jj plan done --show-stripped=none
+  [[ "$output" != *"Stripped scratch sections:"* ]]
+  [[ "$output" != *"Recover with:"* ]]
+}
+
+@test "jj plan done --dry-run --show-stripped=none keeps status side" {
+  jj describe -m "My plan
+
+> [!plan]
+> status: 🔴
+
+# Notes [scratch]
+
+Hidden learnings."
+  run jj plan done --dry-run --show-stripped=none
+  [[ "$output" != *"Stripped scratch sections:"* ]]
+  [[ "$output" == *"Would set metadata: status: ✅"* ]]
+}
+
+@test "jj plan done rejects invalid --show-stripped value" {
+  jj describe -m "My plan"
+  run jj plan done --show-stripped=verbose
+  [[ "$output" == *"invalid --show-stripped value"* ]]
+  [[ "$output" == *"full"* ]]
+  [[ "$output" == *"toc"* ]]
+  [[ "$output" == *"headings"* ]]
+  [[ "$output" == *"none"* ]]
+}
+
 @test "jj plan done on already-done plan is idempotent" {
   jj describe -m "My plan
 

@@ -186,11 +186,13 @@ jj plan untrack feat-auth
 Mark one or all plans as done: strip `[scratch]` sections and set `plan-status: ✅`.
 
 ```
-jj plan done                   # mark the working copy's plan as done
-jj plan done <change_id>       # mark a specific plan as done
-jj plan done --stack           # mark all plans in the stack as done
-jj plan done --dry-run         # preview what would be changed
-jj plan done --keep-scratch    # don't strip [scratch] sections
+jj plan done                          # mark the working copy's plan as done
+jj plan done <change_id>              # mark a specific plan as done
+jj plan done --stack                  # mark all plans in the stack as done
+jj plan done --dry-run                # preview what would be changed
+jj plan done --keep-scratch           # don't strip [scratch] sections
+jj plan done --show-stripped=full     # also print the full body of each stripped section
+jj plan done --show-stripped=none     # don't report what was stripped
 ```
 
 **What it does:**
@@ -201,6 +203,7 @@ jj plan done --keep-scratch    # don't strip [scratch] sections
    - If a `plan-status:` line already exists with a different value (e.g., `🔴`), it is replaced in-place.
    - If no `plan-status:` line exists, one is appended.
    - If `plan-status: ✅` is already present, no change is made.
+4. Prints a report of any stripped scratch sections to stderr, with a recovery hint pointing at `jj evolog`. Verbosity is controlled by `--show-stripped` (default: `toc`).
 
 **Flags:**
 
@@ -209,6 +212,7 @@ jj plan done --keep-scratch    # don't strip [scratch] sections
 | `--stack` | Mark all changes in the stack as done |
 | `--keep-scratch` | Don't strip `[scratch]` sections |
 | `--dry-run` | Preview what would be changed without modifying anything |
+| `--show-stripped=<mode>` | Report stripped scratch sections. Modes: `full` (heading + body), `toc` (heading + descendant headings — default), `headings` (top-level scratch headings only), `none` (silent). |
 
 ### `jj plan summary`
 
@@ -1012,6 +1016,13 @@ jj plan config                     # shows PlanRegistry contents
 ```
 
 ### Show what scratch content was stripped
+
+`jj plan done` prints a report of stripped scratch sections to stderr by default
+(see `--show-stripped`). The report names the heading and table-of-contents of
+what was removed and includes a `jj evolog` recovery hint.
+
+For the authoritative pre-strip content (including bodies that the inline
+report omits), `jj evolog` remains the source of truth:
 
 ```sh
 jj evolog -r kpqxywon              # see all versions, including pre-done

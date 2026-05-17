@@ -1,10 +1,50 @@
 use crate::jj_binary::JjBinary;
-use crate::markdown::PlanDocument;
+use crate::markdown::{PlanDocument, StrippedSection};
 use crate::plan_dir::PlanDir;
 use crate::stack_render::StackFormat;
 use crate::types::PlanRegistry;
 use crate::workspace::Workspace;
 use crate::wrap::SyncChangeView;
+
+/// Verbosity mode for the "stripped scratch sections" report printed by
+/// `jj plan done` and `jj plan done --dry-run`.
+///
+/// The user-facing CLI value is spelled `none`; `parse_show_stripped` maps it
+/// to `ShowStripped::Off` to avoid `Option::None` collisions at use sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowStripped {
+    /// Print the top-level scratch heading, its descendant headings, and the
+    /// verbatim body of each stripped section.
+    Full,
+    /// Print the top-level scratch heading with descendant headings indented
+    /// beneath it (a "table of contents" of the strip). Default.
+    Toc,
+    /// Print only the top-level scratch headings; descendants are omitted.
+    Headings,
+    /// Print nothing about the strip.
+    Off,
+}
+
+impl ShowStripped {
+    pub const DEFAULT: Self = Self::Toc;
+}
+
+/// Parse the `--show-stripped=<mode>` flag value.
+///
+/// Recognizes `full`, `toc`, `headings`, `none`. Maps `none` to `Off` at the
+/// boundary so internal sites use the unambiguous variant name.
+pub fn parse_show_stripped(s: &str) -> Result<ShowStripped, String> {
+    match s {
+        "full" => Ok(ShowStripped::Full),
+        "toc" => Ok(ShowStripped::Toc),
+        "headings" => Ok(ShowStripped::Headings),
+        "none" => Ok(ShowStripped::Off),
+        other => Err(format!(
+            "invalid --show-stripped value '{}': expected one of full, toc, headings, none",
+            other
+        )),
+    }
+}
 
 /// Run `jj plan done` — mark one or all plans as done.
 ///
@@ -16,6 +56,8 @@ use crate::wrap::SyncChangeView;
 /// - `--stack`: mark all changes in the stack as done
 /// - `--keep-scratch`: don't strip `[scratch]` sections
 /// - `--dry-run`: show what would be changed without modifying anything
+/// - `--show-stripped=<mode>`: control the stripped-section report
+///   (`full | toc | headings | none`, default `toc`)
 /// - Positional arg: a specific CHANGE_ID to mark done (defaults to `@`)
 pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &mut Workspace, registry: &PlanRegistry, format: StackFormat) -> crate::error::Result<i32> {
     // ------------------------------------------------------------------
@@ -24,6 +66,7 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &
     let mut do_stack = false;
     let mut keep_scratch = false;
     let mut dry_run = false;
+    let mut show_stripped = ShowStripped::DEFAULT;
     let mut target_id: Option<String> = None;
 
     for arg in args {
@@ -31,6 +74,16 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &
             "--stack" => do_stack = true,
             "--keep-scratch" => keep_scratch = true,
             "--dry-run" => dry_run = true,
+            s if s.starts_with("--show-stripped=") => {
+                let value = &s["--show-stripped=".len()..];
+                match parse_show_stripped(value) {
+                    Ok(mode) => show_stripped = mode,
+                    Err(msg) => {
+                        eprintln!("jj plan done: {}", msg);
+                        return Ok(2);
+                    }
+                }
+            }
             _ => target_id = Some(arg.clone()),
         }
     }
@@ -50,9 +103,9 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &
     // 4. Dispatch: --stack or single plan
     // ------------------------------------------------------------------
     if do_stack {
-        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, workspace, registry, format)
+        run_done_stack(jj, plan_dir, changes.as_deref(), keep_scratch, dry_run, show_stripped, workspace, registry, format)
     } else {
-        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, workspace, registry, format)
+        run_done_single(jj, plan_dir, changes.as_deref(), target_id, keep_scratch, dry_run, show_stripped, workspace, registry, format)
     }
 }
 
@@ -68,6 +121,7 @@ fn run_done_stack(
     changes: Option<&[SyncChangeView]>,
     keep_scratch: bool,
     dry_run: bool,
+    show_stripped: ShowStripped,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
     format: StackFormat,
@@ -80,21 +134,41 @@ fn run_done_stack(
         }
     };
 
+    // Accumulate reports and print them together after all describes complete,
+    // so multi-change output isn't interleaved with the per-describe round-trips.
+    let mut reports: Vec<(String, String, String)> = Vec::new(); // (bookmark, change_id, report_text)
+
     for change in changes {
         let desc = &change.description;
         let doc = PlanDocument::parse(desc);
 
         if dry_run {
-            print_dry_run_diff(&doc, keep_scratch);
+            print_dry_run_diff(&doc, keep_scratch, show_stripped, &change.change_id);
             continue;
         }
 
-        let final_desc = doc.as_done(keep_scratch);
+        let (final_desc, sections) = doc.as_done_with_report(keep_scratch);
         let _ = jj.run_silent(&["describe", "-r", &change.change_id, "-m", &final_desc]);
+
+        if !keep_scratch
+            && let Some(report) = format_strip_report(
+                &sections,
+                show_stripped,
+                doc.raw(),
+                &change.change_id,
+            )
+        {
+            reports.push((change.bookmark_name.clone(), change.change_id.clone(), report));
+        }
     }
 
     if dry_run {
         return Ok(0);
+    }
+
+    for (bookmark, change_id, report) in &reports {
+        eprintln!("{}", stack_change_separator(bookmark, change_id));
+        eprint!("{}", report);
     }
 
     // Sync plan files immediately after describes so the plan files reflect
@@ -124,6 +198,7 @@ fn run_done_single(
     target_id: Option<String>,
     keep_scratch: bool,
     dry_run: bool,
+    show_stripped: ShowStripped,
     workspace: &mut Workspace,
     registry: &PlanRegistry,
     format: StackFormat,
@@ -156,11 +231,11 @@ fn run_done_single(
 
     // Dry run: show what would be stripped and exit
     if dry_run {
-        print_dry_run_diff(&doc, keep_scratch);
+        print_dry_run_diff(&doc, keep_scratch, show_stripped, &change_id_for_describe);
         return Ok(0);
     }
 
-    let final_desc = doc.as_done(keep_scratch);
+    let (final_desc, sections) = doc.as_done_with_report(keep_scratch);
     let _ = jj.run_silent(&[
         "describe",
         "-r",
@@ -168,6 +243,17 @@ fn run_done_single(
         "-m",
         &final_desc,
     ]);
+
+    if !keep_scratch
+        && let Some(report) = format_strip_report(
+            &sections,
+            show_stripped,
+            doc.raw(),
+            &change_id_for_describe,
+        )
+    {
+        eprint!("{}", report);
+    }
 
     // Sync plan files immediately after describe so the plan file reflects
     // the new front matter. Without this, a subsequent `jj edit` (via the
@@ -212,33 +298,111 @@ fn build_sync_views_for_done(workspace: &Workspace, registry: &PlanRegistry) -> 
     crate::wrap::build_sync_views(workspace, registry)
 }
 
-/// Print a dry-run diff for a single change, showing what sections would be
-/// stripped and that the done marker would be set.
-fn print_dry_run_diff(doc: &PlanDocument, keep_scratch: bool) {
-    let proposed = doc.as_done(keep_scratch);
+/// Render a stripped-section report for stderr.
+///
+/// Returns `None` when the mode is `Off` or there is nothing to report (no
+/// scratch sections were stripped). Otherwise returns the full multi-line
+/// string ready to `eprintln!`.
+///
+/// Pure function over its inputs: `input` is the original (pre-strip) document
+/// text that the renderer slices from in `Full` mode.
+pub fn format_strip_report(
+    sections: &[StrippedSection],
+    mode: ShowStripped,
+    input: &str,
+    change_id: &str,
+) -> Option<String> {
+    if matches!(mode, ShowStripped::Off) || sections.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    out.push_str("Stripped scratch sections:\n");
+
+    for (i, section) in sections.iter().enumerate() {
+        // Heading line, e.g. "  ## Notes [scratch]"
+        out.push_str("  ");
+        for _ in 0..section.heading.level {
+            out.push('#');
+        }
+        out.push(' ');
+        out.push_str(&section.heading.text);
+        out.push('\n');
+
+        if matches!(mode, ShowStripped::Toc | ShowStripped::Full) {
+            // Descendant headings, indented one level beyond their nesting depth
+            for desc in &section.descendant_headings {
+                let indent = (desc.level as usize).saturating_sub(section.heading.level as usize);
+                for _ in 0..(indent + 1) {
+                    out.push_str("  ");
+                }
+                for _ in 0..desc.level {
+                    out.push('#');
+                }
+                out.push(' ');
+                out.push_str(&desc.text);
+                out.push('\n');
+            }
+        }
+
+        if matches!(mode, ShowStripped::Full) {
+            // The byte range starts at the scratch heading itself, but we
+            // already printed an indented version of that heading above —
+            // skip past the first line so it isn't shown twice.
+            let slice = &input[section.range.clone()];
+            let body_start = slice.find('\n').map(|n| n + 1).unwrap_or(slice.len());
+            let body = &slice[body_start..];
+            if !body.is_empty() {
+                out.push('\n');
+                out.push_str(body);
+                if !body.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            if i + 1 < sections.len() {
+                out.push_str("─────\n");
+            }
+        }
+    }
+
+    out.push_str(&format!("Recover with: jj evolog -r {}\n", change_id));
+    Some(out)
+}
+
+/// Per-change separator for `--stack` mode, e.g. `--- feat-auth (kpqxywon) ---`.
+///
+/// Matches the existing `--- change ---` style from `print_dry_run_diff` but
+/// interpolates the bookmark and change ID so multi-change output stays readable.
+fn stack_change_separator(bookmark: &str, change_id: &str) -> String {
+    if bookmark.is_empty() {
+        format!("--- {} ---", change_id)
+    } else {
+        format!("--- {} ({}) ---", bookmark, change_id)
+    }
+}
+
+/// Print a dry-run preview for a single change.
+///
+/// Renders the same structured strip report as the live-run path (via
+/// `format_strip_report`) and then prints the status-side message
+/// ("Would set metadata: status: ✅" / "Already marked done"). Honors
+/// `--show-stripped=none` (silent on the strip side) without clamping — the
+/// status side still prints.
+fn print_dry_run_diff(
+    doc: &PlanDocument,
+    keep_scratch: bool,
+    show_stripped: ShowStripped,
+    change_id: &str,
+) {
+    let (_proposed, sections) = doc.as_done_with_report(keep_scratch);
 
     eprintln!("--- change ---");
 
-    if proposed != doc.raw() {
-        // Show the sections that would be stripped
-        let raw_lines: std::collections::HashSet<&str> = doc.raw().lines().collect();
-        let proposed_lines: std::collections::HashSet<&str> = proposed.lines().collect();
-        let removed: Vec<&str> = doc.raw().lines().filter(|l| !proposed_lines.contains(l)).collect();
-        if !removed.is_empty() {
-            eprintln!("Would strip:");
-            for line in &removed {
-                eprintln!("  - {}", line);
-            }
-            eprintln!();
-        }
-        let added: Vec<&str> = proposed.lines().filter(|l| !raw_lines.contains(l)).collect();
-        if !added.is_empty() {
-            eprintln!("Would add:");
-            for line in &added {
-                eprintln!("  + {}", line);
-            }
-            eprintln!();
-        }
+    if !keep_scratch
+        && let Some(report) = format_strip_report(&sections, show_stripped, doc.raw(), change_id)
+    {
+        eprint!("{}", report);
+        eprintln!();
     }
 
     if doc.is_done() {
@@ -251,7 +415,120 @@ fn print_dry_run_diff(doc: &PlanDocument, keep_scratch: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::markdown::PlanDocument;
+
+    // ── ShowStripped parsing ─────────────────────────────────────────
+
+    #[test]
+    fn parse_show_stripped_valid() {
+        assert_eq!(parse_show_stripped("full").unwrap(), ShowStripped::Full);
+        assert_eq!(parse_show_stripped("toc").unwrap(), ShowStripped::Toc);
+        assert_eq!(parse_show_stripped("headings").unwrap(), ShowStripped::Headings);
+        assert_eq!(parse_show_stripped("none").unwrap(), ShowStripped::Off);
+    }
+
+    #[test]
+    fn parse_show_stripped_invalid_lists_valid() {
+        let err = parse_show_stripped("verbose").unwrap_err();
+        for valid in ["full", "toc", "headings", "none"] {
+            assert!(err.contains(valid), "error message should list '{}': {}", valid, err);
+        }
+    }
+
+    // ── format_strip_report ──────────────────────────────────────────
+
+    /// Build a `StrippedSection` by parsing `input` and pulling its first scratch section.
+    fn first_scratch_section(input: &str) -> (Vec<StrippedSection>, String) {
+        let doc = PlanDocument::parse(input);
+        let (_stripped, report) = doc.as_done_with_report(false);
+        (report, doc.raw().to_string())
+    }
+
+    #[test]
+    fn format_strip_report_off_returns_none() {
+        let (sections, raw) = first_scratch_section("# T\n\n## N [scratch]\n\nbody\n");
+        assert!(format_strip_report(&sections, ShowStripped::Off, &raw, "kpqxywon").is_none());
+    }
+
+    #[test]
+    fn format_strip_report_empty_sections_returns_none() {
+        let sections: Vec<StrippedSection> = Vec::new();
+        for mode in [ShowStripped::Full, ShowStripped::Toc, ShowStripped::Headings] {
+            assert!(format_strip_report(&sections, mode, "", "abc").is_none());
+        }
+    }
+
+    #[test]
+    fn format_strip_report_headings_lists_top_level_only() {
+        let (sections, raw) = first_scratch_section(
+            "# T\n\n## Notes [scratch]\n\nbody\n\n### Sub\n\nnested\n",
+        );
+        let out = format_strip_report(&sections, ShowStripped::Headings, &raw, "abc").unwrap();
+        assert!(out.contains("## Notes [scratch]"), "top-level scratch heading present");
+        assert!(!out.contains("### Sub"), "descendant heading must NOT appear in headings mode");
+    }
+
+    #[test]
+    fn format_strip_report_toc_indents_descendants() {
+        let (sections, raw) = first_scratch_section(
+            "# T\n\n## Notes [scratch]\n\nbody\n\n### Sub\n\nnested\n",
+        );
+        let out = format_strip_report(&sections, ShowStripped::Toc, &raw, "abc").unwrap();
+        assert!(out.contains("## Notes [scratch]"), "top-level heading present");
+        assert!(out.contains("### Sub"), "descendant heading present in toc mode");
+        // The descendant line should be indented further than the parent
+        let parent_indent = out.lines().find(|l| l.contains("## Notes")).unwrap().find('#').unwrap();
+        let desc_indent = out.lines().find(|l| l.contains("### Sub")).unwrap().find('#').unwrap();
+        assert!(desc_indent > parent_indent, "descendant should be indented further than parent");
+    }
+
+    #[test]
+    fn format_strip_report_full_includes_body() {
+        let (sections, raw) = first_scratch_section(
+            "# T\n\n## Notes [scratch]\n\nverbatim learnings\n",
+        );
+        let out = format_strip_report(&sections, ShowStripped::Full, &raw, "abc").unwrap();
+        assert!(out.contains("verbatim learnings"),
+            "full mode should include the body slice verbatim, got:\n{}", out);
+    }
+
+    #[test]
+    fn format_strip_report_full_separates_between_not_after_sections() {
+        // The `─────` belongs between adjacent stripped sections, never trailing
+        // the last one before the recovery hint.
+        let input = "# T\n\n## A [scratch]\n\nbody a\n\n## Keep\n\nmid\n\n## B [scratch]\n\nbody b\n";
+        let (sections, raw) = first_scratch_section(input);
+        assert_eq!(sections.len(), 2, "test setup: expected two scratch sections");
+        let out = format_strip_report(&sections, ShowStripped::Full, &raw, "abc").unwrap();
+        assert_eq!(out.matches("─────").count(), 1,
+            "Full mode should place exactly one ───── between two sections, got:\n{}", out);
+        // And it should appear before the recovery hint, not after.
+        let sep_pos = out.find("─────").unwrap();
+        let hint_pos = out.find("Recover with:").unwrap();
+        assert!(sep_pos < hint_pos, "───── must precede recovery hint");
+    }
+
+    #[test]
+    fn format_strip_report_recovery_hint_includes_change_id() {
+        let (sections, raw) = first_scratch_section("# T\n\n## N [scratch]\n\nb\n");
+        for mode in [ShowStripped::Full, ShowStripped::Toc, ShowStripped::Headings] {
+            let out = format_strip_report(&sections, mode, &raw, "kpqxywon").unwrap();
+            assert!(out.contains("jj evolog -r kpqxywon"),
+                "{:?} mode should include recovery hint with change id", mode);
+        }
+    }
+
+    #[test]
+    fn stack_change_separator_with_bookmark() {
+        assert_eq!(stack_change_separator("feat-auth", "kpqxywon"),
+            "--- feat-auth (kpqxywon) ---");
+    }
+
+    #[test]
+    fn stack_change_separator_without_bookmark() {
+        assert_eq!(stack_change_separator("", "kpqxywon"), "--- kpqxywon ---");
+    }
 
     #[test]
     fn test_as_done_sets_status() {

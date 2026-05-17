@@ -942,9 +942,15 @@ Four consumer patterns:
 
 `PlanDocument::headings()` is a convenience accessor that calls `extract_headings(&self.raw)` on demand (not cached), consistent with other on-demand methods like `body_sans_scratch()`.
 
+### Section bounds (shared primitive)
+
+`section_bounds(headings: &[HeadingInfo], i: usize, input_len: usize) -> Range<usize>` is the shared "everything under heading H until the next same-or-higher heading" primitive. Used by `strip_scratch_sections` (for scratch ranges) and `summary::extract_phases` (for phase content slices) — a single definition of how a heading owns its content.
+
 ### Scratch section stripping
 
-`strip_scratch_sections()` is a consumer of `extract_headings()` — it filters for headings containing `[scratch]` (case-insensitive) and slices them out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions.
+`strip_scratch_sections()` is a consumer of `extract_headings()` and `section_bounds()` — it filters for headings containing `[scratch]` (case-insensitive) and slices them out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions. Internally it is a thin wrapper around `strip_scratch_sections_with_report()`, which returns the stripped text alongside a `Vec<StrippedSection>` describing each removed section (top-level scratch heading, its descendant headings, and the exact byte range).
+
+`StrippedSection` carries only metadata and offsets — no owned body — so callers that need the verbatim removed content slice `input[section.range]` on demand. The `done` command's `format_strip_report` renderer uses this to produce a `--show-stripped` report without redundant allocation.
 
 Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, callout metadata preservation, `---` thematic breaks in body.
 

@@ -299,13 +299,29 @@ impl PlanDocument {
     ///
     /// Idempotent: if status is already `✅`, still strips scratch (if requested)
     /// but doesn't double-stamp.
+    ///
+    /// Thin wrapper around `as_done_with_report` that discards the report.
     pub fn as_done(&self, keep_scratch: bool) -> String {
-        let base = if keep_scratch {
-            self.raw.clone()
+        self.as_done_with_report(keep_scratch).0
+    }
+
+    /// Like `as_done`, but also returns a structured report of which scratch
+    /// sections were stripped (always empty when `keep_scratch` is true).
+    ///
+    /// The returned `Vec<StrippedSection>` carries the top-level scratch
+    /// heading, its descendant headings, and the byte range that was removed.
+    /// Callers can slice `self.raw()` at `section.range` to recover the
+    /// original verbatim body.
+    pub fn as_done_with_report(
+        &self,
+        keep_scratch: bool,
+    ) -> (String, Vec<StrippedSection>) {
+        let (base, report) = if keep_scratch {
+            (self.raw.clone(), Vec::new())
         } else {
-            strip_scratch_sections(&self.raw)
+            strip_scratch_sections_with_report(&self.raw)
         };
-        set_metadata_field(&base, "status", "✅")
+        (set_metadata_field(&base, "status", "✅"), report)
     }
 
     /// Extract PR title and body for submission.
@@ -331,6 +347,7 @@ impl PlanDocument {
 ///
 /// Extracted via `pulldown-cmark` with `into_offset_iter()` for proper
 /// CommonMark compliance (ATX and setext headings, code fence immunity).
+#[derive(Debug, Clone)]
 pub struct HeadingInfo {
     /// Heading level (1–6).
     pub level: u8,
@@ -399,56 +416,133 @@ pub fn extract_headings(input: &str) -> Vec<HeadingInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// Section bounds (shared primitive)
+// ---------------------------------------------------------------------------
+
+/// Compute the byte range a heading "owns" in the document.
+///
+/// The range starts at `headings[i].byte_offset` and ends at the byte offset
+/// of the next heading whose `level <= headings[i].level`. If no such
+/// terminator exists, the range runs to `input_len`.
+///
+/// This is the shared "everything under heading H until the next same-or-
+/// higher heading" primitive used by scratch-section stripping and phase
+/// extraction (`summary::extract_phases`).
+pub fn section_bounds(
+    headings: &[HeadingInfo],
+    i: usize,
+    input_len: usize,
+) -> std::ops::Range<usize> {
+    let start = headings[i].byte_offset;
+    let owner_level = headings[i].level;
+    let end = headings
+        .iter()
+        .skip(i + 1)
+        .find(|next| next.level <= owner_level)
+        .map(|next| next.byte_offset)
+        .unwrap_or(input_len);
+    start..end
+}
+
+// ---------------------------------------------------------------------------
 // Scratch section stripping (pulldown-cmark based)
 // ---------------------------------------------------------------------------
 
-/// Strip all `[scratch]`-annotated heading sections from a markdown document.
+/// Identify the byte ranges of all `[scratch]`-annotated heading sections.
 ///
-/// Uses `pulldown-cmark` with `into_offset_iter()` for proper CommonMark heading
-/// detection (ATX and setext headings, code fence awareness). Front matter is
-/// extracted first (pulldown-cmark would misparse `---` as a thematic break),
-/// then heading events define byte ranges for scratch sections, which are sliced
-/// out of the original body text — preserving all original formatting byte-for-byte
-/// in non-scratch regions.
-pub fn strip_scratch_sections(input: &str) -> String {
-    if input.is_empty() {
-        return String::new();
-    }
-
+/// Pure helper shared by `strip_scratch_sections` and
+/// `strip_scratch_sections_with_report`. Each returned range corresponds to a
+/// top-level scratch heading and extends through everything it owns (see
+/// `section_bounds`).
+fn scratch_section_ranges(input: &str) -> (Vec<HeadingInfo>, Vec<std::ops::Range<usize>>) {
     let headings = extract_headings(input);
-
-    // Identify scratch section byte ranges to remove
-    //    A scratch section: starts at a heading with [scratch] in its text,
-    //    extends until the next heading of same or higher level, or end of body.
-    let mut removal_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut ranges = Vec::new();
     let mut i = 0;
     while i < headings.len() {
-        let h = &headings[i];
-        if h.text.to_lowercase().contains("[scratch]") {
-            let scratch_start = h.byte_offset;
-            let scratch_level = h.level;
-
-            // Find where this section ends
-            let mut end = input.len();
-            for (j, heading) in headings.iter().enumerate().skip(i + 1) {
-                if heading.level <= scratch_level {
-                    end = heading.byte_offset;
-                    i = j; // continue scanning from this heading
-                    break;
-                }
-            }
-            if end == input.len() {
-                i = headings.len(); // consumed everything to the end
-            }
-
-            removal_ranges.push(scratch_start..end);
+        if headings[i].text.to_lowercase().contains("[scratch]") {
+            let range = section_bounds(&headings, i, input.len());
+            // Advance past everything this scratch section consumed (skip any
+            // descendant headings — they're inside this section, not separate
+            // scratch sections to report).
+            let owner_level = headings[i].level;
+            i = headings
+                .iter()
+                .enumerate()
+                .skip(i + 1)
+                .find(|(_, h)| h.level <= owner_level)
+                .map(|(j, _)| j)
+                .unwrap_or(headings.len());
+            ranges.push(range);
         } else {
             i += 1;
         }
     }
+    (headings, ranges)
+}
+
+/// A section that was removed by scratch stripping.
+///
+/// Contains structural metadata (heading, descendant headings, byte range)
+/// but **not** the body content — callers slice the original input with
+/// `range` on demand. This keeps the struct allocation-free for callers that
+/// only need the table-of-contents view.
+#[derive(Debug, Clone)]
+pub struct StrippedSection {
+    pub heading: HeadingInfo,
+    pub descendant_headings: Vec<HeadingInfo>,
+    pub range: std::ops::Range<usize>,
+}
+
+/// Strip all `[scratch]`-annotated heading sections from a markdown document.
+///
+/// Thin wrapper around `strip_scratch_sections_with_report` that discards the
+/// structured report. Preserves all original formatting byte-for-byte in
+/// non-scratch regions.
+pub fn strip_scratch_sections(input: &str) -> String {
+    strip_scratch_sections_with_report(input).0
+}
+
+/// Strip scratch sections and return a structured report of what was removed.
+///
+/// Returns the stripped text alongside one `StrippedSection` per top-level
+/// scratch heading, in document order. Each `StrippedSection` carries the
+/// scratch heading itself, any descendant headings (level deeper than the
+/// scratch heading's level) that fell within its byte range, and the exact
+/// `Range<usize>` removed from `input`.
+pub fn strip_scratch_sections_with_report(
+    input: &str,
+) -> (String, Vec<StrippedSection>) {
+    if input.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    let (headings, removal_ranges) = scratch_section_ranges(input);
 
     if removal_ranges.is_empty() {
-        return input.to_string();
+        return (input.to_string(), Vec::new());
+    }
+
+    // Build the report: for each removed range, find its owner heading and
+    // any descendant headings inside the range.
+    let mut report = Vec::with_capacity(removal_ranges.len());
+    for range in &removal_ranges {
+        let owner_idx = headings
+            .iter()
+            .position(|h| h.byte_offset == range.start)
+            .expect("scratch range start always matches a heading offset");
+        let owner = &headings[owner_idx];
+        let descendants: Vec<HeadingInfo> = headings
+            .iter()
+            .skip(owner_idx + 1)
+            .take_while(|h| h.byte_offset < range.end)
+            .filter(|h| h.level > owner.level)
+            .cloned()
+            .collect();
+        report.push(StrippedSection {
+            heading: owner.clone(),
+            descendant_headings: descendants,
+            range: range.clone(),
+        });
     }
 
     // Slice input around removal ranges, preserving original bytes
@@ -464,11 +558,7 @@ pub fn strip_scratch_sections(input: &str) -> String {
         result.push_str(&input[cursor..]);
     }
 
-    if result.is_empty() {
-        return String::new();
-    }
-
-    result
+    (result, report)
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +743,92 @@ mod tests {
 
     // ── Existing scratch stripping tests (must pass with new impl) ───
 
+    // ── strip_scratch_sections_with_report tests ─────────────────────
+
+    #[test]
+    fn strip_scratch_sections_with_report_no_scratch() {
+        let input = "# Title\n\n## Section\n\ncontent\n";
+        let (stripped, report) = strip_scratch_sections_with_report(input);
+        assert_eq!(stripped, input);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn strip_scratch_sections_with_report_single_top_level() {
+        let input = "# Title\n\n## Notes [scratch]\n\nhidden content\n";
+        let (stripped, report) = strip_scratch_sections_with_report(input);
+        assert!(!stripped.contains("[scratch]"));
+        assert!(!stripped.contains("hidden content"));
+        assert_eq!(report.len(), 1);
+        assert!(report[0].heading.text.contains("[scratch]"));
+        assert_eq!(report[0].heading.level, 2);
+        assert!(report[0].descendant_headings.is_empty());
+        // The range should slice back to the exact removed bytes.
+        assert_eq!(
+            &input[report[0].range.clone()],
+            "## Notes [scratch]\n\nhidden content\n",
+            "range should match the removed slice byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn strip_scratch_sections_with_report_with_descendants() {
+        let input = "# Title\n\n## Notes [scratch]\n\nbody\n\n### Sub\n\nnested\n\n#### Deeper\n\nmore nested\n";
+        let (_stripped, report) = strip_scratch_sections_with_report(input);
+        assert_eq!(report.len(), 1);
+        let section = &report[0];
+        assert_eq!(section.heading.level, 2);
+        assert_eq!(section.descendant_headings.len(), 2);
+        assert_eq!(section.descendant_headings[0].text, "Sub");
+        assert_eq!(section.descendant_headings[0].level, 3);
+        assert_eq!(section.descendant_headings[1].text, "Deeper");
+        assert_eq!(section.descendant_headings[1].level, 4);
+    }
+
+    #[test]
+    fn strip_scratch_sections_with_report_multiple_top_levels() {
+        let input = "# Title\n\n## A [scratch]\n\nfirst\n\n## Keep\n\nmiddle\n\n## B [scratch]\n\nsecond\n";
+        let (stripped, report) = strip_scratch_sections_with_report(input);
+        assert!(stripped.contains("## Keep"));
+        assert!(stripped.contains("middle"));
+        assert!(!stripped.contains("[scratch]"));
+        assert_eq!(report.len(), 2);
+        assert!(report[0].heading.text.contains("A"));
+        assert!(report[1].heading.text.contains("B"));
+        // Report is in document order
+        assert!(report[0].range.start < report[1].range.start);
+    }
+
+    #[test]
+    fn as_done_with_report_keep_scratch_preserves_content_and_returns_empty_report() {
+        // Protects the data-loss invariant: if keep_scratch=true is set, neither
+        // the returned String nor the report should silently strip content.
+        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n\n## Notes [scratch]\n\nimportant learnings\n";
+        let doc = PlanDocument::parse(input);
+        let (final_desc, report) = doc.as_done_with_report(true);
+        assert!(report.is_empty(), "keep_scratch must produce an empty report");
+        assert!(final_desc.contains("important learnings"),
+            "keep_scratch must preserve scratch body in the returned String");
+        assert!(final_desc.contains("> status: ✅"), "status should still be stamped");
+    }
+
+    #[test]
+    fn strip_scratch_sections_with_report_no_double_count() {
+        let input = "# Title\n\n## A [scratch]\n\nfirst\n\n## Keep\n\nmiddle content\n\n## B [scratch]\n\nsecond\n";
+        let (_stripped, report) = strip_scratch_sections_with_report(input);
+        assert_eq!(report.len(), 2);
+        // The "middle content" between the two scratch sections must not fall
+        // within either reported range.
+        let middle_offset = input.find("middle content").unwrap();
+        for section in &report {
+            assert!(
+                !section.range.contains(&middle_offset),
+                "middle content should not be in any scratch range, was in {:?}",
+                section.range
+            );
+        }
+    }
+
     // ── PlanDocument tests (callout format) ──────────────────────────
 
     #[test]
@@ -820,6 +996,44 @@ mod tests {
     fn test_extract_headings_empty_input() {
         let headings = extract_headings("");
         assert!(headings.is_empty());
+    }
+
+    // ── section_bounds tests ────────────────────────────────────────
+
+    #[test]
+    fn section_bounds_next_same_level_terminates() {
+        let input = "## A\n\nbody a\n\n## B\n\nbody b\n";
+        let headings = extract_headings(input);
+        let range = section_bounds(&headings, 0, input.len());
+        assert_eq!(&input[range], "## A\n\nbody a\n\n",
+            "range should end at the next level-2 heading");
+    }
+
+    #[test]
+    fn section_bounds_higher_level_terminates() {
+        let input = "### A\n\nbody a\n\n## B\n\nbody b\n";
+        let headings = extract_headings(input);
+        let range = section_bounds(&headings, 0, input.len());
+        assert_eq!(&input[range], "### A\n\nbody a\n\n",
+            "a higher-level heading (fewer #s) terminates the section");
+    }
+
+    #[test]
+    fn section_bounds_deeper_level_does_not_terminate() {
+        let input = "## A\n\n### A.1\n\nnested\n\n## B\n\nbody b\n";
+        let headings = extract_headings(input);
+        let range = section_bounds(&headings, 0, input.len());
+        assert_eq!(&input[range], "## A\n\n### A.1\n\nnested\n\n",
+            "a deeper-level heading is owned by A; range ends only at the next ## B");
+    }
+
+    #[test]
+    fn section_bounds_runs_to_eof() {
+        let input = "## Only\n\nbody, no terminator\n";
+        let headings = extract_headings(input);
+        let range = section_bounds(&headings, 0, input.len());
+        assert_eq!(range.end, input.len(),
+            "with no terminator the range runs to input_len");
     }
 
     // ── Scratch stripping tests ─────────────────────────────────────

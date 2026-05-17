@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::error::Result;
 use crate::jj_binary::JjBinary;
-use crate::markdown::{extract_headings, HeadingInfo, PlanDocument};
+use crate::markdown::{extract_headings, section_bounds, HeadingInfo, PlanDocument};
 use crate::plan_dir::{self, StatusIndicators};
 use crate::stack_render::StackFormat;
 use crate::types::{description_first_line, PlanRegistry};
@@ -169,17 +169,11 @@ pub fn extract_phases(
                 .map(|s| (*s).to_string())
                 .unwrap_or_default();
 
-            // Find the byte range for this phase's content: from this heading's
-            // offset to the next level-1 heading's offset (or end of input).
-            let start = h.byte_offset;
-            let end = headings
-                .iter()
-                .skip(idx + 1)
-                .find(|next| next.level == 1)
-                .map(|next| next.byte_offset)
-                .unwrap_or(raw.len());
-
-            let section = &raw[start..end];
+            // Find the byte range for this phase's content using the shared
+            // section-bounds primitive (same logic used by scratch stripping).
+            // Phase headings are always level 1, so the next terminator is the
+            // next heading with level <= 1, i.e. the next level-1 heading.
+            let section = &raw[section_bounds(headings, idx, raw.len())];
 
             // Count tasks: lines starting with `- ` followed by any indicator
             let mut task_total = 0;
