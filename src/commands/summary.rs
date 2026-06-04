@@ -494,7 +494,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max.min(s.len())])
+        let boundary = s.floor_char_boundary(max);
+        format!("{}...", &s[..boundary])
     }
 }
 
@@ -985,5 +986,48 @@ See jj:abcdefgh for details.
         assert_eq!(parsed["change_id"], "testtest");
         assert_eq!(parsed["status"], "🔴");
         assert!(parsed["raw_body"].is_string());
+    }
+
+    // ── truncate (byte-offset safety) ──────────────────────────────────
+
+    #[test]
+    fn test_truncate_short() {
+        assert_eq!(truncate("short", 60), "short");
+    }
+
+    #[test]
+    fn test_truncate_long_ascii() {
+        let s = "a".repeat(80);
+        let result = truncate(&s, 60);
+        assert!(result.len() <= 63); // 60 chars + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        let s = "a".repeat(60);
+        assert_eq!(truncate(&s, 60), s);
+    }
+
+    #[test]
+    fn test_truncate_multibyte_at_boundary() {
+        // Em-dash (3 bytes: E2 80 94) straddling the max byte boundary.
+        // 57 ASCII chars + em-dash puts byte 60 right in the middle of the dash.
+        let s = "a".repeat(57) + "— and more trailing text";
+        assert!(s.len() > 60, "input must exceed 60 bytes");
+        // This should not panic — old code panicked here.
+        let result = truncate(&s, 60);
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 63);
+    }
+
+    #[test]
+    fn test_truncate_multibyte_sequence() {
+        // Multiple multi-byte chars: emoji and em-dash
+        let s = "🔴 fix: handle edge case — needs investigation with more detail".to_string();
+        let result = truncate(&s, 30);
+        assert!(result.ends_with("..."));
+        // Must be valid UTF-8 (no panic)
+        let _ = &result[..];
     }
 }
