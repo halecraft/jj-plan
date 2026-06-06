@@ -24,9 +24,12 @@ setup_file() {
   "$REAL_JJ" git init "$TEMPLATE_REPO" 2>/dev/null
   "$REAL_JJ" -R "$TEMPLATE_REPO" bookmark create start -r @ 2>/dev/null
   mkdir -p "$TEMPLATE_REPO/.jj-plan"
-  # Capture the real change ID for the registry entry
+  # Capture the real change ID for the registry entry.
+  # Production stores standard-hex change IDs (commit.change_id().hex()), so the
+  # fixture must too — `change_id` alone renders jj's reverse-hex display form,
+  # which ChangeId::try_from_hex rejects, silently breaking resolve_plan_bookmark_at.
   local TMPL_CID
-  TMPL_CID=$("$REAL_JJ" -R "$TEMPLATE_REPO" log -r @ -T 'change_id' --no-graph)
+  TMPL_CID=$("$REAL_JJ" -R "$TEMPLATE_REPO" log -r @ -T 'change_id.normal_hex()' --no-graph)
   # Register the bookmark in the PlanRegistry
   mkdir -p "$TEMPLATE_REPO/.jj/repo/jj-plan"
   cat > "$TEMPLATE_REPO/.jj/repo/jj-plan/plans.toml" << EOF
@@ -55,25 +58,44 @@ teardown() {
   rm -rf "$TEST_REPO"
 }
 
+# Resolve the single plan file for a bookmark under the current
+# L-NN-<encoded-bookmark>.md naming scheme. Matching by bookmark name keeps
+# assertions independent of the position-derived letter prefix and dependency
+# index, so a future reindex does not re-break them.
+plan_file() {
+  local dir="${2:-.jj-plan}"
+  local matches=("$dir"/*-"$1".md)
+  echo "${matches[0]}"
+}
+
+# Set a plan's description across the describe-protocol guard. These tests
+# predate the guard, which blocks bare `jjdesc -m` once a plan file exists
+# (to avoid clobbering the plan document). Bare describe still works before a
+# plan file exists; once it does, fall back to the supported --override-plan-protocol
+# escape hatch, which writes the message to the plan file and the description.
+jjdesc() {
+  jj describe "$@" 2>/dev/null || jj describe --override-plan-protocol "$@"
+}
+
 # =============================================================================
 # Basic sync
 # =============================================================================
 
 @test "describe creates plan file in .jj-plan" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 1 ]]
 }
 
 @test "plan file contains the description" {
-  jj describe -m "My detailed plan"
-  [[ "$(cat .jj-plan/01-start.md)" == "My detailed plan" ]]
+  jjdesc -m "My detailed plan"
+  [[ "$(cat "$(plan_file start)")" == "My detailed plan" ]]
 }
 
 @test "sync does not create current.md" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   [[ ! -e .jj-plan/current.md ]]
 }
 
@@ -82,29 +104,29 @@ teardown() {
 # =============================================================================
 
 @test "jj plan new <bookmark> creates a new plan file" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   jj plan new step-1
-  jj describe -m "Step 1"
+  jjdesc -m "Step 1"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 2 ]]
-  [[ "$(cat .jj-plan/02-step-1.md)" == "Step 1" ]]
+  [[ "$(cat "$(plan_file step-1)")" == "Step 1" ]]
 }
 
 @test "three-change stack produces three numbered files in order" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
-  [[ "$(cat .jj-plan/01-*.md)" == "Plan" ]]
-  [[ "$(cat .jj-plan/02-*.md)" == "Step 1" ]]
-  [[ "$(cat .jj-plan/03-*.md)" == "Step 2" ]]
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
+  [[ "$(cat .jj-plan/*-01-*.md)" == "Plan" ]]
+  [[ "$(cat .jj-plan/*-02-*.md)" == "Step 1" ]]
+  [[ "$(cat .jj-plan/*-03-*.md)" == "Step 2" ]]
 }
 
 @test "sort order is bottom-endian: 01 is closest to start bookmark" {
-  jj describe -m "Stack-root"
-  jj plan new step-1; jj describe -m "Middle"
-  jj plan new step-2; jj describe -m "Tip"
-  [[ "$(cat .jj-plan/01-*.md)" == "Stack-root" ]]
+  jjdesc -m "Stack-root"
+  jj plan new step-1; jjdesc -m "Middle"
+  jj plan new step-2; jjdesc -m "Tip"
+  [[ "$(cat .jj-plan/*-01-*.md)" == "Stack-root" ]]
 }
 
 # =============================================================================
@@ -112,17 +134,17 @@ teardown() {
 # =============================================================================
 
 @test "start bookmark change is included in stack.md as first member" {
-  jj describe -m "I am the start bookmark"
-  [[ "$(cat .jj-plan/stack.md)" == *"[start](./01-start.md)"* ]]
+  jjdesc -m "I am the start bookmark"
+  [[ "$(cat .jj-plan/stack.md)" == *"[start](./"*"-01-start.md)"* ]]
   [[ "$(cat .jj-plan/stack.md)" == *"I am the start bookmark"* ]]
 }
 
 @test "single-change stack (@ is the bookmark) shows one entry" {
-  jj describe -m "Solo change"
+  jjdesc -m "Solo change"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 1 ]]
-  [[ "$(cat .jj-plan/01-start.md)" == "Solo change" ]]
+  [[ "$(cat "$(plan_file start)")" == "Solo change" ]]
 }
 
 # =============================================================================
@@ -130,25 +152,25 @@ teardown() {
 # =============================================================================
 
 @test "jj edit preserves all plan files" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Impl"
-  [[ "$(cat .jj-plan/02-step-1.md)" == "Impl" ]]
+  jj plan new step-1; jjdesc -m "Impl"
+  [[ "$(cat "$(plan_file step-1)")" == "Impl" ]]
   jj edit -r "$PLAN"
-  [[ "$(cat .jj-plan/01-start.md)" == "Plan" ]]
-  [[ "$(cat .jj-plan/02-step-1.md)" == "Impl" ]]
+  [[ "$(cat "$(plan_file start)")" == "Plan" ]]
+  [[ "$(cat "$(plan_file step-1)")" == "Impl" ]]
 }
 
 @test "all stack files remain visible when editing a middle change" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   local STEP1
   STEP1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-2; jjdesc -m "Step 2"
   jj edit -r "$STEP1"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 3 ]]
 }
 
@@ -157,12 +179,12 @@ teardown() {
 # =============================================================================
 
 @test "editing plan file flushes to jj description on switch" {
-  jj describe -m "Original plan"
+  jjdesc -m "Original plan"
   local PLAN IMPL
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Impl"
+  jj plan new step-1; jjdesc -m "Impl"
   IMPL=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  printf "Updated impl description" > .jj-plan/02-step-1.md
+  printf "Updated impl description" > "$(plan_file step-1)"
   jj edit -r "$PLAN"
   [[ "$("$REAL_JJ" log -r "$IMPL" -T description --no-graph)" == "Updated impl description" ]]
 }
@@ -172,16 +194,16 @@ teardown() {
 # =============================================================================
 
 @test "editing a non-current plan file is flushed to jj on next command" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN STEP1
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 1"
   STEP1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-2; jjdesc -m "Step 2"
   # Edit the Plan file (not current) with rich content
-  printf "Plan\n\n## Background\nDetailed context here" > ".jj-plan/01-start.md"
+  printf "Plan\n\n## Background\nDetailed context here" > "$(plan_file start)"
   # Trigger a sync with any mutating command
-  jj describe -m "Step 2 updated"
+  jjdesc -m "Step 2 updated"
   local desc
   desc=$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)
   [[ "$desc" == *"Plan"* ]]
@@ -190,46 +212,46 @@ teardown() {
 }
 
 @test "editing a non-current plan file survives jj edit to another change" {
-  jj describe -m "Phase 1"
+  jjdesc -m "Phase 1"
   local P1 P2
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "phase 2 placeholder"
+  jj plan new step-1; jjdesc -m "phase 2 placeholder"
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Phase 3"
+  jj plan new step-2; jjdesc -m "Phase 3"
   # Write rich plan to Phase 2 (not current)
-  printf "Phase 2: Full implementation plan\n\n## Steps\n- Do X\n- Do Y\n- Do Z" > ".jj-plan/02-step-1.md"
+  printf "Phase 2: Full implementation plan\n\n## Steps\n- Do X\n- Do Y\n- Do Z" > "$(plan_file step-1)"
   # Switch to Phase 2
   jj edit -r "$P2"
-  [[ "$(cat .jj-plan/02-step-1.md)" == *"Phase 2: Full implementation plan"* ]]
-  [[ "$(cat .jj-plan/02-step-1.md)" == *"- Do X"* ]]
+  [[ "$(cat "$(plan_file step-1)")" == *"Phase 2: Full implementation plan"* ]]
+  [[ "$(cat "$(plan_file step-1)")" == *"- Do X"* ]]
   [[ "$("$REAL_JJ" log -r "$P2" -T description --no-graph)" == *"Phase 2: Full implementation plan"* ]]
 }
 
 @test "editing multiple non-current plan files flushes all of them" {
-  jj describe -m "Change A"
+  jjdesc -m "Change A"
   local CA CB
   CA=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Change B"
+  jj plan new step-1; jjdesc -m "Change B"
   CB=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Change C"
+  jj plan new step-2; jjdesc -m "Change C"
   # Edit both A and B (neither is current)
-  printf "Change A revised with detail" > ".jj-plan/01-start.md"
-  printf "Change B revised with detail" > ".jj-plan/02-step-1.md"
+  printf "Change A revised with detail" > "$(plan_file start)"
+  printf "Change B revised with detail" > "$(plan_file step-1)"
   # Trigger sync
-  jj describe -m "Change C updated"
+  jjdesc -m "Change C updated"
   [[ "$("$REAL_JJ" log -r "$CA" -T description --no-graph)" == "Change A revised with detail" ]]
   [[ "$("$REAL_JJ" log -r "$CB" -T description --no-graph)" == "Change B revised with detail" ]]
 }
 
 @test "non-current file edits survive stack renumbering" {
-  jj describe -m "Will be abandoned"
+  jjdesc -m "Will be abandoned"
   local DOOMED KEEP
   DOOMED=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Important plan"
+  jj plan new step-1; jjdesc -m "Important plan"
   KEEP=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Current work"
+  jj plan new step-2; jjdesc -m "Current work"
   # Edit the non-current plan file (index 02)
-  printf "Important plan\n\n## Revised\nWith critical details" > ".jj-plan/02-step-1.md"
+  printf "Important plan\n\n## Revised\nWith critical details" > "$(plan_file step-1)"
   # Abandon the first change — causes renumbering (step-1 goes from 02 to 01).
   # Don't move `start` to KEEP — two bookmarks on one commit causes a flush
   # conflict where both plan files write to the same description.
@@ -243,7 +265,7 @@ teardown() {
   [[ "$desc" == *"critical details"* ]]
   # After renumbering, verify the content survived in the renumbered file.
   local found=false
-  for f in .jj-plan/[0-9][0-9]-*.md; do
+  for f in .jj-plan/*-[0-9][0-9]-*.md; do
     if [[ -f "$f" ]] && grep -q "critical details" "$f"; then
       found=true; break
     fi
@@ -252,48 +274,48 @@ teardown() {
 }
 
 @test "jj describe does not get clobbered by stale file content" {
-  jj describe -m "First version"
-  [[ "$(cat .jj-plan/01-start.md)" == "First version" ]]
-  jj describe -m "Second version"
-  [[ "$(cat .jj-plan/01-start.md)" == "Second version" ]]
-  jj describe -m "Third version"
-  [[ "$(cat .jj-plan/01-start.md)" == "Third version" ]]
+  jjdesc -m "First version"
+  [[ "$(cat "$(plan_file start)")" == "First version" ]]
+  jjdesc -m "Second version"
+  [[ "$(cat "$(plan_file start)")" == "Second version" ]]
+  jjdesc -m "Third version"
+  [[ "$(cat "$(plan_file start)")" == "Third version" ]]
 }
 
 @test "non-current edits and jj describe on current do not interfere" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Impl"
+  jj plan new step-1; jjdesc -m "Impl"
   # Edit non-current (Plan) file
-  printf "Plan\n\n## Updated background" > ".jj-plan/01-start.md"
+  printf "Plan\n\n## Updated background" > "$(plan_file start)"
   # Also jj describe current
-  jj describe -m "Impl revised"
+  jjdesc -m "Impl revised"
   # Plan should have the locally edited content
   local plan_desc
   plan_desc=$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)
   [[ "$plan_desc" == *"Plan"* ]]
   [[ "$plan_desc" == *"## Updated background"* ]]
   # Impl should have the jj describe content (not clobbered)
-  [[ "$(cat .jj-plan/02-step-1.md)" == "Impl revised" ]]
+  [[ "$(cat "$(plan_file step-1)")" == "Impl revised" ]]
 }
 
 @test "exact reproduction of data loss scenario: write to non-current then jj edit" {
   # Build a stack of 4 phases
-  jj describe -m "Phase 1: schema refactor"
-  jj plan new step-1; jj describe -m "phase 2 placeholder"
+  jjdesc -m "Phase 1: schema refactor"
+  jj plan new step-1; jjdesc -m "phase 2 placeholder"
   local P2
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "phase 3 placeholder"
-  jj plan new step-3; jj describe -m "phase 4 placeholder"
+  jj plan new step-2; jjdesc -m "phase 3 placeholder"
+  jj plan new step-3; jjdesc -m "phase 4 placeholder"
   # Write rich plan to phase 2 (NOT current — current is phase 4)
   # Plan files use bookmark names, not change IDs: step-1 is the bookmark for P2
-  printf "Phase 2: Implement branded InterpreterLayer\n\n## Background\nThis is the detailed plan that must not be lost.\n\n## Steps\n- Step A: extract trait\n- Step B: implement layer\n- Step C: wire up" > ".jj-plan/02-step-1.md"
+  printf "Phase 2: Implement branded InterpreterLayer\n\n## Background\nThis is the detailed plan that must not be lost.\n\n## Steps\n- Step A: extract trait\n- Step B: implement layer\n- Step C: wire up" > "$(plan_file step-1)"
   # Now jj edit to phase 2 (this is the operation that caused data loss)
   jj edit -r "$P2"
   # Verify plan survived in BOTH the file and jj description
-  [[ "$(head -1 .jj-plan/02-step-1.md)" == "Phase 2: Implement branded InterpreterLayer" ]]
-  [[ "$(grep -c "Step A" .jj-plan/02-step-1.md)" -eq 1 ]]
+  [[ "$(head -1 "$(plan_file step-1)")" == "Phase 2: Implement branded InterpreterLayer" ]]
+  [[ "$(grep -c "Step A" "$(plan_file step-1)")" -eq 1 ]]
   [[ "$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)" == "Phase 2: Implement branded InterpreterLayer" ]]
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph | grep -c "Step A")" -eq 1 ]]
 }
@@ -303,10 +325,10 @@ teardown() {
 # =============================================================================
 
 @test "jj describe updates the plan file (not clobbered)" {
-  jj describe -m "First version"
-  [[ "$(cat .jj-plan/01-start.md)" == "First version" ]]
-  jj describe -m "Second version"
-  [[ "$(cat .jj-plan/01-start.md)" == "Second version" ]]
+  jjdesc -m "First version"
+  [[ "$(cat "$(plan_file start)")" == "First version" ]]
+  jjdesc -m "Second version"
+  [[ "$(cat "$(plan_file start)")" == "Second version" ]]
 }
 
 # =============================================================================
@@ -314,7 +336,7 @@ teardown() {
 # =============================================================================
 
 @test "multiline descriptions are preserved" {
-  jj describe -m "Auth refactor
+  jjdesc -m "Auth refactor
 
 ## Why
 Need JWT and API key support
@@ -323,17 +345,17 @@ Need JWT and API key support
 - Extract module
 - Add JWT"
   local content
-  content=$(cat .jj-plan/01-start.md)
+  content=$(cat "$(plan_file start)")
   [[ "$content" == *"## Why"* ]]
   [[ "$content" == *"## Steps"* ]]
   [[ "$content" == *"- Extract module"* ]]
 }
 
 @test "multiline edits to plan files round-trip through jj" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  printf "Plan\n\n## Background\nSome context here\n\n## Steps\n- [x] Done\n- [ ] Todo" > .jj-plan/01-start.md
+  printf "Plan\n\n## Background\nSome context here\n\n## Steps\n- [x] Done\n- [ ] Todo" > "$(plan_file start)"
   jj plan new step-1
   local desc
   desc=$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)
@@ -347,43 +369,43 @@ Need JWT and API key support
 # =============================================================================
 
 @test "stack.md is generated with first lines of plan files" {
-  jj describe -m "Refactor auth middleware"
-  jj plan new step-1; jj describe -m "Extract auth module"
-  jj plan new step-2; jj describe -m "Implement JWT strategy"
+  jjdesc -m "Refactor auth middleware"
+  jj plan new step-1; jjdesc -m "Extract auth module"
+  jj plan new step-2; jjdesc -m "Implement JWT strategy"
   local stack
   stack=$(cat .jj-plan/stack.md)
-  [[ "$stack" == *"[start](./01-start.md)"* ]]
+  [[ "$stack" == *"[start](./"*"-01-start.md)"* ]]
   [[ "$stack" == *"Refactor auth middleware"* ]]
-  [[ "$stack" == *"[step-1](./02-step-1.md)"* ]]
+  [[ "$stack" == *"[step-1](./"*"-02-step-1.md)"* ]]
   [[ "$stack" == *"Extract auth module"* ]]
-  [[ "$stack" == *"[step-2](./03-step-2.md)"* ]]
+  [[ "$stack" == *"[step-2](./"*"-03-step-2.md)"* ]]
   [[ "$stack" == *"Implement JWT strategy"* ]]
 }
 
 @test "stack.md marks current change with working copy marker" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
   local stack
   stack=$(cat .jj-plan/stack.md)
   # Current is Step 2 (tip) — should have ◉ marker on node line
-  [[ "$(grep '◉' .jj-plan/stack.md)" == *"[step-2](./03-step-2.md)"* ]]
+  [[ "$(grep '◉' .jj-plan/stack.md)" == *"[step-2](./"*"-03-step-2.md)"* ]]
   # (@) indicator is on the description line (Regular format)
   [[ "$stack" == *"(@)"*"Step 2"* ]]
   # Switch to first
   jj edit -r "$PLAN"
   stack=$(cat .jj-plan/stack.md)
-  [[ "$(grep '◉' .jj-plan/stack.md)" == *"[start](./01-start.md)"* ]]
+  [[ "$(grep '◉' .jj-plan/stack.md)" == *"[start](./"*"-01-start.md)"* ]]
   [[ "$stack" == *"(@)"*"Plan"* ]]
 }
 
 @test "stack.md updates when stack changes" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local before
   before=$(cat .jj-plan/stack.md | wc -l | tr -d " ")
-  jj plan new step-1; jj describe -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 1"
   local after
   after=$(cat .jj-plan/stack.md | wc -l | tr -d " ")
   # Graph format: adding a plan increases line count (header + graph lines)
@@ -397,9 +419,9 @@ Need JWT and API key support
 # =============================================================================
 
 @test "stack.md shows blank for empty not-started changes" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
   # Empty, not-started change has no indicator parenthetical.
   # In Regular format, indicators are on the description line (after │),
   # so we check the node line (bookmark line) AND the next line.
@@ -416,9 +438,9 @@ Need JWT and API key support
 }
 
 @test "stack.md shows ~ for non-empty non-current changes" {
-  jj describe -m "Step 1"
+  jjdesc -m "Step 1"
   echo "some work" > file.txt
-  jj plan new step-1; jj describe -m "Step 2"
+  jj plan new step-1; jjdesc -m "Step 2"
   # Non-current, non-empty change shows (~) indicator on description line
   local stack
   stack=$(cat .jj-plan/stack.md)
@@ -426,12 +448,12 @@ Need JWT and API key support
 }
 
 @test "stack.md shows ✓ for changes with plan-status: ✅" {
-  jj describe -m "Step 1"
-  jj plan new step-1; jj describe -m "Step 2"
+  jjdesc -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 2"
   # Mark Step 1 as done by editing its plan file (bookmark-named: 01-start.md)
-  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nDid the work." > ".jj-plan/01-start.md"
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nDid the work." > "$(plan_file start)"
   # Trigger a sync
-  jj describe -m "Step 2 updated"
+  jjdesc -m "Step 2 updated"
   # (✓) indicator now on description line in Regular format
   local stack
   stack=$(cat .jj-plan/stack.md)
@@ -440,20 +462,20 @@ Need JWT and API key support
 
 @test "stack.md shows all status types together" {
   # Change 0: will be marked done
-  jj describe -m "Done change"
+  jjdesc -m "Done change"
   # Change 1: will have file changes (has-changes)
-  jj plan new step-1; jj describe -m "Has changes"
+  jj plan new step-1; jjdesc -m "Has changes"
   echo "work" > file.txt
   # Change 2: will be current (in-progress)
-  jj plan new step-2; jj describe -m "Current work"
+  jj plan new step-2; jjdesc -m "Current work"
   # Change 3: empty, not started
-  jj plan new step-3; jj describe -m "Future work"
+  jj plan new step-3; jjdesc -m "Future work"
   # Now go back to change 2 to make it current
   jj edit -r @-
   # Mark change 0 as done (bookmark-named: 01-start.md)
-  printf "Done change\n\n> [!plan]\n> status: ✅" > ".jj-plan/01-start.md"
+  printf "Done change\n\n> [!plan]\n> status: ✅" > "$(plan_file start)"
   # Trigger sync
-  jj describe -m "Current work"
+  jjdesc -m "Current work"
   local stack
   stack=$(cat .jj-plan/stack.md)
   # Done change shows (✓) on description line
@@ -471,26 +493,26 @@ Need JWT and API key support
 }
 
 @test "stack.md contains clickable markdown links" {
-  jj describe -m "Auth feature"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Auth feature"
+  jj plan new step-1; jjdesc -m "Extract module"
   [[ -f .jj-plan/stack.md ]]
   # Contains markdown link syntax with ./ prefix
-  [[ "$(cat .jj-plan/stack.md)" == *"](./01-start.md)"* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"](./"*"-01-start.md)"* ]]
   # Contains bookmark names in links
-  [[ "$(cat .jj-plan/stack.md)" == *"[start](./01-start.md)"* ]]
-  [[ "$(cat .jj-plan/stack.md)" == *"[step-1](./02-step-1.md)"* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"[start](./"*"-01-start.md)"* ]]
+  [[ "$(cat .jj-plan/stack.md)" == *"[step-1](./"*"-02-step-1.md)"* ]]
   # Contains the generated header comment
   [[ "$(cat .jj-plan/stack.md)" == *"<!-- generated by jj-plan"* ]]
 }
 
 @test "plan-status: ✅ round-trips through jj description" {
-  jj describe -m "Step 1"
+  jjdesc -m "Step 1"
   local START_CID
   START_CID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   # Write done status to plan file using callout format
-  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nCompleted." > .jj-plan/01-start.md
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\nCompleted." > "$(plan_file start)"
   # Switch away (flushes to jj)
-  jj plan new step-1; jj describe -m "Step 2"
+  jj plan new step-1; jjdesc -m "Step 2"
   # Check the description was preserved
   local desc
   desc=$("$REAL_JJ" log -r "$START_CID" -T description --no-graph)
@@ -499,14 +521,14 @@ Need JWT and API key support
 }
 
 @test "jj status flushes non-current file edits and updates stack" {
-  jj describe -m "Phase 1"
+  jjdesc -m "Phase 1"
   local P2
-  jj plan new step-1; jj describe -m "phase 2 placeholder"
+  jj plan new step-1; jjdesc -m "phase 2 placeholder"
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Phase 3"
+  jj plan new step-2; jjdesc -m "Phase 3"
   # Write rich plan to Phase 2 (not current) WITHOUT running a jj command
   # Plan files use bookmark names, not change IDs: step-1 is bookmark for P2
-  printf "Phase 2: Full implementation plan\n\nDetailed steps here" > ".jj-plan/02-step-1.md"
+  printf "Phase 2: Full implementation plan\n\nDetailed steps here" > "$(plan_file step-1)"
   # jj status should flush the edit and show updated terminal view
   run jj status
   [[ "$output" == *"Phase 2: Full implementation plan"* ]]
@@ -514,15 +536,15 @@ Need JWT and API key support
 }
 
 @test "jj st flushes edits to multiple non-current files" {
-  jj describe -m "Change A"
+  jjdesc -m "Change A"
   local CA CB
   CA=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Change B"
+  jj plan new step-1; jjdesc -m "Change B"
   CB=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Change C"
+  jj plan new step-2; jjdesc -m "Change C"
   # Edit both non-current files (bookmark-named: start, step-1)
-  printf "Change A: revised plan" > ".jj-plan/01-start.md"
-  printf "Change B: revised plan" > ".jj-plan/02-step-1.md"
+  printf "Change A: revised plan" > "$(plan_file start)"
+  printf "Change B: revised plan" > "$(plan_file step-1)"
   # jj st should flush both
   run jj st
   [[ "$output" == *"Change A: revised plan"* ]]
@@ -536,16 +558,16 @@ Need JWT and API key support
 # =============================================================================
 
 @test "files for abandoned changes are removed" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   local STEP1
   STEP1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-2; jjdesc -m "Step 2"
   local before
-  before=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  before=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   jj abandon "$STEP1"
   local after
-  after=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  after=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$before" -eq 3 ]]
   [[ "$after" -eq 2 ]]
 }
@@ -555,7 +577,7 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj log passes through without sync overhead" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   rm -rf .jj-plan
   jj log -r @ -T description --no-graph
   [[ ! -d .jj-plan ]]
@@ -568,8 +590,8 @@ Need JWT and API key support
 }
 
 @test "jj status appends plan stack when .jj-plan is active" {
-  jj describe -m "Refactor auth"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Refactor auth"
+  jj plan new step-1; jjdesc -m "Extract module"
   run jj status
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
   [[ "$output" == *"Refactor auth"* ]]
@@ -577,7 +599,7 @@ Need JWT and API key support
 }
 
 @test "jj st also appends plan stack" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   run jj st
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
   [[ "$output" == *"My plan"* ]]
@@ -588,8 +610,8 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj status appends plan stack from a subdirectory" {
-  jj describe -m "Refactor auth"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Refactor auth"
+  jj plan new step-1; jjdesc -m "Extract module"
   mkdir -p lib
   cd lib
   run jj status
@@ -598,7 +620,7 @@ Need JWT and API key support
 }
 
 @test "jj st appends plan stack from a subdirectory" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   mkdir -p lib
   cd lib
   run jj st
@@ -607,24 +629,24 @@ Need JWT and API key support
 }
 
 @test "mutating commands sync plans from a subdirectory" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   mkdir -p src
   cd src
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-2; jjdesc -m "Step 2"
   local count
-  count=$(ls ../.jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls ../.jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 3 ]]
-  [[ "$(cat ../.jj-plan/03-step-2.md)" == "Step 2" ]]
+  [[ "$(cat "$(plan_file step-2 ../.jj-plan)")" == "Step 2" ]]
 }
 
 @test "editing plan file from subdir flushes to jj on switch" {
-  jj describe -m "Original"
+  jjdesc -m "Original"
   local PLAN IMPL
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Impl"
+  jj plan new step-1; jjdesc -m "Impl"
   IMPL=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  printf "Updated from subdir" > .jj-plan/02-step-1.md
+  printf "Updated from subdir" > "$(plan_file step-1)"
   mkdir -p src
   cd src
   jj edit -r "$PLAN"
@@ -637,20 +659,20 @@ Need JWT and API key support
 
 @test "exceeding max changes creates error.md" {
   export JJ_PLAN_MAX=3
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
-  jj plan new step-3; jj describe -m "Step 3"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
+  jj plan new step-3; jjdesc -m "Step 3"
   [[ -f .jj-plan/error.md ]]
   [[ -f .jj-plan/error.md ]]
 }
 
 @test "error.md contains a descriptive message" {
   export JJ_PLAN_MAX=3
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
-  jj plan new step-3; jj describe -m "Step 3"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
+  jj plan new step-3; jjdesc -m "Step 3"
   local msg
   msg=$(cat .jj-plan/error.md)
   [[ "$msg" == *"max 3"* ]]
@@ -659,10 +681,10 @@ Need JWT and API key support
 
 @test "error state self-heals when stack shrinks below max" {
   export JJ_PLAN_MAX=3
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
-  jj plan new step-3; jj describe -m "Step 3"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
+  jj plan new step-3; jjdesc -m "Step 3"
   [[ -f .jj-plan/error.md ]]
   jj squash -m "Step 2+3 combined"
   jj edit -r @-
@@ -671,11 +693,11 @@ Need JWT and API key support
 
 @test "flush is skipped during error state (no description clobber)" {
   export JJ_PLAN_MAX=3
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
-  jj plan new step-3; jj describe -m "Step 3"
-  jj describe -m "Step 3 updated"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
+  jj plan new step-3; jjdesc -m "Step 3"
+  jjdesc -m "Step 3 updated"
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Step 3 updated" ]]
 }
 
@@ -684,7 +706,7 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj plan new produces empty plan file before describe" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   jj plan new step-1
   local content
   content=$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)
@@ -705,23 +727,23 @@ Need JWT and API key support
 
 @test "no .jj-plan directory means full passthrough (no sync)" {
   rm -rf .jj-plan
-  jj describe -m "Should not create .jj-plan"
+  jjdesc -m "Should not create .jj-plan"
   [[ ! -d .jj-plan ]]
 }
 
 @test "passthrough still runs jj commands correctly without .jj-plan" {
   rm -rf .jj-plan
-  jj describe -m "Test description"
+  jjdesc -m "Test description"
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Test description" ]]
 }
 
 @test "creating .jj-plan activates sync" {
   rm -rf .jj-plan
-  jj describe -m "Before activation"
+  jjdesc -m "Before activation"
   [[ ! -d .jj-plan ]]
   mkdir .jj-plan
-  jj describe -m "After activation"
-  [[ -f .jj-plan/01-start.md ]]
+  jjdesc -m "After activation"
+  [[ -f "$(plan_file start)" ]]
 }
 
 # =============================================================================
@@ -738,11 +760,11 @@ Need JWT and API key support
 @test "no sync when neither registered plan nor useful trunk() exists" {
   rm -f .jj/repo/jj-plan/plans.toml
   "$REAL_JJ" bookmark delete start 2>/dev/null
-  jj describe -m "Orphan work"
+  jjdesc -m "Orphan work"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
   [[ "$count" -eq 0 ]]
-  [[ ! -f .jj-plan/01-start.md ]]
+  [[ ! -f "$(plan_file start)" ]]
 }
 
 # =============================================================================
@@ -773,10 +795,10 @@ Need JWT and API key support
 
 @test "jj plan new with -r positions the new change" {
   # Get current change for -r positioning
-  jj describe -m "Base"
+  jjdesc -m "Base"
   BASE=$("$REAL_JJ" log -r @ -T 'change_id.shortest(8)' --no-graph 2>/dev/null)
   jj plan new step-1
-  jj describe -m "After"
+  jjdesc -m "After"
   # Create plan rooted off base
   run jj plan new rooted-plan -r "$BASE"
   [[ "$status" -eq 0 ]]
@@ -784,45 +806,45 @@ Need JWT and API key support
 }
 
 @test "jj plan new flushes pending edits" {
-  jj describe -m "Original plan"
+  jjdesc -m "Original plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  printf "Revised plan with important details" > .jj-plan/01-start.md
+  printf "Revised plan with important details" > "$(plan_file start)"
   jj plan new step-next
   [[ "$("$REAL_JJ" log -r "$PLAN" -T description --no-graph)" == "Revised plan with important details" ]]
 }
 
 @test "jj plan new creates plan file and shows stack" {
-  jj describe -m "Old plan"
+  jjdesc -m "Old plan"
   run jj plan new step-next
-  [[ -f .jj-plan/02-step-next.md ]]
+  [[ -f "$(plan_file step-next)" ]]
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
 }
 
 @test "jj plan new plan file contains placeholder" {
-  jj describe -m "Old plan"
+  jjdesc -m "Old plan"
   jj plan new step-next
-  [[ "$(cat .jj-plan/02-step-next.md)" == "(plan: jj:"* ]]
+  [[ "$(cat "$(plan_file step-next)")" == "(plan: jj:"* ]]
 }
 
 @test "jj plan new from mid-stack inserts linearly (not a fork)" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
-  jj plan new step-2; jj describe -m "Step 2"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
+  jj plan new step-2; jjdesc -m "Step 2"
   # Move @ back to the middle
   jj edit -r @-
   jj plan new step-mid
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 4 ]]
-  [[ "$(cat .jj-plan/01-*.md)" == "Plan" ]]
-  [[ "$(cat .jj-plan/02-*.md)" == "Step 1" ]]
-  [[ "$(cat .jj-plan/03-*.md)" == "(plan: jj:"* ]]
-  [[ "$(cat .jj-plan/04-*.md)" == "Step 2" ]]
+  [[ "$(cat .jj-plan/*-01-*.md)" == "Plan" ]]
+  [[ "$(cat .jj-plan/*-02-*.md)" == "Step 1" ]]
+  [[ "$(cat .jj-plan/*-03-*.md)" == "(plan: jj:"* ]]
+  [[ "$(cat .jj-plan/*-04-*.md)" == "Step 2" ]]
 }
 
 @test "jj plan new placeholder contains actual change ID" {
-  jj describe -m "Existing plan"
+  jjdesc -m "Existing plan"
   jj plan new step-next
   local NEW_ID desc
   NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -872,7 +894,7 @@ Need JWT and API key support
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Created plan: feat/auth"* ]]
   # Verify the encoded filename was created
-  [[ -f .jj-plan/02-feat--auth.md ]]
+  [[ -f "$(plan_file feat--auth)" ]]
 }
 
 @test "jj plan new feat--auth after feat/auth fails with collision" {
@@ -901,13 +923,13 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj stack shows visualization with change ID" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   run jj stack
   [[ "$status" -eq 0 ]]
   # Verify the visualization includes the bookmark name and a change ID
   [[ "$output" == *"start "* ]]
-  # Change ID is the short reverse-hex (k-z alphabet, 8+ chars) between bookmark and indicator
-  [[ "$output" =~ start\ [k-z]{8} ]]
+  # Change ID is the short reverse-hex (k-z alphabet, 8+ chars), shown before the bookmark
+  [[ "$output" =~ [k-z]{8}.*start ]]
   [[ "$output" == *"trunk()"* ]]
 }
 
@@ -947,16 +969,16 @@ Need JWT and API key support
 # jj plan error handling
 # =============================================================================
 
-@test "jj plan with no subcommand shows usage" {
-  jj describe -m "Plan"
+@test "jj plan with no subcommand shows the current plan summary" {
+  jjdesc -m "Plan"
   run jj plan
-  [[ "$status" -eq 1 ]]
-  [[ "$output" == *"jj plan: missing subcommand"* ]]
-  [[ "$output" == *"jj plan --help"* ]]
+  # Bare `jj plan` shows the summary when @ is a tracked plan (orientation otherwise).
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"Plan"* ]]
 }
 
 @test "jj plan bogus shows usage" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   run jj plan bogus
   [[ "$status" -eq 1 ]]
   [[ "$output" == *"jj plan: unknown subcommand"* ]]
@@ -984,7 +1006,7 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj plan new --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan new --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -992,7 +1014,7 @@ Need JWT and API key support
 }
 
 @test "jj plan track --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan track --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1000,7 +1022,7 @@ Need JWT and API key support
 }
 
 @test "jj plan untrack --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan untrack --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1008,7 +1030,7 @@ Need JWT and API key support
 }
 
 @test "jj plan done --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan done --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1016,7 +1038,7 @@ Need JWT and API key support
 }
 
 @test "jj plan go --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan go --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1024,7 +1046,7 @@ Need JWT and API key support
 }
 
 @test "jj plan next --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan next --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1032,7 +1054,7 @@ Need JWT and API key support
 }
 
 @test "jj plan prev --help prints help without side effects" {
-  jj describe -m "Precious content"
+  jjdesc -m "Precious content"
   run jj plan prev --help
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
@@ -1056,8 +1078,8 @@ Need JWT and API key support
 }
 
 @test "jj plan config shows stack info" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   run jj plan config
   [[ "$output" == *"stack segments:"*"2"* ]]
 }
@@ -1089,8 +1111,8 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj plan new appends plan stack when .jj-plan is active" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   run jj plan new step-2
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
   [[ "$output" == *"Plan"* ]]
@@ -1098,10 +1120,10 @@ Need JWT and API key support
 }
 
 @test "jj edit appends plan stack when .jj-plan is active" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 1"
   run jj edit -r "$PLAN"
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
   [[ "$output" == *"Plan"* ]]
@@ -1109,7 +1131,7 @@ Need JWT and API key support
 }
 
 @test "jj plan new appends plan stack after confirmation" {
-  jj describe -m "Old plan"
+  jjdesc -m "Old plan"
   run jj plan new my-feature
   [[ "$output" == *"Created plan:"* ]]
   [[ "$output" == *"Plan stack (.jj-plan/"* ]]
@@ -1128,12 +1150,12 @@ Need JWT and API key support
 # =============================================================================
 
 @test "change that is both current AND done shows (@, ✓)" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   local PLAN
   PLAN=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 1"
   # Mark Plan as done using callout format (bookmark-named: 01-start.md)
-  printf "Plan\n\n> [!plan]\n> status: ✅" > ".jj-plan/01-start.md"
+  printf "Plan\n\n> [!plan]\n> status: ✅" > "$(plan_file start)"
   # Switch back to Plan — it is both current AND done
   jj edit -r "$PLAN"
   # ◉ marker (working copy) on node line
@@ -1145,11 +1167,11 @@ Need JWT and API key support
 }
 
 @test "status: ✅ in callout detected when not on the last line" {
-  jj describe -m "Step 1"
-  jj plan new step-1; jj describe -m "Step 2"
+  jjdesc -m "Step 1"
+  jj plan new step-1; jjdesc -m "Step 2"
   # Write status in callout format with trailing content (bookmark-named: 01-start.md)
-  printf "Step 1\n\n> [!plan]\n> status: ✅\n\n## Notes\nSome trailing content" > ".jj-plan/01-start.md"
-  jj describe -m "Step 2 updated"
+  printf "Step 1\n\n> [!plan]\n> status: ✅\n\n## Notes\nSome trailing content" > "$(plan_file start)"
+  jjdesc -m "Step 2 updated"
   # (✓) indicator on description line in Regular format
   local stack
   stack=$(cat .jj-plan/stack.md)
@@ -1161,12 +1183,12 @@ Need JWT and API key support
 # =============================================================================
 
 @test "abandon bookmarked change with descendants succeeds and resyncs" {
-  jj describe -m "Start root"
+  jjdesc -m "Start root"
   local ROOT CHILD
   ROOT=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new child-step; jj describe -m "Child"
+  jj plan new child-step; jjdesc -m "Child"
   CHILD=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new grandchild-step; jj describe -m "Grandchild"
+  jj plan new grandchild-step; jjdesc -m "Grandchild"
   run jj abandon "$ROOT"
   # jj deletes the bookmark on abandon (not move). Verify the abandon succeeded
   # and plan files re-synced. The companion test ".jj-plan is correctly synced
@@ -1176,11 +1198,11 @@ Need JWT and API key support
 }
 
 @test "abandon non-bookmarked middle change does not interfere with bookmark" {
-  jj describe -m "Plan"
-  jj plan new step-1; jj describe -m "Step 1"
+  jjdesc -m "Plan"
+  jj plan new step-1; jjdesc -m "Step 1"
   local STEP1
   STEP1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Step 2"
+  jj plan new step-2; jjdesc -m "Step 2"
   run jj abandon "$STEP1"
   local bm
   bm=$("$REAL_JJ" bookmark list --no-pager 2>&1)
@@ -1189,19 +1211,19 @@ Need JWT and API key support
 }
 
 @test ".jj-plan is correctly synced after bookmark recovery on abandon" {
-  jj describe -m "Start root"
+  jjdesc -m "Start root"
   local ROOT
   ROOT=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new child-step; jj describe -m "Child"
-  jj plan new grandchild-step; jj describe -m "Grandchild"
+  jj plan new child-step; jjdesc -m "Child"
+  jj plan new grandchild-step; jjdesc -m "Grandchild"
   jj abandon "$ROOT"
   local count
-  count=$(ls .jj-plan/[0-9][0-9]-*.md | wc -l | tr -d " ")
+  count=$(ls .jj-plan/*-[0-9][0-9]-*.md | wc -l | tr -d " ")
   [[ "$count" -eq 2 ]]
-  [[ "$(cat .jj-plan/01-*.md)" == "Child" ]]
+  [[ "$(cat .jj-plan/*-01-*.md)" == "Child" ]]
   # Verify the grandchild plan file content (it should be at some NN-grandchild-step.md)
   local gc_file
-  gc_file=$(ls .jj-plan/[0-9][0-9]-grandchild-step.md 2>/dev/null | head -1)
+  gc_file=$(ls "$(plan_file grandchild-step)" 2>/dev/null | head -1)
   [[ -n "$gc_file" ]]
   [[ "$(cat "$gc_file")" == "Grandchild" ]]
 }
@@ -1213,17 +1235,17 @@ Need JWT and API key support
 @test "legacy .jj-plans/ works when .jj-plan/ does not exist" {
   rm -rf .jj-plan
   mkdir -p .jj-plans
-  jj describe -m "Legacy plan"
-  [[ -f .jj-plans/01-start.md ]]
-  [[ "$(cat .jj-plans/01-start.md)" == "Legacy plan" ]]
+  jjdesc -m "Legacy plan"
+  [[ -f "$(plan_file start .jj-plans)" ]]
+  [[ "$(cat "$(plan_file start .jj-plans)")" == "Legacy plan" ]]
   run jj status
   [[ "$output" == *"Plan stack (.jj-plans/"* ]]
 }
 
 @test ".jj-plan/ takes precedence when both .jj-plan/ and .jj-plans/ exist" {
   mkdir -p .jj-plans
-  jj describe -m "Precedence test"
-  [[ -f .jj-plan/01-start.md ]]
+  jjdesc -m "Precedence test"
+  [[ -f "$(plan_file start)" ]]
   local legacy_count
   legacy_count=$(ls .jj-plans/[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
   [[ "$legacy_count" -eq 0 ]]
@@ -1234,14 +1256,14 @@ Need JWT and API key support
 @test "JJ_PLAN_DIR env var overrides both .jj-plan/ and .jj-plans/" {
   mkdir -p .jj-plans .custom-plans
   export JJ_PLAN_DIR="$(pwd)/.custom-plans"
-  jj describe -m "Custom dir test"
-  [[ -f .custom-plans/01-start.md ]]
+  jjdesc -m "Custom dir test"
+  [[ -f "$(plan_file start .custom-plans)" ]]
   local default_count legacy_count
-  default_count=$(ls .jj-plan/[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
-  legacy_count=$(ls .jj-plans/[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
+  default_count=$(ls .jj-plan/*-[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
+  legacy_count=$(ls .jj-plans/*-[0-9][0-9]-*.md 2>/dev/null | wc -l | tr -d " ")
   [[ "$default_count" -eq 0 ]]
   [[ "$legacy_count" -eq 0 ]]
-  [[ "$(cat .custom-plans/01-start.md)" == "Custom dir test" ]]
+  [[ "$(cat "$(plan_file start .custom-plans)")" == "Custom dir test" ]]
   run jj status
   [[ "$output" == *"Plan stack (.custom-plans/"* ]]
 }
@@ -1251,18 +1273,18 @@ Need JWT and API key support
 # =============================================================================
 
 @test "jj plan done marks current plan as done" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   jj plan done
   local desc
   desc=$("$REAL_JJ" log -r @ -T description --no-graph)
-  [[ "$desc" == *"plan-status: ✅"* ]]
+  [[ "$desc" == *"status: ✅"* ]]
 }
 
 @test "jj plan done does not change working copy" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1 P2
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
+  jj plan new step-1; jjdesc -m "Plan 2"
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   # Go back to plan 1 and mark it done
   jj edit -r "$P1"
@@ -1274,13 +1296,13 @@ Need JWT and API key support
 }
 
 @test "jj plan done --dry-run does not modify description" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 ## Scratch [scratch]
 
 Working notes here"
   run jj plan done --dry-run
-  [[ "$output" == *"Would strip scratch sections"* ]]
+  [[ "$output" == *"Stripped scratch sections"* ]]
   local desc
   desc=$("$REAL_JJ" log -r @ -T description --no-graph)
   [[ "$desc" == *"My plan"* ]]
@@ -1288,7 +1310,7 @@ Working notes here"
 }
 
 @test "jj plan done --keep-scratch preserves scratch content" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 ## Notes [scratch]
 
@@ -1297,11 +1319,11 @@ Important scratch notes"
   local desc
   desc=$("$REAL_JJ" log -r @ -T description --no-graph)
   [[ "$desc" == *"Important scratch notes"* ]]
-  [[ "$desc" == *"plan-status: ✅"* ]]
+  [[ "$desc" == *"status: ✅"* ]]
 }
 
 @test "jj plan done strips scratch sections" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 ## Background
 
@@ -1320,21 +1342,21 @@ Final results"
   [[ "$desc" == *"Real content"* ]]
   [[ "$desc" == *"Final results"* ]]
   [[ "$desc" != *"Temporary notes"* ]]
-  [[ "$desc" == *"plan-status: ✅"* ]]
+  [[ "$desc" == *"status: ✅"* ]]
 }
 
 @test "jj plan done --stack marks all plans done" {
-  jj describe -m "Plan 1"
-  jj plan new step-1; jj describe -m "Plan 2"
-  jj plan new step-2; jj describe -m "Plan 3"
+  jjdesc -m "Plan 1"
+  jj plan new step-1; jjdesc -m "Plan 2"
+  jj plan new step-2; jjdesc -m "Plan 3"
   jj plan done --stack
   local descs
   descs=$("$REAL_JJ" log -r "@ | @- | @--" -T "description" --no-graph)
-  [[ "$descs" == *"plan-status: ✅"* ]]
+  [[ "$descs" == *"status: ✅"* ]]
 }
 
 @test "jj plan done --show-stripped=toc lists top-level scratch + descendants" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 > [!plan]
 > status: 🔴
@@ -1362,7 +1384,7 @@ Wrap-up."
 }
 
 @test "jj plan done --show-stripped=headings omits descendants" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 > [!plan]
 > status: 🔴
@@ -1384,7 +1406,7 @@ Nested content."
 }
 
 @test "jj plan done --show-stripped=none is silent on strip side" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 > [!plan]
 > status: 🔴
@@ -1398,7 +1420,7 @@ Hidden learnings."
 }
 
 @test "jj plan done --dry-run --show-stripped=none keeps status side" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 > [!plan]
 > status: 🔴
@@ -1412,7 +1434,7 @@ Hidden learnings."
 }
 
 @test "jj plan done rejects invalid --show-stripped value" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   run jj plan done --show-stripped=verbose
   [[ "$output" == *"invalid --show-stripped value"* ]]
   [[ "$output" == *"full"* ]]
@@ -1422,7 +1444,7 @@ Hidden learnings."
 }
 
 @test "jj plan done on already-done plan is idempotent" {
-  jj describe -m "My plan
+  jjdesc -m "My plan
 
 plan-status: ✅"
   jj plan done
@@ -1437,7 +1459,7 @@ plan-status: ✅"
 # =============================================================================
 
 @test "jj plan summary shows plan outline" {
-  jj describe -m "feat: my feature
+  jjdesc -m "feat: my feature
 
 > [!plan]
 > status: 🟡
@@ -1469,7 +1491,7 @@ Some context.
 }
 
 @test "jj plan summary --json outputs valid JSON" {
-  jj describe -m "feat: json test
+  jjdesc -m "feat: json test
 
 > [!plan]
 > status: 🔴
@@ -1486,7 +1508,7 @@ Details here.
 }
 
 @test "jj plan summary --stack=quiet omits stack" {
-  jj describe -m "feat: quiet test"
+  jjdesc -m "feat: quiet test"
   run jj plan summary --stack=quiet
   [[ "$status" -eq 0 ]]
   [[ "$output" != *"Stack"* ]]
@@ -1553,7 +1575,9 @@ Details here.
 }
 
 @test "jj -R target-repo plan summary uses the target repo from outside cwd" {
-  cat > "$TEST_REPO/.jj-plan/01-start.md" <<'EOF'
+  # Seed the plan file so the name-glob resolves, then write the rich plan to it.
+  jjdesc -m "seed" >/dev/null 2>&1
+  cat > "$(plan_file start "$TEST_REPO/.jj-plan")" <<'EOF'
 feat: cross-repo summary
 
 > [!plan]
@@ -1597,10 +1621,10 @@ EOF
 # =============================================================================
 
 @test "jj plan next advances from plan 1 to plan 2" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1 P2
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
+  jj plan new step-1; jjdesc -m "Plan 2"
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
   jj edit -r "$P1"
   run jj plan next
@@ -1611,10 +1635,10 @@ EOF
 }
 
 @test "jj plan prev moves from plan 2 to plan 1" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
+  jj plan new step-1; jjdesc -m "Plan 2"
   run jj plan prev
   local CUR
   CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -1623,27 +1647,27 @@ EOF
 }
 
 @test "jj plan next at last plan stays put" {
-  jj describe -m "Plan 1"
-  jj plan new step-1; jj describe -m "Plan 2"
+  jjdesc -m "Plan 1"
+  jj plan new step-1; jjdesc -m "Plan 2"
   run jj plan next
   [[ "$output" == *"Already at the last plan"* ]]
   [[ "$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)" == "Plan 2" ]]
 }
 
 @test "jj plan prev at first plan stays put" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   run jj plan prev
   [[ "$output" == *"Already at the first plan"* ]]
   [[ "$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)" == "Plan 1" ]]
 }
 
 @test "jj plan next flushes pending edits before moving" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
+  jj plan new step-1; jjdesc -m "Plan 2"
   jj edit -r "$P1"
-  printf "Edited plan 1 content" > .jj-plan/01-start.md
+  printf "Edited plan 1 content" > "$(plan_file start)"
   jj plan next
   [[ "$("$REAL_JJ" log -r "$P1" -T description --no-graph)" == "Edited plan 1 content" ]]
 }
@@ -1653,11 +1677,11 @@ EOF
 # =============================================================================
 
 @test "jj plan go 2 moves to the second plan" {
-  jj describe -m "Plan 1"
-  jj plan new step-1; jj describe -m "Plan 2"
+  jjdesc -m "Plan 1"
+  jj plan new step-1; jjdesc -m "Plan 2"
   local P2
   P2=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-2; jj describe -m "Plan 3"
+  jj plan new step-2; jjdesc -m "Plan 3"
   run jj plan go 2
   local CUR
   CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -1666,11 +1690,11 @@ EOF
 }
 
 @test "jj plan go CHANGE_ID moves to specified change" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
-  jj plan new step-2; jj describe -m "Plan 3"
+  jj plan new step-1; jjdesc -m "Plan 2"
+  jj plan new step-2; jjdesc -m "Plan 3"
   run jj plan go "$P1"
   local CUR
   CUR=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -1678,30 +1702,30 @@ EOF
 }
 
 @test "jj plan go accepts bookmark name" {
-  jj describe -m "Plan 1"
-  jj plan new my-step; jj describe -m "Plan 2"
-  jj plan new other-step; jj describe -m "Plan 3"
+  jjdesc -m "Plan 1"
+  jj plan new my-step; jjdesc -m "Plan 2"
+  jj plan new other-step; jjdesc -m "Plan 3"
   run jj plan go my-step
   [[ "$status" -eq 0 ]]
   [[ "$("$REAL_JJ" log -r @ -T "description.first_line()" --no-graph)" == "Plan 2" ]]
 }
 
 @test "jj plan go 0 errors" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   run jj plan go 0
   [[ "$status" -eq 1 ]]
   [[ "$output" == *"out of range"* ]]
 }
 
 @test "jj plan go 99 errors (out of range)" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   run jj plan go 99
   [[ "$status" -eq 1 ]]
   [[ "$output" == *"out of range"* ]]
 }
 
 @test "jj plan go without target shows error" {
-  jj describe -m "Plan"
+  jjdesc -m "Plan"
   run jj plan go
   [[ "$status" -eq 1 ]]
   [[ "$output" == *"missing target"* ]]
@@ -1715,7 +1739,7 @@ EOF
   printf "Custom: {{CHANGE_ID}}\n\n## My Section\n" > .jj-plan/template.md
   jj plan new tmpl-step
   local content
-  content=$(cat .jj-plan/02-tmpl-step.md)
+  content=$(cat "$(plan_file tmpl-step)")
   [[ "$content" == *"Custom: "* ]]
   [[ "$content" == *"## My Section"* ]]
 }
@@ -1728,7 +1752,7 @@ EOF
   export JJ_PLAN_TEMPLATE="$ENVFILE"
   jj plan new tmpl-step
   local content
-  content=$(cat .jj-plan/02-tmpl-step.md)
+  content=$(cat "$(plan_file tmpl-step)")
   [[ "$content" == *"Env override: "* ]]
   [[ "$content" == *"## Env Section"* ]]
   [[ "$content" != *"ENV template"* ]]
@@ -1738,7 +1762,7 @@ EOF
   jj plan new tmpl-step
   local NEW_ID content
   NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  content=$(cat .jj-plan/02-tmpl-step.md)
+  content=$(cat "$(plan_file tmpl-step)")
   [[ "$content" == "(plan: jj:$NEW_ID)"* ]]
 }
 
@@ -1747,7 +1771,7 @@ EOF
   jj plan new tmpl-step
   local NEW_ID content
   NEW_ID=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  content=$(cat .jj-plan/02-tmpl-step.md)
+  content=$(cat "$(plan_file tmpl-step)")
   [[ "$content" == *"jj:$NEW_ID"* ]]
 }
 
@@ -1756,19 +1780,19 @@ EOF
 # =============================================================================
 
 @test "jj describe -m writes to plan file first" {
-  jj describe -m "Initial"
-  jj describe -m "Updated via describe"
-  [[ "$(cat .jj-plan/01-start.md)" == "Updated via describe" ]]
+  jjdesc -m "Initial"
+  jjdesc -m "Updated via describe"
+  [[ "$(cat "$(plan_file start)")" == "Updated via describe" ]]
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Updated via describe" ]]
 }
 
 @test "jj describe -m on non-current change updates correct plan file" {
-  jj describe -m "Plan 1"
+  jjdesc -m "Plan 1"
   local P1
   P1=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
-  jj plan new step-1; jj describe -m "Plan 2"
-  jj describe -r "$P1" -m "Plan 1 updated"
-  [[ "$(cat .jj-plan/01-*.md)" == "Plan 1 updated" ]]
+  jj plan new step-1; jjdesc -m "Plan 2"
+  jjdesc -r "$P1" -m "Plan 1 updated"
+  [[ "$(cat .jj-plan/*-01-*.md)" == "Plan 1 updated" ]]
 }
 
 # =============================================================================
@@ -1823,7 +1847,7 @@ EOF
 
 @test "stack base bookmark survives rebase" {
   jj plan new --stack dashboard dash-api
-  jj describe -m "Dashboard API"
+  jjdesc -m "Dashboard API"
   # Create a sibling commit from trunk to use as new base
   "$REAL_JJ" new 'trunk()' --no-edit -m "new base"
   local NEW_BASE
@@ -1847,9 +1871,9 @@ EOF
 @test "jj stack untrack removes all plans in current stack" {
   # Create a 2-plan stack
   jj plan new --stack auth auth-refactor
-  jj describe -m "Auth refactor"
+  jjdesc -m "Auth refactor"
   jj plan new auth-tests
-  jj describe -m "Auth tests"
+  jjdesc -m "Auth tests"
   # Verify both are registered
   local registry
   registry=$(cat .jj/repo/jj-plan/plans.toml)
@@ -1867,7 +1891,7 @@ EOF
 
 @test "jj stack untrack deletes stack base bookmark" {
   jj plan new --stack dashboard dash-api
-  jj describe -m "Dashboard API"
+  jjdesc -m "Dashboard API"
   # Verify stack bookmark exists as a local bookmark
   local bm_list
   bm_list=$("$REAL_JJ" bookmark list --no-pager)
@@ -1883,7 +1907,7 @@ EOF
 
 @test "jj stack untrack --dry-run does not modify state" {
   jj plan new --stack auth auth-refactor
-  jj describe -m "Auth refactor"
+  jjdesc -m "Auth refactor"
   run jj stack untrack --dry-run
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"Would untrack"* ]]
@@ -1899,9 +1923,9 @@ EOF
 
 @test "jj stack untrack does not modify commit descriptions" {
   jj plan new --stack feat feat-api
-  jj describe -m "Feature API implementation"
+  jjdesc -m "Feature API implementation"
   jj plan new feat-tests
-  jj describe -m "Feature test suite"
+  jjdesc -m "Feature test suite"
   local FEAT_API FEAT_TESTS
   FEAT_API=$("$REAL_JJ" log -r @- -T "change_id.shortest(8)" --no-graph)
   FEAT_TESTS=$("$REAL_JJ" log -r @ -T "change_id.shortest(8)" --no-graph)
@@ -1919,14 +1943,14 @@ EOF
 @test "jj stack untrack with multiple stacks only untracks current" {
   # Create first explicit stack (auth)
   jj plan new --stack auth auth-refactor
-  jj describe -m "Auth refactor"
+  jjdesc -m "Auth refactor"
   jj plan new auth-tests
-  jj describe -m "Auth tests"
+  jjdesc -m "Auth tests"
   # Navigate back to start (trunk-adjacent) to create a sibling stack
   jj edit -r start
   # Create second explicit stack (dashboard)
   jj plan new --stack dashboard dash-api
-  jj describe -m "Dashboard API"
+  jjdesc -m "Dashboard API"
   # Verify both stacks are registered
   local registry
   registry=$(cat .jj/repo/jj-plan/plans.toml)
@@ -1969,7 +1993,7 @@ EOF
 
   # 4. Create an explicit stack on top of trunk
   jj plan new --stack feat feat-api
-  jj describe -m "Feature API"
+  jjdesc -m "Feature API"
 
   # Verify it is registered with a stack field
   local registry
@@ -1989,7 +2013,7 @@ EOF
   "$REAL_JJ" git import
 
   # 6. Run any mutating command to trigger wrap() → auto_cleanup_merged_stacks()
-  jj describe -m "Feature API"
+  jjdesc -m "Feature API"
 
   # 7. The stack should have been auto-cleaned from the registry
   registry=$(cat .jj/repo/jj-plan/plans.toml)
@@ -2064,7 +2088,7 @@ EOF
 
   # Branch 1: auth stack
   jj plan new --stack auth auth-refactor
-  jj describe -m "Refactor auth"
+  jjdesc -m "Refactor auth"
 
   # Branch 2: create a genuine sibling of auth-refactor off start.
   # Use $REAL_JJ new (not the shim) to avoid --insert-after @ rebasing.
@@ -2113,7 +2137,7 @@ EOF
 }
 
 @test "jj stack single stack has no column gutter" {
-  jj describe -m "My plan"
+  jjdesc -m "My plan"
   run jj stack
   [[ "$status" -eq 0 ]]
   # Single stack should NOT show "stack:" header
@@ -2129,8 +2153,8 @@ EOF
 # =============================================================================
 
 @test "jj status uses compact format by default" {
-  jj describe -m "Refactor auth"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Refactor auth"
+  jj plan new step-1; jjdesc -m "Extract module"
   run jj status
   [[ "$status" -eq 0 ]]
   # Plan description should be on the same line as the bookmark name (compact)
@@ -2143,8 +2167,8 @@ EOF
 }
 
 @test "stack.md uses regular format with description on separate line" {
-  jj describe -m "Refactor auth"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Refactor auth"
+  jj plan new step-1; jjdesc -m "Extract module"
   # Trigger a sync so stack.md is written
   run jj status
   [[ "$status" -eq 0 ]]
@@ -2155,8 +2179,8 @@ EOF
 }
 
 @test "jj stack --format=regular produces multi-line output" {
-  jj describe -m "Refactor auth"
-  jj plan new step-1; jj describe -m "Extract module"
+  jjdesc -m "Refactor auth"
+  jj plan new step-1; jjdesc -m "Extract module"
   run jj stack --format=regular
   [[ "$status" -eq 0 ]]
   # Regular format should have │ description lines
@@ -2165,7 +2189,7 @@ EOF
 }
 
 @test "jj stack --all --format=regular works with flag order independence" {
-  jj describe -m "Refactor auth"
+  jjdesc -m "Refactor auth"
   run jj stack --all --format=regular
   [[ "$status" -eq 0 ]]
   # Should have regular format with │ description lines
@@ -2177,7 +2201,7 @@ EOF
 }
 
 @test "jj stack --format=compact explicitly produces compact output" {
-  jj describe -m "Refactor auth"
+  jjdesc -m "Refactor auth"
   run jj stack --format=compact
   [[ "$status" -eq 0 ]]
   # Compact: description on same line, no │ connector
@@ -2192,7 +2216,7 @@ EOF
 }
 
 @test "JJ_PLAN_STACK_FORMAT=regular env var overrides default" {
-  jj describe -m "Refactor auth"
+  jjdesc -m "Refactor auth"
   JJ_PLAN_STACK_FORMAT=regular run jj stack
   [[ "$status" -eq 0 ]]
   # Env var set to regular should produce │ description lines
