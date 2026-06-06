@@ -649,7 +649,9 @@ Intercepted to append the plan stack summary after the normal `jj status` output
 
 ### Read-only passthrough commands
 
-Commands like `jj log`, `jj show`, `jj diff`, `jj evolog` pass through transparently. Plan files are synced before the command runs (pre-sync).
+Commands like `jj diff` and `jj interdiff` pass through transparently with zero overhead.
+
+`jj log`, `jj show`, and `jj evolog` also pass through, but first run a **drift gate**: a near-zero-cost content-hash check that flushes pending `.jj-plan/*.md` edits to descriptions only when the plan files have actually changed since the last sync. So a plan you just edited shows up immediately in `jj log` — no `jj status` needed first — while a clean repo stays a pure passthrough (no jj-lib opened, no new operation). The gate's cache lives at `.jj/repo/jj-plan/sync-state.toml` and is safe to delete (a missing entry just forces one extra flush).
 
 ### All other mutating commands
 

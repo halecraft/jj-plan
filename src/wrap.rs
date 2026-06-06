@@ -8,6 +8,7 @@ use crate::stack_render::{self, RenderOptions, StackColumn, StackFormat};
 use crate::types::{self, PlanRegistry, StackResult};
 use crate::workspace::Workspace;
 use crate::sync;
+use crate::sync_state;
 
 /// Pre-gathered display data returned by `sync_to_disk` for reuse by
 /// `show_plan_stack`. Avoids a second GATHER traversal of the repository.
@@ -242,6 +243,17 @@ pub fn sync_to_disk(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRe
     };
 
     sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry, stack_md_content.as_deref());
+
+    // Record the post-sync plan-file digest so the read-path drift gate
+    // (`log`/`show`/`evolog`) can decide whether a flush is needed without
+    // opening jj-lib. Best-effort: a write failure only costs an extra flush
+    // later (drift is assumed when the sidecar is missing/stale).
+    let repo_root = workspace.jj_workspace().workspace_root();
+    let contents = sync_state::gather_plan_file_contents(&plan_dir.path, registry);
+    let digest = sync_state::compute_digest(&contents);
+    if let Err(e) = sync_state::save_sync_state(repo_root, &sync_state::SyncState::new(digest)) {
+        debug_log!("  sync_state: failed to save: {e}");
+    }
 
     display_data
 }

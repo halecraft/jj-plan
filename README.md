@@ -79,7 +79,7 @@ jj stack auth gitlab test     # GitLab (via glab CLI or GITLAB_TOKEN)
 jj stack auth gitea test      # Gitea  (via GITEA_TOKEN + GITEA_HOST)
 ```
 
-Every `jj` command you run — `status`, `new`, `edit`, `rebase` — automatically syncs the `.jj-plan/` directory with change descriptions. Plan files are always the source of truth.
+Every `jj` command you run — `status`, `new`, `edit`, `rebase` — automatically syncs the `.jj-plan/` directory with change descriptions. Plan files are always the source of truth. Even read-only inspection commands (`jj log`, `jj show`, `jj evolog`) reflect a freshly edited plan file: they run a near-zero-cost content-hash check and flush pending edits only when the plan files have actually changed — so `jj log` never shows a stale description, while staying a pure passthrough when nothing changed.
 
 ### What you see
 

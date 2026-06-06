@@ -1514,6 +1514,57 @@ Details here.
   [[ "$output" != *"Stack"* ]]
 }
 
+@test "jj plan summary flushes direct plan-file edits before reading (closes write→inspect loop)" {
+  # The jj description still holds a placeholder...
+  "$REAL_JJ" describe -m "(plan: jj:start placeholder)" >/dev/null 2>&1
+  # ...while an editor/LLM has written the real plan straight to disk.
+  printf "feat: real plan title\n\n> [!plan]\n> status: 🔴\n\n# Background\n\nReal content here.\n" > .jj-plan/01-start.md
+
+  # Inspecting via summary must flush disk→description first, with NO
+  # intervening mutating command or `jj status`.
+  run jj plan summary
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"real plan title"* ]]
+  [[ "$output" != *"placeholder"* ]]
+
+  # The flush must have updated the actual jj description (verified via real jj).
+  local desc
+  desc=$("$REAL_JJ" log -r start -T description --no-graph)
+  [[ "$desc" == *"feat: real plan title"* ]]
+  [[ "$desc" == *"Real content here."* ]]
+  [[ "$desc" != *"placeholder"* ]]
+}
+
+@test "bare jj plan flushes direct plan-file edits before showing summary" {
+  # Bare `jj plan` only routes to summary when `@` resolves to a tracked plan,
+  # which requires the registry change_id in production (standard-hex) form.
+  # The shared template fixture stores it in jj's reverse-hex display form, so
+  # rewrite it here with the real normal_hex id.
+  local CID
+  CID=$("$REAL_JJ" log -r start -T 'change_id.normal_hex()' --no-graph)
+  cat > .jj/repo/jj-plan/plans.toml <<EOF
+version = 1
+
+[[bookmarks]]
+name = "start"
+change_id = "$CID"
+planned_at = "2024-01-01T00:00:00Z"
+EOF
+
+  "$REAL_JJ" describe -m "(plan: jj:start placeholder)" >/dev/null 2>&1
+  printf "feat: bare-plan title\n\n> [!plan]\n> status: 🔴\n\n# Background\n\nReal bare content.\n" > .jj-plan/01-start.md
+
+  run jj plan
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"bare-plan title"* ]]
+  [[ "$output" != *"placeholder"* ]]
+
+  local desc
+  desc=$("$REAL_JJ" log -r start -T description --no-graph)
+  [[ "$desc" == *"feat: bare-plan title"* ]]
+  [[ "$desc" == *"Real bare content."* ]]
+}
+
 @test "jj --no-pager log remains a pure passthrough" {
   run jj --no-pager log -r @ -T description --no-graph
   [[ "$status" -eq 0 ]]
@@ -1524,6 +1575,48 @@ Details here.
   run jj --color never log -r @ -T description --no-graph
   [[ "$status" -eq 0 ]]
   [[ "$output" != *"Plan stack ("* ]]
+}
+
+@test "jj log reflects a direct plan-file edit (drift gate flushes before exec)" {
+  jjdesc -m "original"
+  # Editor/LLM edits the plan file directly — no intervening jj command.
+  printf "feat: edited via file\n\n> [!plan]\n> status: 🔴\n\nBody." > "$(plan_file start)"
+  run jj --no-pager log -r start -T description --no-graph
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"feat: edited via file"* ]]
+  # The flush actually updated the jj description (verified via real jj).
+  [[ "$("$REAL_JJ" log -r start -T description --no-graph)" == *"feat: edited via file"* ]]
+}
+
+@test "jj show reflects a direct plan-file edit" {
+  jjdesc -m "original"
+  printf "feat: shown via file\n\nBody." > "$(plan_file start)"
+  run jj --no-pager show -r start
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"feat: shown via file"* ]]
+}
+
+@test "jj log on a clean repo does not flush (no new jj operation)" {
+  jjdesc -m "clean"
+  local before after
+  before=$("$REAL_JJ" op log --no-graph --no-pager -T 'id ++ "\n"' | wc -l | tr -d ' ')
+  run jj --no-pager log -r @ --no-graph
+  [[ "$status" -eq 0 ]]
+  after=$("$REAL_JJ" op log --no-graph --no-pager -T 'id ++ "\n"' | wc -l | tr -d ' ')
+  # No drift → no flush → no new operation.
+  [[ "$before" -eq "$after" ]]
+}
+
+@test "jj log after a plan-file edit creates a flush operation" {
+  jjdesc -m "before"
+  local before after
+  before=$("$REAL_JJ" op log --no-graph --no-pager -T 'id ++ "\n"' | wc -l | tr -d ' ')
+  printf "after-edit body content" > "$(plan_file start)"
+  run jj --no-pager log -r @ --no-graph
+  [[ "$status" -eq 0 ]]
+  after=$("$REAL_JJ" op log --no-graph --no-pager -T 'id ++ "\n"' | wc -l | tr -d ' ')
+  # Drift → exactly the flush's describe operation(s) appear.
+  [[ "$after" -gt "$before" ]]
 }
 
 @test "jj --no-pager describe -m is still blocked on tracked plans" {

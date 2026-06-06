@@ -27,6 +27,7 @@ pub mod stack_context;
 pub mod stack_render;
 pub mod submit;
 pub mod sync;
+pub mod sync_state;
 pub mod types;
 pub mod workspace;
 pub mod wrap;

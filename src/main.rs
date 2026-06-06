@@ -3,9 +3,13 @@ use std::path::PathBuf;
 use jj_plan::commands;
 use jj_plan::dispatch::classify_args;
 use jj_plan::error::JjPlanError;
+use jj_plan::flush;
 use jj_plan::jj_binary::JjBinary;
-use jj_plan::plan_dir::{find_repo_root_from, resolve_plan_dir, resolved_stack_format};
+use jj_plan::plan_dir::{find_repo_root_from, resolve_plan_dir, resolved_stack_format, PlanDir};
+use jj_plan::plan_file;
 use jj_plan::plan_registry::load_registry;
+use jj_plan::sync_state;
+use jj_plan::types::PlanRegistry;
 use jj_plan::workspace;
 use jj_plan::wrap;
 
@@ -42,12 +46,123 @@ const READONLY_COMMANDS: &[&str] = &[
 /// showing status, then resync afterward.
 const COHERENCE_COMMANDS: &[&str] = &["status"];
 
+/// Read-only commands that can render a change *description* and therefore must
+/// reflect pending `.jj-plan/` edits. They get the drift gate (flush-only-on-
+/// drift) instead of the pure-exec fast path. `diff`/`interdiff` surface trees,
+/// not descriptions, so they stay pure passthrough.
+const DRIFT_GATED_READONLY: &[&str] = &["log", "show", "evolog"];
+
 fn is_readonly_command(cmd: &str) -> bool {
     READONLY_COMMANDS.contains(&cmd)
 }
 
 fn is_coherence_command(cmd: &str) -> bool {
     COHERENCE_COMMANDS.contains(&cmd)
+}
+
+fn is_drift_gated_readonly(cmd: &str) -> bool {
+    DRIFT_GATED_READONLY.contains(&cmd)
+}
+
+/// Outcome of the read-path drift decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadGate {
+    /// No coherence work needed — `exec` the real jj directly (no jj-lib open).
+    ExecDirect,
+    /// Plan files drifted — flush them to descriptions, then `exec`.
+    FlushThenExec,
+}
+
+/// Pure decision for the read-path drift gate.
+///
+/// Flush only when jj-plan is activated, not in the error state, and the plan
+/// files have drifted since the last sync. Every other case is a direct exec.
+fn decide_read_gate(activated: bool, error_state: bool, drifted: bool) -> ReadGate {
+    if activated && !error_state && drifted {
+        ReadGate::FlushThenExec
+    } else {
+        ReadGate::ExecDirect
+    }
+}
+
+/// Everything the drift gate needs once jj-plan is confirmed activated.
+struct DriftGateContext {
+    repo_root: PathBuf,
+    plan_dir: PlanDir,
+    registry: PlanRegistry,
+    error_state: bool,
+    drifted: bool,
+    /// Digest of the current plan-file set (empty/unused in the error state).
+    digest: String,
+}
+
+/// GATHER: resolve repo + plan dir and compute the cheap drift signal.
+///
+/// Returns `None` when jj-plan is not activated for the target repo (caller
+/// then execs unchanged). Opens **no** jj-lib — only stats and small file reads.
+fn gather_drift_gate_context(repository_override: Option<&str>) -> Option<DriftGateContext> {
+    let repo_start = resolve_repo_start_path(repository_override)?;
+    let repo_root = find_repo_root_from(&repo_start)?;
+    let plan_dir = resolve_plan_dir(Some(&repo_root))?;
+
+    let error_state = plan_file::is_error_state(&plan_dir.path);
+    let registry = load_registry(&repo_root);
+
+    // In the error state we never flush (matches flush_all), so skip the
+    // file reads entirely — `drifted` is irrelevant.
+    let (digest, drifted) = if error_state {
+        (String::new(), false)
+    } else {
+        let contents = sync_state::gather_plan_file_contents(&plan_dir.path, &registry);
+        let digest = sync_state::compute_digest(&contents);
+        let stored = sync_state::load_sync_state(&repo_root);
+        let drifted = sync_state::is_drifted(&digest, stored.as_ref());
+        (digest, drifted)
+    };
+
+    Some(DriftGateContext {
+        repo_root,
+        plan_dir,
+        registry,
+        error_state,
+        drifted,
+        digest,
+    })
+}
+
+/// Handle a description-surfacing read-only command (`log`/`show`/`evolog`).
+///
+/// Fast path (the common case): a few stats + small file reads decide there's no
+/// drift, and we `exec` the real jj with zero jj-lib overhead. Only on actual
+/// drift do we open jj-lib, flush plan files to descriptions, refresh the
+/// sidecar, and then `exec`. The command's own stdout/stderr/exit are always the
+/// real jj's — the flush is silent and `exec` replaces this process.
+fn run_drift_gated_readonly(
+    jj: &JjBinary,
+    full_args: &[String],
+    repository_override: Option<&str>,
+) -> jj_plan::error::Result<i32> {
+    let ctx = gather_drift_gate_context(repository_override);
+
+    let gate = match &ctx {
+        Some(c) => decide_read_gate(true, c.error_state, c.drifted),
+        None => decide_read_gate(false, false, false),
+    };
+
+    if let (ReadGate::FlushThenExec, Some(c)) = (gate, &ctx) {
+        // Degrade to a plain exec if jj-lib can't open (e.g. version mismatch).
+        if let Some(workspace) = workspace::Workspace::open(&c.repo_root) {
+            flush::flush_all(&c.plan_dir.path, jj, &workspace, &c.registry);
+            // Files are unchanged by flush, so the digest we computed still holds.
+            let _ = sync_state::save_sync_state(
+                &c.repo_root,
+                &sync_state::SyncState::new(c.digest.clone()),
+            );
+        }
+    }
+
+    jj.exec_strings(full_args)?;
+    unreachable!("exec replaces the process");
 }
 
 /// Workspace subcommands that are read-only and safe for exec passthrough.
@@ -135,7 +250,14 @@ fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
     let full_args = args;
     let cmd_args = &args[invocation.command_index..];
 
-    // Read-only commands go straight to the real jj binary. Coherence
+    // Description-surfacing read-only commands (log/show/evolog) take the drift
+    // gate: a cheap content-hash check that flushes pending plan-file edits (and
+    // opens jj-lib) only when they actually changed — otherwise pure exec.
+    if is_drift_gated_readonly(subcommand) {
+        return run_drift_gated_readonly(jj, full_args, invocation.repository_override.as_deref());
+    }
+
+    // Other read-only commands go straight to the real jj binary. Coherence
     // commands are intentionally excluded from this fast path.
     if !is_coherence_command(subcommand) && is_readonly_command(subcommand) {
         jj.exec_strings(full_args)?;
@@ -326,5 +448,30 @@ mod tests {
     fn bookmark_is_in_readonly_commands() {
         assert!(is_readonly_command("bookmark"));
         assert!(!is_readonly_command("status"));
+    }
+
+    #[test]
+    fn drift_gated_set_is_description_surfacing_only() {
+        assert!(is_drift_gated_readonly("log"));
+        assert!(is_drift_gated_readonly("show"));
+        assert!(is_drift_gated_readonly("evolog"));
+        // diff/interdiff surface trees, not descriptions — stay pure exec.
+        assert!(!is_drift_gated_readonly("diff"));
+        assert!(!is_drift_gated_readonly("interdiff"));
+        // every drift-gated command is also a read-only command.
+        for cmd in DRIFT_GATED_READONLY {
+            assert!(is_readonly_command(cmd));
+        }
+    }
+
+    #[test]
+    fn decide_read_gate_truth_table() {
+        use ReadGate::*;
+        // Only flush when activated AND not error-state AND drifted.
+        assert_eq!(decide_read_gate(true, false, true), FlushThenExec);
+        assert_eq!(decide_read_gate(true, false, false), ExecDirect);
+        assert_eq!(decide_read_gate(true, true, true), ExecDirect); // error state never flushes
+        assert_eq!(decide_read_gate(false, false, true), ExecDirect); // not activated
+        assert_eq!(decide_read_gate(false, true, false), ExecDirect);
     }
 }

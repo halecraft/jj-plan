@@ -521,9 +521,9 @@ fn indent_lines(s: &str, prefix: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn run_summary(
     jj: &JjBinary,
-    _plan_dir: &crate::plan_dir::PlanDir,
+    plan_dir: &crate::plan_dir::PlanDir,
     args: &[String],
-    workspace: &Workspace,
+    workspace: &mut Workspace,
     registry: &PlanRegistry,
     _format: StackFormat,
 ) -> Result<i32> {
@@ -554,6 +554,28 @@ pub fn run_summary(
     // ------------------------------------------------------------------
     // GATHER — collect all data from effectful sources
     // ------------------------------------------------------------------
+
+    // Coherence seam: flush direct `.jj-plan/` edits to jj descriptions before
+    // reading, then reload so the reads below see post-flush state. Without this,
+    // writing a plan file and immediately running `jj plan summary` / `jj plan`
+    // shows the stale placeholder description. Uses the same content-hash drift
+    // gate as the read-only commands, so the flush + reload is skipped when
+    // nothing changed since the last sync (summary already holds an open
+    // workspace, so the only cost saved is the redundant flush round-trip).
+    if !crate::plan_file::is_error_state(&plan_dir.path) {
+        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+        let contents = crate::sync_state::gather_plan_file_contents(&plan_dir.path, registry);
+        let digest = crate::sync_state::compute_digest(&contents);
+        let stored = crate::sync_state::load_sync_state(&repo_root);
+        if crate::sync_state::is_drifted(&digest, stored.as_ref()) {
+            crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+            workspace.reload();
+            let _ = crate::sync_state::save_sync_state(
+                &repo_root,
+                &crate::sync_state::SyncState::new(digest),
+            );
+        }
+    }
 
     // Resolve description
     let description = match workspace.read_description_at(&target) {
