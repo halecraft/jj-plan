@@ -58,15 +58,19 @@ pub fn handle_describe(
     // ── EXECUTE ─────────────────────────────────────────────────────────
     match action {
         DescribeAction::EditorPassthrough => {
-            crate::wrap::wrap(plan_dir, jj, full_args, workspace, registry, format)
+            // Strip `--override-plan-protocol` (a jj-plan-only flag) so it never
+            // reaches the real `jj`, which would reject it. A no-op when absent.
+            let stripped = strip_override_flag(full_args);
+            crate::wrap::wrap(plan_dir, jj, &stripped, workspace, registry, format)
         }
 
         DescribeAction::Allow => {
-            // Non-plan target with -m. If there's a plan file for the target,
-            // write the message to it (this path is for non-plan changes that
-            // still happen to have a plan file, which shouldn't happen — but
-            // Allow means plan_file_path was None, so this is just wrap).
-            crate::wrap::wrap(plan_dir, jj, full_args, workspace, registry, format)
+            // Non-plan target (no plan file): a normal describe. Strip the
+            // jj-plan-only `--override-plan-protocol` flag if the user passed it
+            // here — there is no plan to protect, and leaving it in would leak
+            // the unknown flag to the real `jj`. A no-op when absent.
+            let stripped = strip_override_flag(full_args);
+            crate::wrap::wrap(plan_dir, jj, &stripped, workspace, registry, format)
         }
 
         DescribeAction::AllowOverride { plan_file_path: pf_path } => {

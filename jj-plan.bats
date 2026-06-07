@@ -1795,6 +1795,16 @@ EOF
   [[ "$(cat .jj-plan/*-01-*.md)" == "Plan 1 updated" ]]
 }
 
+@test "jj describe --override-plan-protocol on a non-plan change does not leak the flag" {
+  # An untracked change has no plan file → the describe guard takes the Allow
+  # path, which must strip the jj-plan-only flag so it never reaches real jj.
+  jj new >/dev/null 2>&1
+  run jj describe --override-plan-protocol -m "untracked override"
+  [[ "$status" -eq 0 ]]
+  [[ "$output" != *"unexpected argument"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "untracked override" ]]
+}
+
 # =============================================================================
 # jj plan new --stack (Phase 3: explicit stack boundaries)
 # =============================================================================
