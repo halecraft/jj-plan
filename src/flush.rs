@@ -15,9 +15,13 @@ use crate::workspace::Workspace;
 /// on `InSync`/`DescToFile`/`Conflict`. The `DescToFile`/`Conflict` no-push is the
 /// mirror-bug guard — a stale file can never overwrite a changed description.
 ///
-/// flush is deliberately **desc-only**: it never writes plan files and never persists the
-/// baseline (it cannot observe `file == desc` until the post-command reload — that is
-/// sync's / the read-gate's job, via `anchor`).
+/// `flush_all` is deliberately **desc-only**: it never writes plan files and never persists
+/// the baseline (it cannot observe `file == desc` until the post-command reload — that is
+/// sync's / the gate's job, via `anchor`). Callers that flush *and then do more work against
+/// the result* — `run_done`, `wrap`, the read gate — must use [`flush_and_anchor`], which
+/// composes `flush_all` + reload + `observe` + `anchor` + save so the baseline tracks the
+/// converged state; otherwise a following description rewrite is mis-attributed by
+/// `reconcile` against a stale baseline.
 ///
 /// Internally GATHER → PLAN → EXECUTE (FC/IS):
 /// - Gather: read plan files, resolve bookmark→change_id, batch-read descriptions, load
@@ -189,6 +193,42 @@ fn execute_flush(jj: &JjBinary, actions: &[FlushAction]) {
     for action in actions {
         let _ = jj.run_silent(&["describe", "-r", &action.change_id, "-m", &action.content]);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared pre-command sequence: flush, then anchor the baseline
+// ---------------------------------------------------------------------------
+
+/// Flush plan-file edits to descriptions, then anchor the baseline to the
+/// post-flush state — the full sequence every pre-command/read-gate site needs.
+///
+/// A bare [`flush_all`] converges file→desc but leaves the baseline stale
+/// (flush is deliberately desc-only). So a command that *rewrites the
+/// description right after the flush* — `jj plan done`'s stamp, an editor
+/// `jj describe` — would be mis-attributed by [`crate::sync_state::reconcile`]
+/// against that stale baseline and reverted (or spuriously conflicted).
+/// Anchoring here records the converged content, so the subsequent rewrite
+/// lands cleanly as `DescToFile` and sync writes the file.
+///
+/// `anchor` advances only bookmarks observed equal (`file == desc`), so a failed
+/// flush never poisons the baseline. `prev_baselines` is the map loaded before
+/// the flush; the advanced map is persisted to the sync-state sidecar.
+pub fn flush_and_anchor(
+    plan_dir: &Path,
+    jj: &JjBinary,
+    workspace: &mut Workspace,
+    registry: &PlanRegistry,
+    prev_baselines: &BTreeMap<String, String>,
+) {
+    flush_all(plan_dir, jj, workspace, registry);
+    // Re-read post-flush descriptions and advance baselines only for bookmarks
+    // now confirmed equal — a failed flush leaves file != desc and is NOT
+    // recorded (no poisoning).
+    workspace.reload();
+    let observed = observe(plan_dir, workspace, registry);
+    let next = sync_state::anchor(prev_baselines, &observed);
+    let repo_root = workspace.jj_workspace().workspace_root();
+    let _ = sync_state::save_sync_state(repo_root, &sync_state::SyncState::new(next));
 }
 
 // ---------------------------------------------------------------------------

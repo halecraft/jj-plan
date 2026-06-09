@@ -2394,3 +2394,53 @@ EOF
   run grep -rl "MUST NOT be lost" .jj-plan
   [[ "$status" -eq 0 ]]
 }
+
+# --- done-sticky: the pre-command flush anchors the baseline (jj:uopvtloz) ---
+
+@test "done: status sticks after a formatter reflow + status flip" {
+  jj status >/dev/null 2>&1                    # materialize a-01-start.md + seed baseline
+  # A done plan in canonical two-line form.
+  printf 'feat: real plan\n\n# Background\nwork\n\n> [!plan]\n> status: 🔴\n' > "$(plan_file start)"
+  jj plan done >/dev/null 2>&1
+  # Simulate a markdown formatter: compress the callout to the inline form AND
+  # flip the status back to 🔴 — an un-converged file edit, no read in between.
+  printf 'feat: real plan\n\n# Background\nwork\n\n> [!plan] status: 🔴\n' > "$(plan_file start)"
+  # Mark done again — it must stick, not be reverted by a stale baseline.
+  run jj plan done
+  [[ "$output" != *"unflushed edits"* ]]                              # no unflushed warning
+  [[ "$(cat "$(plan_file start)")" == *"status: ✅"* ]]               # ✅ on the file
+  [[ "$("$REAL_JJ" log -r start -T description --no-graph)" == *"status: ✅"* ]]  # ✅ on the desc
+  # And it SURVIVES a subsequent read-only command (the revert guard).
+  jj log >/dev/null 2>&1
+  [[ "$(cat "$(plan_file start)")" == *"status: ✅"* ]]
+  [[ "$(cat "$(plan_file start)")" != *"status: 🔴"* ]]
+  [[ "$("$REAL_JJ" log -r start -T description --no-graph)" == *"status: ✅"* ]]
+}
+
+@test "wrap: editor describe after a file edit lands (no stale-baseline conflict)" {
+  jj status >/dev/null 2>&1
+  jj describe -r start --override-plan-protocol -m "v1" >/dev/null 2>&1  # file == desc == baseline
+  # A fake editor that rewrites the description jj hands it.
+  printf '#!/usr/bin/env bash\nprintf "rewritten in editor\\n" > "$1"\n' > "$TEST_REPO/fakeed.sh"
+  chmod +x "$TEST_REPO/fakeed.sh"
+  # Edit the plan file out of band (drift, no read to anchor), then editor-describe.
+  printf 'edited in file\n' > "$(plan_file start)"
+  EDITOR="$TEST_REPO/fakeed.sh" VISUAL="$TEST_REPO/fakeed.sh" jj describe -r start >/dev/null 2>&1
+  # The editor's content lands in BOTH desc and file; no spurious .incoming conflict.
+  [[ "$("$REAL_JJ" log -r start -T description --no-graph)" == *"rewritten in editor"* ]]
+  [[ "$(cat "$(plan_file start)")" == *"rewritten in editor"* ]]
+  [[ ! -f "$(plan_file start)".incoming ]]
+}
+
+@test "reflow: compressing the callout to inline is not drift (no churn)" {
+  jj status >/dev/null 2>&1                    # materialize the plan file
+  printf 'feat: real plan\n\n# Background\nwork\n\n> [!plan]\n> status: ✅\n' > "$(plan_file start)"
+  jj log >/dev/null 2>&1                        # flush + anchor the canonical two-line form
+  # A markdown formatter compresses the callout to the inline form (same meaning).
+  printf 'feat: real plan\n\n# Background\nwork\n\n> [!plan] status: ✅\n' > "$(plan_file start)"
+  jj log >/dev/null 2>&1                        # canonical hash == baseline → InSync, no flush
+  local desc; desc="$("$REAL_JJ" log -r start -T description --no-graph)"
+  [[ "$desc" == *"status: ✅"* ]]
+  [[ "$desc" != *'> [!plan] status:'* ]]        # desc was NOT rewritten to the inline form (no churn)
+  grep -q '> \[!plan\] status: ✅' "$(plan_file start)"   # file's inline form left untouched
+}

@@ -216,6 +216,26 @@ pub fn set_metadata_field(input: &str, key: &str, value: &str) -> String {
     render_description(title, &body, &metadata)
 }
 
+/// The canonical byte-form of a plan description: parse, then re-render through
+/// the inverse pair [`parse_metadata`] → [`render_description`].
+///
+/// Two descriptions that differ only in callout **form** — the inline
+/// `> [!plan] status: X` vs the two-line bare opener, or metadata key order —
+/// or in surrounding blank lines collapse to the same output, so the sync drift
+/// gate can treat a markdown formatter's callout reflow as a no-op rather than a
+/// real edit. Genuine title/body/metadata-**value** changes still differ.
+///
+/// Idempotent (`canonical_form(canonical_form(x)) == canonical_form(x)`) and
+/// identity-safe on edge content: empty input stays empty.
+pub fn canonical_form(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let title = input.lines().next().unwrap_or("");
+    let (metadata, body) = parse_metadata(input);
+    render_description(title, &body, &metadata)
+}
+
 // ---------------------------------------------------------------------------
 // PlanDocument — unified parse-and-transform facade
 // ---------------------------------------------------------------------------
@@ -778,6 +798,33 @@ mod tests {
         assert_eq!(result.matches("> [!plan]").count(), 1, "one callout:\n{}", result);
         assert_eq!(result.matches("status:").count(), 1, "one status:\n{}", result);
         assert!(!result.contains('🔴'));
+    }
+
+    // ── canonical_form (drift-gate equivalence) ──────────────────────
+
+    #[test]
+    fn canonical_form_collapses_callout_form_and_key_order() {
+        let two_line = "feat: x\n\n# Body\n\n> [!plan]\n> status: 🔴\n> issue: M-1\n";
+        let inline = "feat: x\n\n# Body\n\n> [!plan] status: 🔴\n> issue: M-1\n";
+        assert_eq!(canonical_form(two_line), canonical_form(inline),
+            "inline and two-line callout forms must canonicalize equal");
+    }
+
+    #[test]
+    fn canonical_form_is_idempotent_and_empty_safe() {
+        assert_eq!(canonical_form(""), "", "empty stays empty");
+        for i in ["feat: x", "feat: x\n\n# B\n\n> [!plan] status: ✅\n"] {
+            let c = canonical_form(i);
+            assert_eq!(canonical_form(&c), c, "canonical_form must be a fixpoint for {:?}", i);
+        }
+    }
+
+    #[test]
+    fn canonical_form_preserves_status_value() {
+        // A real status-value change must NOT be canonicalized away.
+        let red = "feat: x\n\n> [!plan]\n> status: 🔴\n";
+        let done = "feat: x\n\n> [!plan]\n> status: ✅\n";
+        assert_ne!(canonical_form(red), canonical_form(done));
     }
 
     // ── Existing scratch stripping tests (must pass with new impl) ───

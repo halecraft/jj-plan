@@ -47,14 +47,20 @@ const JJ_PLAN_DIR: &str = "jj-plan";
 // Pure: normalization + content hashing
 // ---------------------------------------------------------------------------
 
-/// Normalize content for comparison/hashing by stripping trailing newlines.
+/// Normalize content to its **canonical form** for comparison/hashing.
 ///
-/// The read path (`read_description_at`/`gather_descriptions`) strips the trailing `\n`,
-/// while editors routinely add one. Without this, a newline-only difference would read as
-/// a divergence and produce a false `Conflict`. Comparing content modulo trailing newlines
-/// makes such a difference `InSync`.
-fn normalize(s: &str) -> &str {
-    s.trim_end_matches('\n')
+/// Delegates to [`crate::markdown::canonical_form`] (parse → re-render), which
+/// collapses cosmetic differences a comparison should ignore: a trailing
+/// newline (editors add one; the read path strips it), the callout's inline vs
+/// two-line **form** (a markdown formatter toggles these), metadata key order,
+/// and surrounding blank lines. Genuine title/body/metadata-**value** edits
+/// still differ, so a real change is never masked.
+///
+/// This only affects reconcile **decisions** and baseline **hashes** — the raw
+/// file/description bytes are what actually get written, so canonicalizing here
+/// never mangles content; it just stops a cosmetic reflow from reading as drift.
+fn normalize(s: &str) -> String {
+    crate::markdown::canonical_form(s)
 }
 
 /// sha256-hex of a content string (normalized first). Pure.
@@ -131,8 +137,8 @@ pub fn reconcile(file: Option<&str>, desc: &str, base_hash: Option<&str>) -> Rec
     // Both non-empty and differing.
     match base_hash {
         Some(base_hash) => {
-            let file_changed = hash_content(file) != base_hash;
-            let desc_changed = hash_content(desc) != base_hash;
+            let file_changed = hash_content(&file) != base_hash;
+            let desc_changed = hash_content(&desc) != base_hash;
             match (file_changed, desc_changed) {
                 (true, false) => Reconcile::FileToDesc, // only file changed
                 (false, true) => Reconcile::DescToFile, // only description changed
@@ -325,6 +331,25 @@ mod tests {
     fn reconcile_only_file_changed_pushes() {
         let base = hash_content("old");
         assert_eq!(reconcile(Some("new"), "old", Some(&base)), Reconcile::FileToDesc);
+    }
+
+    #[test]
+    fn reconcile_callout_form_difference_is_insync() {
+        // A markdown formatter compressing the two-line callout to the inline
+        // form must NOT read as drift — canonical comparison collapses them.
+        let two_line = "feat: x\n\n> [!plan]\n> status: ✅\n";
+        let inline = "feat: x\n\n> [!plan] status: ✅\n";
+        let base = hash_content(two_line);
+        assert_eq!(reconcile(Some(inline), two_line, Some(&base)), Reconcile::InSync);
+    }
+
+    #[test]
+    fn reconcile_status_value_change_still_flushes() {
+        // Safety: a genuine status-value change is still detected and flushed.
+        let base_content = "feat: x\n\n> [!plan]\n> status: 🔴\n";
+        let base = hash_content(base_content);
+        let file = "feat: x\n\n> [!plan] status: ✅\n"; // flipped to ✅ in the file
+        assert_eq!(reconcile(Some(file), base_content, Some(&base)), Reconcile::FileToDesc);
     }
 
     #[test]

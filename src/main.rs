@@ -154,14 +154,7 @@ fn run_drift_gated_readonly(
     if let (ReadGate::FlushThenExec, Some(c)) = (gate, &ctx) {
         // Degrade to a plain exec if jj-lib can't open (e.g. version mismatch).
         if let Some(mut workspace) = workspace::Workspace::open(&c.repo_root) {
-            flush::flush_all(&c.plan_dir.path, jj, &workspace, &c.registry);
-            // Re-read post-flush descriptions and advance baselines only for bookmarks now
-            // confirmed equal — a failed flush leaves file != desc and is NOT recorded
-            // (no poisoning). This replaces the old "save the file digest unconditionally".
-            workspace.reload();
-            let observed = flush::observe(&c.plan_dir.path, &workspace, &c.registry);
-            let next = sync_state::anchor(&c.prev_baselines, &observed);
-            let _ = sync_state::save_sync_state(&c.repo_root, &sync_state::SyncState::new(next));
+            flush::flush_and_anchor(&c.plan_dir.path, jj, &mut workspace, &c.registry, &c.prev_baselines);
         }
     }
 

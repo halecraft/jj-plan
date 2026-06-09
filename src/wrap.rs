@@ -36,8 +36,20 @@ pub fn wrap(
     registry: &PlanRegistry,
     format: StackFormat,
 ) -> crate::error::Result<i32> {
-    // 1. Flush all local plan file edits to jj descriptions
-    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+    // 1. Flush local plan-file edits to descriptions and anchor the baseline to
+    //    the converged state — gated on drift so the undrifted common case pays
+    //    no extra work. Anchoring (vs a bare flush) keeps a wrapped command that
+    //    rewrites the description (e.g. editor `jj describe`) from being
+    //    mis-attributed against a stale baseline.
+    {
+        let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+        let stored = sync_state::load_sync_state(&repo_root);
+        let current = sync_state::current_file_hashes(&plan_dir.path, registry);
+        if sync_state::is_drifted(&current, stored.as_ref()) {
+            let prev_baselines = stored.map(|s| s.baselines).unwrap_or_default();
+            crate::flush::flush_and_anchor(&plan_dir.path, jj, workspace, registry, &prev_baselines);
+        }
+    }
 
     // 2. Run the actual jj command with inherited stdio
     let status = jj.run_inherit_strings(args)?;

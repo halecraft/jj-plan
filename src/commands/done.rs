@@ -89,14 +89,21 @@ pub fn run_done(jj: &JjBinary, plan_dir: &PlanDir, args: &[String], workspace: &
     }
 
     // ------------------------------------------------------------------
-    // 2. Flush local plan edits to jj descriptions
+    // 2. Flush local plan edits to jj descriptions, then anchor the baseline
+    //    to the converged state. Without the anchor, the `done` stamp below
+    //    would be judged against a stale baseline and reverted (the file would
+    //    appear "changed" and win); anchored, it lands as a desc-side change
+    //    (DescToFile) and sync writes it to the file.
     // ------------------------------------------------------------------
-    crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
+    let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
+    let prev_baselines = crate::sync_state::load_sync_state(&repo_root)
+        .map(|s| s.baselines)
+        .unwrap_or_default();
+    crate::flush::flush_and_anchor(&plan_dir.path, jj, workspace, registry, &prev_baselines);
 
     // ------------------------------------------------------------------
-    // 3. Resolve stack (jj-lib — reload after flush in case flush mutated)
+    // 3. Resolve stack (flush_and_anchor already reloaded the workspace)
     // ------------------------------------------------------------------
-    workspace.reload();
     let changes = build_sync_views_for_done(workspace, registry);
 
     // ------------------------------------------------------------------

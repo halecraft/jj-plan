@@ -347,7 +347,7 @@ cmd_args[1] match:
 
 The wrap lifecycle is the core mechanism that keeps plan files and jj descriptions in sync. The `wrap()` function in `src/wrap.rs` orchestrates 6 phases for every mutating command:
 
-1. **Flush** — plan file → jj description (`flush_all`)
+1. **Flush + anchor** — plan file → jj description, then advance the baseline to the converged state (`flush_and_anchor`, gated on `is_drifted`)
 2. **Run** — execute the real jj command
 3. **Reload** — `workspace.reload()`
 4. **Full sync & show** — stale-bookmark cleanup + legacy migration + sync + display (`full_sync_and_show`)
@@ -371,8 +371,11 @@ stored in `.jj/repo/jj-plan/sync-state.toml` (v2; mirrors `pr_cache`). `reconcil
 | `DescToFile` | only the desc changed, or file absent | nothing | write file |
 | `Conflict` | both diverged from a known base | nothing | preserve file + `.incoming` |
 
-Two principles govern the edges (decided as ordered rules; trailing newline normalized
-first so an editor-added `\n` is never a false conflict):
+Two principles govern the edges (decided as ordered rules; each side is reduced to its
+**canonical form** first — `markdown::canonical_form`, a `parse_metadata`→`render_description`
+round-trip — so an editor-added `\n`, a callout reflowed between the two-line and inline
+`> [!plan]` forms, metadata key order, or surrounding blank lines are never a false
+conflict, while genuine title/body/metadata-value edits still differ):
 
 - **An empty side never overwrites a non-empty side.** An empty description can't zero a
   file; an empty file can't clear a description. (To clear a plan, untrack/abandon — don't
@@ -388,11 +391,16 @@ first so an editor-added `\n` is never a false conflict):
 when its two sides are observed equal* — never trusting a "flush succeeded" return. This is
 the single guard against **baseline poisoning**: a failed flush leaves `file != desc`, so
 the baseline is not advanced, and the next sync still sees the file as unflushed and
-preserves it. `anchor` is applied at exactly three persistence sites — `wrap::sync_to_disk`
-and the two read paths that flush without a following sync (`run_drift_gated_readonly` in
-`main.rs` and `run_summary`); those gates re-read descriptions post-flush via
-`flush::observe`. flush itself never persists the baseline. `flush_all` loads the baseline
-internally, so its 13 callers are unchanged.
+preserves it. `anchor` runs after `wrap::sync_to_disk`'s sync **and** after every
+*pre-command* flush via `flush::flush_and_anchor` (`flush_all` → reload → `observe` →
+`anchor` → save). That shared helper is the fix for a class of bug where a command rewrites
+the description right after the flush — `jj plan done`'s `✅` stamp, an editor `jj describe`
+— and the rewrite, judged against a *stale* (un-anchored) baseline, was mis-attributed to
+the file and reverted (or spuriously conflicted). Anchoring first makes the rewrite land as
+`DescToFile`, so sync writes it to the file. The helper is used by the read gate
+(`run_drift_gated_readonly`), `run_summary`, `run_done`, and `wrap` (drift-gated). Bare
+`flush_all` itself never persists the baseline; it loads the baseline internally, so its
+callers are unchanged. Context: `jj:uopvtloz`.
 
 **Recovery artifacts** (all gitignored under `.jj-plan/`, all invisible to
 `collect_plan_files`): `.history/<sha8>-<bookmark>.md` snapshots prior content before any
@@ -600,7 +608,7 @@ mirrors `pr_cache.rs`).
 2. Error state (`error.md` present) → `exec` (never flush in the error state, matching `flush_all`).
 3. `current_file_hashes`; `load_sync_state`; `is_drifted`.
 4. **Not drifted** (the common case) → `exec` immediately. **No jj-lib opened, no jj operation created.**
-5. **Drifted** (or missing sidecar) → `Workspace::open` (degrade to plain `exec` on failure), `flush_all`, `reload`, then re-read descriptions via `flush::observe` and `anchor` the sidecar (advancing only bookmarks now confirmed `file == desc` — a failed flush is not recorded, so it cannot poison the baseline), then `exec`.
+5. **Drifted** (or missing sidecar) → `Workspace::open` (degrade to plain `exec` on failure), then `flush::flush_and_anchor` (`flush_all` → `reload` → re-read descriptions via `flush::observe` → `anchor` the sidecar, advancing only bookmarks now confirmed `file == desc` — a failed flush is not recorded, so it cannot poison the baseline), then `exec`. The same `flush_and_anchor` runs before `run_done`'s stamp and `wrap`'s command, so a description rewrite that follows a flush lands as `DescToFile` instead of being reverted against a stale baseline.
 
 The gate never alters the command's stdout/stderr/exit: the flush is silent (`run_silent`), and `exec` replaces the process so the output is exactly real `jj`'s. No `reload` is needed — `exec` is a fresh process that reads the post-flush state from disk. `DRIFT_GATED_READONLY = ["log", "show", "evolog"]`; `diff`/`interdiff` stay on the pure-exec fast path because they surface trees, not descriptions.
 
