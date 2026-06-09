@@ -154,7 +154,7 @@ fn run_done_stack(
             && let Some(report) = format_strip_report(
                 &sections,
                 show_stripped,
-                doc.raw(),
+                doc.body(),
                 &change.change_id,
             )
         {
@@ -248,7 +248,7 @@ fn run_done_single(
         && let Some(report) = format_strip_report(
             &sections,
             show_stripped,
-            doc.raw(),
+            doc.body(),
             &change_id_for_describe,
         )
     {
@@ -399,7 +399,7 @@ fn print_dry_run_diff(
     eprintln!("--- change ---");
 
     if !keep_scratch
-        && let Some(report) = format_strip_report(&sections, show_stripped, doc.raw(), change_id)
+        && let Some(report) = format_strip_report(&sections, show_stripped, doc.body(), change_id)
     {
         eprint!("{}", report);
         eprintln!();
@@ -442,7 +442,8 @@ mod tests {
     fn first_scratch_section(input: &str) -> (Vec<StrippedSection>, String) {
         let doc = PlanDocument::parse(input);
         let (_stripped, report) = doc.as_done_with_report(false);
-        (report, doc.raw().to_string())
+        // Report ranges index into the body (scratch lives there), not raw.
+        (report, doc.body().to_string())
     }
 
     #[test]

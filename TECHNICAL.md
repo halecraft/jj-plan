@@ -990,29 +990,32 @@ A single-threaded tokio runtime is created per `jj stack` command invocation. Th
 
 ### Callout metadata format
 
-Plan descriptions use an Obsidian-style callout block for metadata, keeping the commit summary on line 1 (as jj/git expect):
+Plan descriptions use an Obsidian-style callout block for metadata, keeping the commit summary on line 1 (as jj/git expect). The **body leads and the callout trails** — the description is the important part, so the tool-managed status block sits at the bottom:
 
 ```
 feat: my feature          ← line 1: always the title (shown in jj log, git log, PR titles)
 
-> [!plan]                 ← callout opener (case-insensitive on "plan")
+# Background              ← body content
+
+> [!plan]                 ← callout opener (canonically bare)
 > status: 🔴              ← metadata key: value lines (optional)
 > issue: MERC-123
-
-# Background              ← body content
 ```
 
-Parsing rules:
+**Parse and render are an inverse pair.** `parse_metadata` reads a description into `(metadata, body)`; `render_description` (private) is its canonical inverse — it emits `title`, then `body` (surrounding blanks trimmed), then a single bare-opener `> [!plan]` block at the end with metadata in `BTreeMap` (key-sorted) order. Every writer (`set_metadata_field`, `PlanDocument::as_done`) is `parse → transform → render`, so the format is serialized in exactly one place.
+
+Reading rules:
 - Line 1 is always the title — never metadata.
-- Scan all lines (after title) for `> [!plan]` (the callout opener, case-insensitive).
-- Read subsequent `> key: value` lines where key matches `^[a-z][a-z0-9_-]*: ` after stripping the `> ` prefix. The block ends at the first line that doesn't start with `> ` or doesn't match the key pattern.
+- Scan all lines (after title) for `> [!plan]` (the callout opener, case-insensitive). Parsing is **position-independent**: a callout written under the old top-placement still parses, and is normalized to the bottom on the next tool write.
+- Read any inline `key: value` on the opener line itself (`> [!plan] status: 🔴`), then the subsequent `> key: value` lines where key matches `^[a-z][a-z0-9_-]*: ` after stripping the `> ` prefix. The block ends at the first line that doesn't start with `> ` or doesn't match the key pattern.
 - Blank lines before, after, or around the callout block do not affect parsing (blank-line tolerant).
 - Body is everything outside the title line and the callout block lines. A `---` in the body is just a CommonMark thematic break — no special handling needed.
-- `set_metadata_field` finds the callout block and replaces/appends the key. If no callout block exists, inserts one after the title line.
+
+**Bare-opener invariant.** The opener is canonically *bare* (`> [!plan]`); inline metadata is *read-tolerated* but never written. `set_metadata_field` parses (wherever/however the callout sits), upserts, and re-renders one canonical block — collapsing any duplicate/contradictory callouts. The writer is **idempotent**: `render_description(parse_metadata(x))` is a fixpoint, which the read-path drift gate and three-way reconcile depend on for convergence.
 
 This format replaced an earlier `---`-delimited "summary-first" format that was position-sensitive (metadata had to start on line 2, no blank lines allowed) and used `---` as both metadata separator and CommonMark thematic break. The callout format is unambiguous, blank-line tolerant, and renders correctly in both plain text and markdown renderers.
 
-Free functions: `parse_metadata()`, `set_metadata_field()`, `remove_metadata()`, `extract_headings()`, `strip_scratch_sections()`.
+Free functions: `parse_metadata()`, `set_metadata_field()`, `extract_headings()`, `strip_scratch_sections()`.
 
 ### `PlanDocument` — unified parse-and-transform facade
 
@@ -1057,9 +1060,11 @@ Four consumer patterns:
 
 `strip_scratch_sections()` is a consumer of `extract_headings()` and `section_bounds()` — it filters for headings containing `[scratch]` (case-insensitive) and slices them out using byte offsets, preserving all original formatting byte-for-byte in non-scratch regions. Internally it is a thin wrapper around `strip_scratch_sections_with_report()`, which returns the stripped text alongside a `Vec<StrippedSection>` describing each removed section (top-level scratch heading, its descendant headings, and the exact byte range).
 
-`StrippedSection` carries only metadata and offsets — no owned body — so callers that need the verbatim removed content slice `input[section.range]` on demand. The `done` command's `format_strip_report` renderer uses this to produce a `--show-stripped` report without redundant allocation.
+`StrippedSection` carries only metadata and offsets — no owned body — so callers that need the verbatim removed content slice the **stripped input** at `section.range` on demand. `PlanDocument::as_done_with_report` strips `self.body()` (not the raw description), so the returned ranges index into the body — the `done` command's `format_strip_report` is passed `doc.body()` to produce the `--show-stripped` report without redundant allocation.
 
-Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, callout metadata preservation, `---` thematic breaks in body.
+Callout metadata is preserved automatically, by construction: the callout lives outside the body (it is parsed into `metadata`), so it is never part of any heading's `section_bounds` and cannot be swept into a trailing scratch range. `as_done` re-renders the callout from the parsed `metadata` map, so **all** keys survive scratch stripping, not just `status`.
+
+Edge cases handled: multiple scratch sections, nested headings, setext headings, code fences, empty input, entire document as scratch, trailing scratch section adjacent to the (bottom) callout, `---` thematic breaks in body.
 
 ---
 

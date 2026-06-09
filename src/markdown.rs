@@ -4,6 +4,15 @@ use std::collections::BTreeMap;
 // Metadata parsing (Obsidian-style callout block format)
 // ---------------------------------------------------------------------------
 
+/// The canonical callout opener. Defined once so the parser (which recognizes
+/// it) and `render_description` (which emits it) cannot drift apart.
+///
+/// **Invariant:** the opener is canonically *bare* — metadata always lives on
+/// the `> key: value` lines that follow. Metadata placed inline on the opener
+/// (`> [!plan] status: 🔴`, e.g. from a hand edit or an Obsidian "callout
+/// title") is *read-tolerated* by the parser but is never written back.
+const CALLOUT_OPENER: &str = "> [!plan]";
+
 /// Check if a line (after stripping `> ` prefix) looks like a metadata key.
 ///
 /// Pattern: `^[a-z][a-z0-9_-]*: ` (lowercase key, colon, space, value).
@@ -27,43 +36,69 @@ fn is_callout_metadata_line(line: &str) -> bool {
     after_colon.is_empty() || after_colon.starts_with(' ')
 }
 
-/// Check if a line is a `> [!plan]` callout opener (case-insensitive on `plan`).
-fn is_callout_opener(line: &str) -> bool {
+/// Parse a `key: value` pair from callout content — the text after `> ` on a
+/// metadata line, or the inline text after `]` on an opener. Returns `None`
+/// unless it matches the metadata key pattern (see `is_callout_metadata_line`).
+fn parse_metadata_pair(content: &str) -> Option<(String, String)> {
+    if !is_callout_metadata_line(content) {
+        return None;
+    }
+    let colon = content.find(':').unwrap();
+    Some((
+        content[..colon].to_string(),
+        content[colon + 1..].trim().to_string(),
+    ))
+}
+
+/// If `line` is a `> [!plan]` callout opener (case-insensitive on `plan`),
+/// return the inline text after the `]` (trimmed). Returns `None` if the line
+/// is not an opener. An opener with no inline text yields `Some("")`.
+fn opener_inline(line: &str) -> Option<&str> {
     let trimmed = line.trim_end();
     if !trimmed.starts_with("> [!") {
-        return false;
+        return None;
     }
     let after_prefix = &trimmed[4..];
-    let close_bracket = match after_prefix.find(']') {
-        Some(p) => p,
-        None => return false,
-    };
-    let tag = &after_prefix[..close_bracket];
-    tag.eq_ignore_ascii_case("plan")
+    let close_bracket = after_prefix.find(']')?;
+    if !after_prefix[..close_bracket].eq_ignore_ascii_case("plan") {
+        return None;
+    }
+    Some(after_prefix[close_bracket + 1..].trim())
+}
+
+/// Check if a line is a `> [!plan]` callout opener (case-insensitive on `plan`).
+fn is_callout_opener(line: &str) -> bool {
+    opener_inline(line).is_some()
 }
 
 /// Extract Obsidian-style callout metadata from a plan description.
 ///
-/// Format:
+/// Canonical format — the body leads, the callout trails:
 /// ```text
 /// feat: my feature          ← line 1: always the title
+///
+/// # Background              ← body
 ///
 /// > [!plan]                 ← callout opener (case-insensitive)
 /// > status: 🔴              ← metadata key: value lines
 /// > issue: MERC-123
-///
-/// # Background              ← body
 /// ```
 ///
 /// Returns a map of key-value pairs and the body (input with the title line
 /// and callout block lines removed). If no `> [!plan]` block is found,
 /// returns an empty map and everything after line 1 as the body.
 ///
+/// Parsing is **position-independent** (the callout may sit anywhere after the
+/// title — top-placed callouts from before the format change still parse) and
+/// **inline-tolerant** (`> [!plan] status: 🔴` is read, though never written —
+/// see [`CALLOUT_OPENER`]). `render_description` is the canonical inverse.
+///
 /// Parsing rules:
 /// - Line 1 is always the title — never metadata.
 /// - Scan all lines (after title) for `> [!plan]` (the callout opener).
-/// - Read subsequent `> key: value` lines. The block ends at the first line
-///   that doesn't start with `> ` or doesn't match `key: value` pattern.
+/// - Read any inline `key: value` on the opener line, then the subsequent
+///   `> key: value` lines. The block ends at the first line that doesn't start
+///   with `> ` or doesn't match the `key: value` pattern.
 /// - Blank lines before/after the callout block do not affect parsing.
 /// - Body is everything outside the title line and the callout block lines.
 pub fn parse_metadata(input: &str) -> (BTreeMap<String, String>, String) {
@@ -84,18 +119,21 @@ pub fn parse_metadata(input: &str) -> (BTreeMap<String, String>, String) {
         }
     };
 
-    // Collect metadata lines: lines after the opener that start with "> "
-    // and whose content (after "> ") matches the key: value pattern.
+    // Collect metadata. First, any inline metadata on the opener line itself
+    // (`> [!plan] status: 🔴`) — read-tolerated for backward/Obsidian compat.
+    // Then the `> key: value` lines that follow.
     let mut map = BTreeMap::new();
     let mut block_end = opener_idx + 1; // exclusive index past last callout line
 
+    if let Some(inline) = opener_inline(lines[opener_idx])
+        && let Some((key, value)) = parse_metadata_pair(inline) {
+            map.insert(key, value);
+        }
+
     for line in &lines[opener_idx + 1..] {
         if let Some(content) = line.strip_prefix("> ")
-            && is_callout_metadata_line(content) {
-                let colon_pos = content.find(':').unwrap();
-                let key = &content[..colon_pos];
-                let value = content[colon_pos + 1..].trim();
-                map.insert(key.to_string(), value.to_string());
+            && let Some((key, value)) = parse_metadata_pair(content) {
+                map.insert(key, value);
                 block_end += 1;
                 continue;
             }
@@ -122,93 +160,60 @@ pub fn parse_metadata(input: &str) -> (BTreeMap<String, String>, String) {
     (map, body)
 }
 
-/// Set a metadata field in a callout block, creating the block if needed.
+/// Canonical serializer — the inverse of [`parse_metadata`].
 ///
-/// If a `> [!plan]` block exists, replaces or appends the key within it.
-/// If no callout block exists, inserts one after the title line.
-/// All other content is preserved byte-for-byte.
-pub fn set_metadata_field(input: &str, key: &str, value: &str) -> String {
-    let title_end = input.find('\n').unwrap_or(input.len());
-    if title_end == input.len() {
-        // Single line (title only) — append callout block
-        return format!("{}\n\n> [!plan]\n> {}: {}\n", input, key, value);
+/// Emits the `title`, then the `body` (surrounding blank lines trimmed), then a
+/// single **bare-opener** `> [!plan]` block at the END, with `metadata` in
+/// deterministic (`BTreeMap`, key-sorted) order. When `metadata` is empty, no
+/// callout is emitted.
+///
+/// The result is a fixpoint under re-parse: `render_description` applied to the
+/// output of `parse_metadata` is byte-stable, which is what makes the writers
+/// idempotent (the drift gate and three-way reconcile rely on convergence).
+fn render_description(
+    title: &str,
+    body: &str,
+    metadata: &BTreeMap<String, String>,
+) -> String {
+    let body = body.trim_matches('\n');
+
+    let mut out = String::with_capacity(title.len() + body.len() + 64);
+    out.push_str(title);
+    out.push('\n');
+
+    if !body.is_empty() {
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
     }
 
-    let title_line = &input[..title_end];
-    let after_title = &input[title_end + 1..];
-    let lines: Vec<&str> = after_title.lines().collect();
-
-    // Find the callout opener
-    let opener_idx = lines.iter().position(|l| is_callout_opener(l));
-
-    match opener_idx {
-        Some(idx) => {
-            // Callout exists — find its metadata lines, replace or append key
-            let mut meta_lines: Vec<String> = Vec::new();
-            let mut found = false;
-            let mut block_end = idx + 1;
-
-            for line in &lines[idx + 1..] {
-                if let Some(content) = line.strip_prefix("> ")
-                    && is_callout_metadata_line(content) {
-                        let colon_pos = content.find(':').unwrap();
-                        let existing_key = &content[..colon_pos];
-                        if existing_key == key {
-                            meta_lines.push(format!("> {}: {}", key, value));
-                            found = true;
-                        } else {
-                            meta_lines.push((*line).to_string());
-                        }
-                        block_end += 1;
-                        continue;
-                    }
-                break;
-            }
-
-            if !found {
-                meta_lines.push(format!("> {}: {}", key, value));
-            }
-
-            // Rebuild: title + lines before callout + opener + meta lines + lines after callout
-            let mut result = String::with_capacity(input.len() + 32);
-            result.push_str(title_line);
-            result.push('\n');
-            for line in &lines[..idx] {
-                result.push_str(line);
-                result.push('\n');
-            }
-            result.push_str(lines[idx]); // opener line
-            result.push('\n');
-            for ml in &meta_lines {
-                result.push_str(ml);
-                result.push('\n');
-            }
-            for line in &lines[block_end..] {
-                result.push_str(line);
-                result.push('\n');
-            }
-            // Match original trailing newline behavior
-            if !after_title.ends_with('\n') && result.ends_with('\n') {
-                result.pop();
-            }
-            result
-        }
-        None => {
-            // No callout block — insert one after title line
-            format!(
-                "{}\n\n> [!plan]\n> {}: {}\n\n{}",
-                title_line, key, value, after_title
-            )
+    if !metadata.is_empty() {
+        out.push('\n');
+        out.push_str(CALLOUT_OPENER);
+        out.push('\n');
+        for (key, value) in metadata {
+            out.push_str("> ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(value);
+            out.push('\n');
         }
     }
+
+    out
 }
 
-/// Return the input with the callout block and title removed.
+/// Upsert `key = value` into the plan callout and re-emit a single canonical
+/// `> [!plan]` block at the END of the description (see [`render_description`]).
 ///
-/// If there is no callout, returns everything after line 1.
-pub fn remove_metadata(input: &str) -> String {
-    let (_, body) = parse_metadata(input);
-    body
+/// Implemented as parse → upsert → render: position- and inline-tolerant on
+/// read, it collapses any stray/duplicate callouts to one canonical block and
+/// is idempotent. All body content is preserved (surrounding blanks normalized).
+pub fn set_metadata_field(input: &str, key: &str, value: &str) -> String {
+    let title = input.lines().next().unwrap_or("");
+    let (mut metadata, body) = parse_metadata(input);
+    metadata.insert(key.to_string(), value.to_string());
+    render_description(title, &body, &metadata)
 }
 
 // ---------------------------------------------------------------------------
@@ -294,8 +299,8 @@ impl PlanDocument {
 
     /// The complete "mark as done" transformation.
     ///
-    /// 1. If `!keep_scratch`, strips `[scratch]` sections from the full document.
-    /// 2. Sets metadata `status: ✅` in the callout block.
+    /// 1. If `!keep_scratch`, strips `[scratch]` sections from the **body**.
+    /// 2. Sets metadata `status: ✅` and re-renders the callout at the bottom.
     ///
     /// Idempotent: if status is already `✅`, still strips scratch (if requested)
     /// but doesn't double-stamp.
@@ -308,20 +313,24 @@ impl PlanDocument {
     /// Like `as_done`, but also returns a structured report of which scratch
     /// sections were stripped (always empty when `keep_scratch` is true).
     ///
-    /// The returned `Vec<StrippedSection>` carries the top-level scratch
-    /// heading, its descendant headings, and the byte range that was removed.
-    /// Callers can slice `self.raw()` at `section.range` to recover the
-    /// original verbatim body.
+    /// Operates on already-parsed components (GATHER→PLAN→EXECUTE): the callout
+    /// lives in `self.metadata`, **not** in the body, so scratch-stripping can
+    /// never delete it — every metadata key survives, not just `status`. The
+    /// returned `Vec<StrippedSection>` carries byte ranges into **`self.body()`**
+    /// (not `raw`), so callers slice `self.body()` at `section.range` to recover
+    /// the removed content.
     pub fn as_done_with_report(
         &self,
         keep_scratch: bool,
     ) -> (String, Vec<StrippedSection>) {
-        let (base, report) = if keep_scratch {
-            (self.raw.clone(), Vec::new())
+        let (body, report) = if keep_scratch {
+            (self.body.clone(), Vec::new())
         } else {
-            strip_scratch_sections_with_report(&self.raw)
+            strip_scratch_sections_with_report(&self.body)
         };
-        (set_metadata_field(&base, "status", "✅"), report)
+        let mut metadata = self.metadata.clone();
+        metadata.insert("status".to_string(), "✅".to_string());
+        (render_description(&self.title, &body, &metadata), report)
     }
 
     /// Extract PR title and body for submission.
@@ -716,29 +725,59 @@ mod tests {
         assert!(result.starts_with("feat: my feature\n"), "title preserved");
     }
 
-    // ── remove_metadata tests (callout format) ───────────────────────
+    // ── canonical writer: placement, inline-tolerance, idempotency ───
 
     #[test]
-    fn remove_metadata_strips_callout() {
-        let input = "feat: title\n\n> [!plan]\n> status: 🔴\n> issue: MERC-123\n\nbody text here\n";
-        let result = remove_metadata(input);
-        assert!(result.contains("body text here"), "body should remain");
-        assert!(!result.contains("> [!plan]"), "callout should be stripped");
-        assert!(!result.contains("> status:"), "metadata should be stripped");
+    fn set_metadata_field_emits_callout_at_bottom() {
+        let input = "feat: title\n\n# Background\n\nDetails.\n";
+        let result = set_metadata_field(input, "status", "🔴");
+        // The body precedes the callout; the callout is the trailing block.
+        let body_pos = result.find("# Background").unwrap();
+        let callout_pos = result.find("> [!plan]").unwrap();
+        assert!(body_pos < callout_pos, "body must precede the callout:\n{}", result);
+        assert!(result.trim_end().ends_with("> status: 🔴"),
+            "callout must be the final block:\n{}", result);
     }
 
     #[test]
-    fn remove_metadata_no_callout() {
-        let input = "feat: title\n\nbody text";
-        let result = remove_metadata(input);
-        assert!(result.contains("body text"));
+    fn set_metadata_field_inline_opener_upserts_in_place() {
+        // Regression: status inline on the opener (`> [!plan] status: 🔴`) must
+        // be upserted, not duplicated, and the stale 🔴 must not survive.
+        let input = "refactor: x\n\n(plan: jj:abcd)\n\n> [!plan] status: 🔴\n";
+        let result = set_metadata_field(input, "status", "✅");
+        assert_eq!(result.matches("status:").count(), 1,
+            "exactly one status line, got:\n{}", result);
+        assert!(!result.contains('🔴'), "stale 🔴 must be gone:\n{}", result);
+        assert!(result.contains("> [!plan]\n> status: ✅"),
+            "canonical bare opener with ✅:\n{}", result);
+        assert!(result.contains("(plan: jj:abcd)"), "self-reference preserved");
     }
 
     #[test]
-    fn remove_metadata_single_line() {
-        let input = "feat: title";
-        let result = remove_metadata(input);
-        assert!(result.is_empty());
+    fn set_metadata_field_is_idempotent_fixpoint() {
+        // f(x) == f(f(x)) byte-for-byte across representative shapes.
+        let inputs = [
+            "feat: a",
+            "feat: b\n\n# Background\n\nText.\n",
+            "feat: c\n\n> [!plan]\n> status: 🔴\n> issue: M-1\n\n# Body\n",
+            "feat: d\n\n> [!plan] status: 🔴\n",
+        ];
+        for input in inputs {
+            let once = set_metadata_field(input, "status", "✅");
+            let twice = set_metadata_field(&once, "status", "✅");
+            assert_eq!(once, twice, "writer must be a fixpoint for input:\n{}", input);
+        }
+    }
+
+    #[test]
+    fn set_metadata_field_dedupes_contradictory_callout() {
+        // The exact reported contradiction: a stray inline 🔴 plus a `status: ✅`
+        // line. The writer collapses to one canonical block.
+        let input = "feat: x\n\n> [!plan] status: 🔴\n> status: ✅\n";
+        let result = set_metadata_field(input, "status", "✅");
+        assert_eq!(result.matches("> [!plan]").count(), 1, "one callout:\n{}", result);
+        assert_eq!(result.matches("status:").count(), 1, "one status:\n{}", result);
+        assert!(!result.contains('🔴'));
     }
 
     // ── Existing scratch stripping tests (must pass with new impl) ───
@@ -896,6 +935,41 @@ mod tests {
         assert!(result.contains("> status: ✅"));
         assert!(result.contains("[scratch]"));
         assert!(result.contains("Kept."));
+    }
+
+    #[test]
+    fn plan_document_as_done_trailing_scratch_preserves_metadata() {
+        // Headline regression: with the callout at the bottom, a trailing
+        // `[scratch]` section must NOT swallow it. `done` strips the body (where
+        // the scratch lives), not the callout — so `issue` survives, not just
+        // `status`. Naively stripping the raw string would lose `issue` here.
+        let input = "feat: title\n\n\
+                     > [!plan]\n> status: 🔴\n> issue: M-1\n\n\
+                     # Resources [scratch]\n\nthrowaway\n";
+        let doc = PlanDocument::parse(input);
+        let result = doc.as_done(false);
+        assert!(result.contains("> issue: M-1"),
+            "non-status metadata must survive a trailing scratch section:\n{}", result);
+        assert!(result.contains("> status: ✅"), "status stamped:\n{}", result);
+        assert!(!result.contains("[scratch]"), "scratch removed");
+        assert!(!result.contains("throwaway"), "scratch body removed");
+    }
+
+    #[test]
+    fn parse_metadata_top_placed_callout_still_parses() {
+        // Backward-compat guard: callouts written under the old (top) layout
+        // must still parse — reads are position-independent.
+        let input = "feat: title\n\n> [!plan]\n> status: ✅\n\n# Background\n\nBody.\n";
+        let doc = PlanDocument::parse(input);
+        assert!(doc.is_done(), "top-placed status: ✅ must read as done");
+        assert!(doc.body().contains("# Background"));
+    }
+
+    #[test]
+    fn parse_metadata_inline_only_status_is_read() {
+        // is_done() must be correct when the only status is inline on the opener.
+        let doc = PlanDocument::parse("feat: title\n\n> [!plan] status: ✅\n");
+        assert!(doc.is_done(), "inline-opener status must be read");
     }
 
     #[test]

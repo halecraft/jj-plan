@@ -4,9 +4,14 @@ use std::path::Path;
 /// Built-in default template for new plan changes.
 ///
 /// Uses Obsidian-style callout metadata format: the title/summary line comes
-/// first (as jj/git expect), followed by a `> [!plan]` callout block with
-/// `> key: value` metadata lines. Developers who want sections (Background,
-/// Tasks, etc.) should create a `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`.
+/// first (as jj/git expect) and the `> [!plan]` callout block is the **trailing**
+/// element, so the description leads and the tool-managed status block sits at
+/// the end. The default has no body, so the callout is already last; when a
+/// plan grows a body, the writers (`markdown::render_description`, via
+/// `set_metadata_field` / `as_done`) keep the callout pinned to the bottom.
+/// Developers who want sections (Background, Tasks, etc.) should create a
+/// `.jj-plan/template.md` or set `JJ_PLAN_TEMPLATE`; jj-plan never reorders the
+/// template's own content — only the tool-injected callout is placed last.
 const DEFAULT_TEMPLATE: &str = "(plan: jj:{{CHANGE_ID}})\n\n> [!plan]\n> status: 🔴\n";
 
 /// Resolve the template content using the standard fallback chain:
