@@ -564,15 +564,19 @@ pub fn run_summary(
     // workspace, so the only cost saved is the redundant flush round-trip).
     if !crate::plan_file::is_error_state(&plan_dir.path) {
         let repo_root = workspace.jj_workspace().workspace_root().to_path_buf();
-        let contents = crate::sync_state::gather_plan_file_contents(&plan_dir.path, registry);
-        let digest = crate::sync_state::compute_digest(&contents);
+        let current = crate::sync_state::current_file_hashes(&plan_dir.path, registry);
         let stored = crate::sync_state::load_sync_state(&repo_root);
-        if crate::sync_state::is_drifted(&digest, stored.as_ref()) {
+        if crate::sync_state::is_drifted(&current, stored.as_ref()) {
+            let prev = stored.map(|s| s.baselines).unwrap_or_default();
             crate::flush::flush_all(&plan_dir.path, jj, workspace, registry);
             workspace.reload();
+            // Advance baselines only for bookmarks now confirmed equal — a failed flush is
+            // not recorded, so it cannot poison the baseline (the reproduced defeat).
+            let observed = crate::flush::observe(&plan_dir.path, workspace, registry);
+            let next = crate::sync_state::anchor(&prev, &observed);
             let _ = crate::sync_state::save_sync_state(
                 &repo_root,
-                &crate::sync_state::SyncState::new(digest),
+                &crate::sync_state::SyncState::new(next),
             );
         }
     }

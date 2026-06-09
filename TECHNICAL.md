@@ -353,18 +353,74 @@ The wrap lifecycle is the core mechanism that keeps plan files and jj descriptio
 4. **Full sync & show** — stale-bookmark cleanup + legacy migration + sync + display (`full_sync_and_show`)
 5. **Auto-cleanup** — remove merged stacks (`auto_cleanup_merged_stacks`)
 
+### Plan-file reconcile (three-way) (`src/sync_state.rs`)
+
+flush (file→desc) and sync (desc→file) are the two directions of **one** pure 3-way
+decision, `reconcile(file, desc, base)` (mental model = git merge-base: `file = ours`,
+`desc = theirs`, `base = merge base`). Each shell executes only its lane and refuses to act
+in the other's, so **neither side can clobber the other** — the property both the original
+data-loss bug and its mirror violated. Context: `jj:kmkzurqp`.
+
+`base` is the per-bookmark hash of the content last **confirmed equal on both sides**,
+stored in `.jj/repo/jj-plan/sync-state.toml` (v2; mirrors `pr_cache`). `reconcile` returns:
+
+| result | meaning | flush does | sync does |
+|---|---|---|---|
+| `InSync` | `file == desc` | nothing | nothing |
+| `FileToDesc` | only the file changed | `jj describe` | preserve file |
+| `DescToFile` | only the desc changed, or file absent | nothing | write file |
+| `Conflict` | both diverged from a known base | nothing | preserve file + `.incoming` |
+
+Two principles govern the edges (decided as ordered rules; trailing newline normalized
+first so an editor-added `\n` is never a false conflict):
+
+- **An empty side never overwrites a non-empty side.** An empty description can't zero a
+  file; an empty file can't clear a description. (To clear a plan, untrack/abandon — don't
+  empty a side.) This replaced flush's old `!content.is_empty()` skip.
+- **Recoverability bias for ambiguity.** A description overwrite is recoverable via the jj
+  oplog; a plan-file overwrite is **not** (plan files are gitignored, with no oplog beyond
+  our `.history/`). So when there is no baseline (`base = None`), `reconcile` biases to
+  `FileToDesc`, never `DescToFile`. `Conflict` therefore arises **only** from a known base
+  with genuine divergence — never from `base = None` (no first-run conflict spam; self-heals
+  on the next successful flush).
+
+**Baselines only advance via `anchor`**, which records `hash(content)` for a bookmark *only
+when its two sides are observed equal* — never trusting a "flush succeeded" return. This is
+the single guard against **baseline poisoning**: a failed flush leaves `file != desc`, so
+the baseline is not advanced, and the next sync still sees the file as unflushed and
+preserves it. `anchor` is applied at exactly three persistence sites — `wrap::sync_to_disk`
+and the two read paths that flush without a following sync (`run_drift_gated_readonly` in
+`main.rs` and `run_summary`); those gates re-read descriptions post-flush via
+`flush::observe`. flush itself never persists the baseline. `flush_all` loads the baseline
+internally, so its 13 callers are unchanged.
+
+**Recovery artifacts** (all gitignored under `.jj-plan/`, all invisible to
+`collect_plan_files`): `.history/<sha8>-<bookmark>.md` snapshots prior content before any
+overwrite or removal; `<file>.incoming` holds the incoming description when a write
+conflicts; `<file>.orphan` preserves a stale file's unflushed content before removal.
+
+Known limitation: two bookmarks on one commit map to one description; the guard makes this
+*safer* (preserve + warn instead of silently letting one win) but does not fully resolve the
+ambiguity.
+
 ### Phase 1: Flush (`src/flush.rs`)
 
-**Direction:** Plan file → jj description.
+**Direction:** Plan file → jj description (one lane of the shared reconcile — see
+"Plan-file reconcile (three-way)" below).
 
 For each plan file in `.jj-plan/`:
 1. Read the file content.
-2. Resolve the bookmark name from the filename.
-3. Look up the bookmark → change ID mapping via workspace bookmarks.
-4. Read the current jj description for that change.
-5. If the file content differs from the description, run `jj describe` to update.
+2. Resolve the bookmark name from the filename, then the bookmark → change ID mapping.
+3. Read the current jj description and the bookmark's baseline.
+4. Run `sync_state::reconcile(file, desc, base)`. flush pushes (`jj describe`) **only** when
+   the result is `FileToDesc` (the file carries edits the description lacks). On
+   `DescToFile`/`Conflict` it leaves the description alone — a stale file can never
+   overwrite a changed description (the mirror-bug guard).
 
-This makes the plan file authoritative — any local edits to `.jj-plan/*.md` take precedence over the jj description.
+flush is deliberately **desc-only**: it never writes plan files and never persists the
+baseline (it cannot observe `file == desc` until the post-command reload — that is sync's /
+the read-gate's job). A failed `jj describe` is swallowed and is now harmless: it leaves
+`file != desc`, so the baseline simply does not advance for that bookmark (no poisoning).
 
 ### Phase 2: Run the jj command
 
@@ -406,17 +462,31 @@ This function is idempotent — safe to call multiple times (the second call fin
 
 ### Sync internals (`src/sync.rs`)
 
-**Direction:** jj description → plan file.
+**Direction:** jj description → plan file (the other lane of the shared reconcile).
 
-Uses a **gather → plan → execute** architecture:
+Uses a **gather → plan → execute** architecture. Sync is **non-destructive**: it adopts
+the description into the file only when `reconcile` returns `DescToFile`; it never writes
+over a non-empty file that carries unflushed edits.
 
-1. **Gather**: Read `.jj-plan/` to build a `CurrentPlanState` (file list, bookmark-to-filename map).
-2. **Plan** (pure): Compare current state with the stack from jj-lib. Produce a `SyncPlan`:
-   - Files to remove (bookmarks no longer in stack).
-   - Files to rename (same bookmark, different index).
-   - Files to write (description changed in jj).
-   - File summary for `stack.md` (received as opaque `Option<&str>` from the caller — sync writes but does not generate this content).
-3. **Execute**: Apply the plan — remove, rename, write, write `stack.md`. Also cleans up any stale `current.md` from older versions.
+1. **Gather**: Read `.jj-plan/` once into a `CurrentPlanState` (entries, bookmark→filename,
+   and bookmark→**content** — the content is pure data passed to the planner, not a lookup
+   closure).
+2. **Plan** (pure): for each stack change run `reconcile(file, desc, base)` and project:
+   - `DescToFile` → a **write** (adopt the description; carries the prior content for the
+     pre-overwrite snapshot).
+   - `InSync`/`FileToDesc` → **skip** (preserve the file; `FileToDesc` also warns that the
+     flush did not land).
+   - `Conflict` → a **conflict** (preserve the file; the incoming description is surfaced).
+   Plus stale **removes** (each tagged with whether its content diverged from baseline),
+   **renames** (reposition, independent of reconcile), and the opaque `stack.md` summary.
+   The plan also carries the post-execution `(bookmark, file_after, desc)` observations that
+   drive `anchor`.
+3. **Execute**: snapshot prior content to `.jj-plan/.history/` before any content-replacing
+   write or remove; remove stale files (a diverged one is preserved as `<file>.orphan` +
+   warning); apply renames; write adopted descriptions **atomically** (temp + `rename`);
+   surface conflicts as `<file>.incoming` + warning; clean up stale `current.md`; write
+   `stack.md`. `sync()` then returns the advanced baselines (`anchor`), which the caller
+   persists.
 
 Note: `sync_to_disk` in `wrap.rs` builds the @-relative stack once via `build_current_stack()` and forks it into two consumers: `stack_to_sync_changes()` for plan file sync and `build_column_from_stack()` for rendering. The rendered `stack.md` content is passed to `sync::sync()` as opaque content. The returned `StackDisplayData` is reused by `show_plan_stack` — no second traversal is needed. `build_multi_stack()` is never called on this path.
 
@@ -512,15 +582,25 @@ jj-plan can't hook the editor or an LLM's file-write, so a direct `.jj-plan/*.md
 
 **The cost asymmetry.** Reading the plan files is microseconds; the expensive part of a flush is opening jj-lib (`Workspace::open`) to read the descriptions to diff against (milliseconds). So the gate answers one cheap question before exec — *"has any plan file changed since the last sync?"* — without opening jj-lib, and only escalates to a real flush on a positive answer.
 
-**The signal.** After every sync, `wrap::sync_to_disk` records a SHA-256 **digest** of the plan-file set (the `collect_plan_files` set — `stack.md`/`current.md`/`error.md` are excluded) in `.jj/repo/jj-plan/sync-state.toml`, alongside `plans.toml`/`pr-cache.toml`. The digest is over file **content** (length-prefixed, NUL-framed, filename-sorted), so it is order-independent and unaffected by sync's unconditional `stack.md` rewrite or identical-content plan-file rewrites — only a real edit moves it. The sidecar is safe to delete: a missing record counts as drift (`is_drifted` returns `true` for `None`), costing at most one extra (correct) flush. `sync_state` is split functional-core / imperative-shell: `compute_digest`/`is_drifted` are pure; `gather_plan_file_contents`/`load_sync_state`/`save_sync_state` are the I/O shell (persistence mirrors `pr_cache.rs`).
+**The signal.** The sidecar `.jj/repo/jj-plan/sync-state.toml` (v2; alongside
+`plans.toml`/`pr-cache.toml`) stores the per-bookmark **baselines** — `hash_content` of the
+content confirmed equal on both sides (see "Plan-file reconcile" above). Drift is decided by
+`is_drifted(current_file_hashes, stored.baselines)`: `current_file_hashes` re-hashes the
+plan files as they are now (keyed by bookmark, so a rename/renumber alone does not move it),
+and any difference from the stored baselines is drift. The sidecar is safe to delete: a
+missing/old-version record counts as drift (`is_drifted` returns `true` for `None`), costing
+at most one extra (correct) flush. `sync_state` is split functional-core / imperative-shell:
+`reconcile`/`anchor`/`hash_content`/`is_drifted` are pure; `read_plan_contents`/
+`current_file_hashes`/`load_sync_state`/`save_sync_state` are the I/O shell (persistence
+mirrors `pr_cache.rs`).
 
 **The gate** (`run_drift_gated_readonly` in `main.rs`, decided by the pure `decide_read_gate(activated, error_state, drifted)`):
 
 1. Resolve repo root + plan dir (cheap stats). Not activated → `exec` (today's zero-overhead path, unchanged). Non-jj-plan repos never reach here.
 2. Error state (`error.md` present) → `exec` (never flush in the error state, matching `flush_all`).
-3. Gather plan-file contents → `compute_digest`; `load_sync_state`; `is_drifted`.
+3. `current_file_hashes`; `load_sync_state`; `is_drifted`.
 4. **Not drifted** (the common case) → `exec` immediately. **No jj-lib opened, no jj operation created.**
-5. **Drifted** (or missing sidecar) → `Workspace::open` (degrade to plain `exec` on failure), `flush_all`, refresh the sidecar, then `exec`.
+5. **Drifted** (or missing sidecar) → `Workspace::open` (degrade to plain `exec` on failure), `flush_all`, `reload`, then re-read descriptions via `flush::observe` and `anchor` the sidecar (advancing only bookmarks now confirmed `file == desc` — a failed flush is not recorded, so it cannot poison the baseline), then `exec`.
 
 The gate never alters the command's stdout/stderr/exit: the flush is silent (`run_silent`), and `exec` replaces the process so the output is exactly real `jj`'s. No `reload` is needed — `exec` is a fresh process that reads the post-flush state from disk. `DRIFT_GATED_READONLY = ["log", "show", "evolog"]`; `diff`/`interdiff` stay on the pure-exec fast path because they surface trees, not descriptions.
 
@@ -1072,26 +1152,27 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 ### Unit tests (`cargo test`)
 
-389 tests covering:
+523 tests covering (selected modules):
 
 | Module | Tests | Covers |
 |---|---|---|
 | `commands/` | 105 | Dispatch, describe interception & guard, navigation, new/track/untrack, stack visualization, WC adoption |
-| `plan_file.rs` | 30 | Filename parsing, bookmark encoding, registry-based resolution, legacy detection |
+| `plan_file.rs` | 30 | Filename parsing, bookmark encoding, registry-based resolution, legacy detection, atomic write |
 | `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain`, multi-stack grouping |
+| `sync_state.rs` | 22 | `reconcile` truth table, `anchor` (poison-proof), `is_drifted`, v2 baselines roundtrip / v1 load |
 | `types.rs` | 23 | `LogEntry` methods, `PlanRegistry` CRUD, `resolve_encoded`, `would_collide`, TOML roundtrip, v1→v2 compat, `plans_in_stack` |
 | `markdown.rs` | 20 | Scratch stripping, code fence immunity, edge cases |
 | `template.rs` | 16 | Resolution chain, interpolation, bookmark placeholders, fallback |
-| `sync.rs` | 14 | Gather/plan/execute phases, symlink targeting, edge cases |
+| `sync.rs` | 15 | `plan_sync` reconcile projection (write/skip/conflict), removes/renames, baseline observations |
 | `plan_dir.rs` | 8 | Directory resolution, plan max |
+| `flush.rs` | 8 | `plan_flush` reconcile projection, mirror no-push, empty-file no-push |
 | `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
 | `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
-| `flush.rs` | 6 | Description comparison, bookmark-based resolution |
 | `platform/detection.rs` | 18 | URL parsing, platform detection |
 
 ### Bats integration tests (`./test.sh`)
 
-126 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`.
+176 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`. The "Reconcile (three-way)" block covers the failing-flush clobber, baseline-poisoning, mirror, true-conflict, and squash remove-path loss paths via a fake `jj` that no-ops `describe`.
 
 ### PR integration tests
 

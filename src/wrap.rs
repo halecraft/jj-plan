@@ -242,16 +242,23 @@ pub fn sync_to_disk(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanRe
         _ => (None, None),
     };
 
-    sync::sync(plan_dir, sync_changes.as_deref(), max_stack_size, registry, stack_md_content.as_deref());
-
-    // Record the post-sync plan-file digest so the read-path drift gate
-    // (`log`/`show`/`evolog`) can decide whether a flush is needed without
-    // opening jj-lib. Best-effort: a write failure only costs an extra flush
-    // later (drift is assumed when the sidecar is missing/stale).
+    // Load the previous per-bookmark baselines, run the reconcile-aware sync, and persist
+    // the advanced baselines it returns (anchored to confirmed-equal content). These same
+    // baselines drive the read-path drift gate without opening jj-lib. Best-effort: a write
+    // failure only costs an extra flush later (drift is assumed when the sidecar is stale).
     let repo_root = workspace.jj_workspace().workspace_root();
-    let contents = sync_state::gather_plan_file_contents(&plan_dir.path, registry);
-    let digest = sync_state::compute_digest(&contents);
-    if let Err(e) = sync_state::save_sync_state(repo_root, &sync_state::SyncState::new(digest)) {
+    let prev_baselines = sync_state::load_sync_state(repo_root)
+        .map(|s| s.baselines)
+        .unwrap_or_default();
+    let new_baselines = sync::sync(
+        plan_dir,
+        sync_changes.as_deref(),
+        max_stack_size,
+        registry,
+        stack_md_content.as_deref(),
+        &prev_baselines,
+    );
+    if let Err(e) = sync_state::save_sync_state(repo_root, &sync_state::SyncState::new(new_baselines)) {
         debug_log!("  sync_state: failed to save: {e}");
     }
 

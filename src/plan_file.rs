@@ -263,6 +263,26 @@ pub fn write_or_warn(path: &Path, content: &str) {
     }
 }
 
+/// Write content atomically (temp file in the same directory, then `rename`), warning on
+/// failure. The rename is atomic on the same filesystem, so a reader never sees a
+/// half-written plan file. The temp name (`.NAME.tmp`) is not a plan file (no `.md`
+/// suffix), so it is invisible to `collect_plan_files` even if a crash leaves it behind.
+pub fn write_atomic_or_warn(path: &Path, content: &str) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return write_or_warn(path, content);
+    };
+    let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
+    let result = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path));
+    if let Err(e) = result {
+        eprintln!(
+            "jj-plan: warning: failed to write {}: {}",
+            path.display(),
+            e
+        );
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
 /// Remove a file, warning on failure (ignores "not found").
 pub fn remove_or_warn(path: &Path) {
     if let Err(e) = fs::remove_file(path)

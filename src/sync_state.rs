@@ -1,26 +1,25 @@
-//! Read-path drift signal for plan files.
+//! Plan-file ↔ description reconcile: the pure 3-way decision, the per-bookmark
+//! baseline, and the read-path drift signal.
 //!
-//! jj-plan propagates direct `.jj-plan/*.md` edits into jj descriptions only on
-//! the next command that flushes. Read-only commands that surface descriptions
-//! (`log`, `show`, `evolog`) historically `exec`'d real `jj` directly, so they
-//! could render a stale description until some later command flushed.
+//! jj-plan keeps each plan in two places — the jj change **description** and an
+//! editable `.jj-plan/L-NN-bookmark.md` **file**. `flush` moves file→description and
+//! `sync` moves description→file. These are the two directions of one 3-way reconcile.
 //!
-//! Opening jj-lib to diff plan files against descriptions is the expensive part
-//! of a flush (milliseconds), while reading the small plan files is cheap
-//! (microseconds). This module provides the cheap signal that lets the read path
-//! decide whether a flush — and therefore a jj-lib open — is even needed:
+//! [`reconcile`] is the single pure decision shared by both directions (mental model =
+//! git merge-base: `file = ours`, `desc = theirs`, `base = merge base`). Each shell
+//! executes only its lane and refuses to act destructively in the other's, so neither
+//! side can clobber the other.
 //!
-//! - After every sync, `wrap::sync_to_disk` records a content **digest** of the
-//!   plan-file set in `.jj/repo/jj-plan/sync-state.toml` (mirrors `pr_cache`).
-//! - On a gated read command, we recompute the digest from disk and compare. If
-//!   it matches the recorded one, nothing drifted → pure `exec`. If it differs
-//!   (or no record exists), there are unflushed edits → flush, then `exec`.
+//! The **baseline** is the content last confirmed equal on both sides, stored per
+//! bookmark in `.jj/repo/jj-plan/sync-state.toml` (mirrors `pr_cache`). It advances only
+//! via [`anchor`], which records `hash(content)` for a bookmark **only when its two sides
+//! are observed equal** — so a failed flush cannot poison it.
 //!
-//! The digest is over **file content**, so sync's unconditional `stack.md`
-//! rewrite and identical-content plan-file rewrites do not perturb it — only a
-//! real plan-file edit does. The sidecar is safe to delete: a missing record
-//! counts as drift, costing at most one extra (correct) flush.
+//! The same per-bookmark hashes drive the read-path drift gate: a `log`/`show`/`evolog`
+//! command flushes only when [`current_file_hashes`] differs from the stored baselines
+//! ([`is_drifted`]), avoiding a jj-lib open in the common (no-edit) case.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,11 +27,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{JjPlanError, Result};
+use crate::plan_file::PlanFileEntry;
 use crate::plan_registry::resolve_repo_path;
 use crate::types::PlanRegistry;
 
 /// Current version of the sync-state file format.
-pub const SYNC_STATE_VERSION: u32 = 1;
+///
+/// v1 stored a single aggregate `digest`; v2 stores a per-bookmark baseline map. A v1
+/// (or unknown-version) file loads as `None` — forcing one self-healing flush.
+pub const SYNC_STATE_VERSION: u32 = 2;
 
 /// Filename for the sync-state sidecar.
 const SYNC_STATE_FILE: &str = "sync-state.toml";
@@ -40,57 +43,163 @@ const SYNC_STATE_FILE: &str = "sync-state.toml";
 /// Directory name for jj-plan metadata within `.jj/repo/`.
 const JJ_PLAN_DIR: &str = "jj-plan";
 
-/// Persisted content digest of the plan-file set as of the last sync.
+// ---------------------------------------------------------------------------
+// Pure: normalization + content hashing
+// ---------------------------------------------------------------------------
+
+/// Normalize content for comparison/hashing by stripping trailing newlines.
+///
+/// The read path (`read_description_at`/`gather_descriptions`) strips the trailing `\n`,
+/// while editors routinely add one. Without this, a newline-only difference would read as
+/// a divergence and produce a false `Conflict`. Comparing content modulo trailing newlines
+/// makes such a difference `InSync`.
+fn normalize(s: &str) -> &str {
+    s.trim_end_matches('\n')
+}
+
+/// sha256-hex of a content string (normalized first). Pure.
+///
+/// Per-bookmark hashing keys on the bookmark name (the map key), so — unlike the old
+/// aggregate digest — no length-prefixed framing is needed to avoid cross-file collisions.
+pub fn hash_content(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(normalize(content).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+// ---------------------------------------------------------------------------
+// Pure: the 3-way reconcile decision
+// ---------------------------------------------------------------------------
+
+/// The single pure decision shared by flush (file→desc) and sync (desc→file).
+///
+/// Each shell executes only its lane:
+/// - flush pushes on `FileToDesc`; leaves the description alone on everything else.
+/// - sync writes on `DescToFile`; preserves the file on everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reconcile {
+    /// `file == desc` — already equal; nobody acts, baseline records agreement.
+    InSync,
+    /// Only the file changed — flush pushes file→desc; sync preserves the file.
+    FileToDesc,
+    /// Only the description changed (or the file is absent) — sync writes desc→file;
+    /// flush leaves the description.
+    DescToFile,
+    /// Both sides diverged from a known base — preserve the file, surface the incoming
+    /// description; neither shell overwrites.
+    Conflict,
+}
+
+/// Pure 3-way decision. `base_hash` = `hash_content` of the content last confirmed equal on
+/// both sides (`None` = no baseline yet); the baseline is stored as a hash, not content, so
+/// "did this side change?" is `hash_content(side) != base_hash`. Two principles govern the
+/// edges:
+///
+/// - **An empty side never overwrites a non-empty side** (emptiness = "no authoritative
+///   content").
+/// - **Recoverability bias for ambiguity.** A description overwrite is recoverable via the
+///   jj oplog; a plan-file overwrite is not. So when attribution is impossible
+///   (`base = None`), bias to `FileToDesc`, never `DescToFile`. `Conflict` therefore arises
+///   only from a *known* base with genuine divergence — never from `base = None`.
+///
+/// The safety invariant: no result writes the description over a non-empty file unless the
+/// file is confirmed clean (`hash == base_hash`), so unflushed file edits are never lost.
+pub fn reconcile(file: Option<&str>, desc: &str, base_hash: Option<&str>) -> Reconcile {
+    // Rule 1: no file yet → materialize from the description.
+    let file = match file {
+        None => return Reconcile::DescToFile,
+        Some(f) => normalize(f),
+    };
+    let desc = normalize(desc);
+
+    // Rule 2: already equal (covers equal, convergent-both-changed, both-empty).
+    if file == desc {
+        return Reconcile::InSync;
+    }
+
+    // Rule 3: exactly one side empty → act toward the non-empty side.
+    let file_empty = file.is_empty();
+    let desc_empty = desc.is_empty();
+    if file_empty != desc_empty {
+        return if file_empty {
+            Reconcile::DescToFile // empty file → restore from description
+        } else {
+            Reconcile::FileToDesc // empty description → push the file (never lose it)
+        };
+    }
+
+    // Both non-empty and differing.
+    match base_hash {
+        Some(base_hash) => {
+            let file_changed = hash_content(file) != base_hash;
+            let desc_changed = hash_content(desc) != base_hash;
+            match (file_changed, desc_changed) {
+                (true, false) => Reconcile::FileToDesc, // only file changed
+                (false, true) => Reconcile::DescToFile, // only description changed
+                (true, true) => Reconcile::Conflict,    // both diverged (file != desc)
+                // (false, false) ⇒ file == base == desc ⇒ file == desc, handled by Rule 2.
+                (false, false) => Reconcile::InSync,
+            }
+        }
+        // Rule 5: no baseline → bias to the recoverable direction.
+        None => Reconcile::FileToDesc,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persisted per-bookmark baseline
+// ---------------------------------------------------------------------------
+
+/// Per-bookmark content baselines as of the last confirmed sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncState {
     /// File format version.
     pub version: u32,
-    /// sha256 (hex) over the sorted plan-file set.
-    pub digest: String,
+    /// bookmark name → sha256-hex of the content confirmed equal on BOTH sides.
+    #[serde(default)]
+    pub baselines: BTreeMap<String, String>,
 }
 
 impl SyncState {
-    /// Construct a `SyncState` wrapping a digest at the current version.
-    pub fn new(digest: impl Into<String>) -> Self {
+    /// Construct a `SyncState` wrapping a baseline map at the current version.
+    pub fn new(baselines: BTreeMap<String, String>) -> Self {
         Self {
             version: SYNC_STATE_VERSION,
-            digest: digest.into(),
+            baselines,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pure: digest + drift decision
-// ---------------------------------------------------------------------------
-
-/// Compute a content digest over a set of plan files.
+/// Advance baselines: for each observation, set `bm → hash(file)` **only when the two
+/// sides are equal** (normalized); otherwise keep the previous baseline. Pure.
 ///
-/// Pure. Sorts the `(filename, content)` pairs by filename so the result is
-/// order-independent, then folds each pair into SHA-256 with a length-prefixed,
-/// NUL-delimited framing so distinct file sets cannot collide by concatenation.
-/// Returns the lowercase hex digest.
-pub fn compute_digest(files: &[(String, String)]) -> String {
-    let mut sorted: Vec<&(String, String)> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut hasher = Sha256::new();
-    for (name, content) in sorted {
-        hasher.update(name.as_bytes());
-        hasher.update([0u8]);
-        hasher.update((content.len() as u64).to_le_bytes());
-        hasher.update(content.as_bytes());
-        hasher.update([0u8]);
+/// This is the single place baseline poisoning is prevented — it observes equality rather
+/// than trusting any "flush succeeded" return. `observed` is sourced from executed
+/// outcomes (a `Write` yields `(desc, desc)`; a gate pairs the re-read description with the
+/// file it already gathered), never from a fresh disk scan.
+pub fn anchor(
+    prev: &BTreeMap<String, String>,
+    observed: &[(String, Option<String>, String)],
+) -> BTreeMap<String, String> {
+    let mut next = prev.clone();
+    for (bookmark, file, desc) in observed {
+        if let Some(file) = file
+            && normalize(file) == normalize(desc)
+        {
+            next.insert(bookmark.clone(), hash_content(file));
+        }
     }
-    format!("{:x}", hasher.finalize())
+    next
 }
 
-/// Decide whether plan files have drifted from the last recorded sync.
+/// Decide whether plan files have drifted from the last confirmed baseline.
 ///
-/// Pure. A missing baseline (`None`) counts as drift — conservatively forcing a
-/// flush on first run / after the sidecar is deleted. Otherwise compares digests.
-pub fn is_drifted(current_digest: &str, stored: Option<&SyncState>) -> bool {
+/// Pure. A missing/unparseable/old-version baseline (`None`) counts as drift —
+/// conservatively forcing one flush. Otherwise compares the current per-bookmark file
+/// hashes against the stored baselines.
+pub fn is_drifted(current_file_hashes: &BTreeMap<String, String>, stored: Option<&SyncState>) -> bool {
     match stored {
-        Some(state) => state.digest != current_digest,
+        Some(state) => &state.baselines != current_file_hashes,
         None => true,
     }
 }
@@ -99,20 +208,26 @@ pub fn is_drifted(current_digest: &str, stored: Option<&SyncState>) -> bool {
 // Imperative shell: gather plan-file contents
 // ---------------------------------------------------------------------------
 
-/// Read the plan-file set (the same files `flush` operates on) into
-/// `(filename, content)` pairs for digesting.
+/// Read the plan-file set once into `(entry, content)` pairs — the single content read
+/// shared by flush, sync, and the drift gate.
 ///
-/// Imperative. Uses `collect_plan_files`, so non-plan files (`stack.md`,
-/// `current.md`, `error.md`) are excluded — they don't parse as `L-NN-…` plan
-/// filenames. Files that can't be read are skipped (treated as absent).
-pub fn gather_plan_file_contents(plan_dir: &Path, registry: &PlanRegistry) -> Vec<(String, String)> {
+/// Imperative. Uses `collect_plan_files`, so non-plan files (`stack.md`, `error.md`,
+/// `.history/`, `*.incoming`, `*.orphan`) are excluded. Files that can't be read are
+/// skipped (treated as absent).
+pub fn read_plan_contents(plan_dir: &Path, registry: &PlanRegistry) -> Vec<(PlanFileEntry, String)> {
     crate::plan_file::collect_plan_files(plan_dir, registry)
         .into_iter()
-        .filter_map(|entry| {
-            fs::read_to_string(&entry.path)
-                .ok()
-                .map(|content| (entry.filename, content))
-        })
+        .filter_map(|entry| fs::read_to_string(&entry.path).ok().map(|content| (entry, content)))
+        .collect()
+}
+
+/// Current per-bookmark content hashes (the *drift input* — hashes of files as they are
+/// now, keyed by bookmark name). Distinct from the stored `baselines` (the *confirmed*
+/// state); `is_drifted` compares the two.
+pub fn current_file_hashes(plan_dir: &Path, registry: &PlanRegistry) -> BTreeMap<String, String> {
+    read_plan_contents(plan_dir, registry)
+        .into_iter()
+        .map(|(entry, content)| (entry.bookmark_name, hash_content(&content)))
         .collect()
 }
 
@@ -127,15 +242,18 @@ pub fn sync_state_path(workspace_root: &Path) -> PathBuf {
         .join(SYNC_STATE_FILE)
 }
 
-/// Load the recorded sync state, or `None` if missing or unparseable.
+/// Load the recorded sync state, or `None` if missing, unparseable, or an old version.
 ///
-/// Unparseable is treated as missing (returns `None`) rather than erroring —
-/// the sidecar is a best-effort cache, and a corrupt one should simply force a
-/// flush, not break a read command.
+/// A v1 (aggregate-digest) file has no `version = 2`, so it deserializes to a `version`
+/// that isn't 2 → treated as `None` (one self-healing flush). Unparseable is also `None`.
 pub fn load_sync_state(workspace_root: &Path) -> Option<SyncState> {
     let path = sync_state_path(workspace_root);
     let content = fs::read_to_string(&path).ok()?;
-    toml::from_str(&content).ok()
+    let state: SyncState = toml::from_str(&content).ok()?;
+    if state.version != SYNC_STATE_VERSION {
+        return None;
+    }
+    Some(state)
 }
 
 /// Persist the sync state, creating `.jj/repo/jj-plan/` if needed.
@@ -154,8 +272,8 @@ pub fn save_sync_state(workspace_root: &Path, state: &SyncState) -> Result<()> {
         .map_err(|e| JjPlanError::Config(format!("failed to serialize sync state: {e}")))?;
 
     let content = format!(
-        "# Plan-file drift cache — content digest of the plan-file set at last sync.\n\
-         # Safe to delete; a missing/stale entry just forces one extra flush.\n\n{body}"
+        "# Plan-file reconcile baselines — per-bookmark hash of the content confirmed equal\n\
+         # on both sides at last sync. Safe to delete; a missing entry just forces one flush.\n\n{body}"
     );
 
     fs::write(&path, content)?;
@@ -167,72 +285,129 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn files(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn obs(items: &[(&str, Option<&str>, &str)]) -> Vec<(String, Option<String>, String)> {
+        items
             .iter()
-            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .map(|(bm, f, d)| (bm.to_string(), f.map(|s| s.to_string()), d.to_string()))
             .collect()
     }
 
-    // -- compute_digest --
+    // -- reconcile (ordered rules) --
 
     #[test]
-    fn digest_is_deterministic() {
-        let f = files(&[("a-01-x.md", "hello"), ("b-02-y.md", "world")]);
-        assert_eq!(compute_digest(&f), compute_digest(&f));
+    fn reconcile_absent_file_materializes() {
+        assert_eq!(reconcile(None, "desc", Some("x")), Reconcile::DescToFile);
+        assert_eq!(reconcile(None, "", None), Reconcile::DescToFile);
     }
 
     #[test]
-    fn digest_is_order_independent() {
-        let a = files(&[("a-01-x.md", "hello"), ("b-02-y.md", "world")]);
-        let b = files(&[("b-02-y.md", "world"), ("a-01-x.md", "hello")]);
-        assert_eq!(compute_digest(&a), compute_digest(&b));
+    fn reconcile_equal_is_insync() {
+        assert_eq!(reconcile(Some("same"), "same", Some("old")), Reconcile::InSync);
     }
 
     #[test]
-    fn digest_empty_set_is_stable() {
-        assert_eq!(compute_digest(&[]), compute_digest(&[]));
+    fn reconcile_newline_only_difference_is_insync() {
+        // The normalization gotcha: trailing-newline-only difference must NOT be a conflict.
+        assert_eq!(reconcile(Some("plan\n"), "plan", Some("plan")), Reconcile::InSync);
+        assert_eq!(reconcile(Some("plan"), "plan\n\n", Some("base")), Reconcile::InSync);
     }
 
     #[test]
-    fn digest_flips_on_content_change() {
-        let a = files(&[("a-01-x.md", "hello")]);
-        let b = files(&[("a-01-x.md", "hello!")]);
-        assert_ne!(compute_digest(&a), compute_digest(&b));
+    fn reconcile_convergent_both_changed_to_same_is_insync() {
+        assert_eq!(reconcile(Some("X"), "X", Some("old")), Reconcile::InSync);
     }
 
     #[test]
-    fn digest_flips_on_filename_change() {
-        let a = files(&[("a-01-x.md", "hello")]);
-        let b = files(&[("a-01-z.md", "hello")]);
-        assert_ne!(compute_digest(&a), compute_digest(&b));
+    fn reconcile_only_file_changed_pushes() {
+        let base = hash_content("old");
+        assert_eq!(reconcile(Some("new"), "old", Some(&base)), Reconcile::FileToDesc);
     }
 
     #[test]
-    fn digest_no_concatenation_collision() {
-        // ("ab","c") vs ("a","bc") must not collide thanks to length-prefix framing.
-        let a = files(&[("ab", "c")]);
-        let b = files(&[("a", "bc")]);
-        assert_ne!(compute_digest(&a), compute_digest(&b));
+    fn reconcile_only_desc_changed_writes_file() {
+        // The mirror direction: a stale file must not overwrite a changed description.
+        let base = hash_content("old");
+        assert_eq!(reconcile(Some("old"), "new", Some(&base)), Reconcile::DescToFile);
+    }
+
+    #[test]
+    fn reconcile_both_diverged_known_base_is_conflict() {
+        let base = hash_content("base");
+        assert_eq!(reconcile(Some("mine"), "theirs", Some(&base)), Reconcile::Conflict);
+    }
+
+    #[test]
+    fn reconcile_empty_desc_nonempty_file_pushes() {
+        // The original bug's fix direction: empty description never overwrites a file.
+        assert_eq!(reconcile(Some("RICH"), "", Some("")), Reconcile::FileToDesc);
+        assert_eq!(reconcile(Some("RICH"), "", None), Reconcile::FileToDesc);
+    }
+
+    #[test]
+    fn reconcile_empty_file_nonempty_desc_restores() {
+        // An emptied file never overwrites a non-empty description.
+        assert_eq!(reconcile(Some(""), "RICH", Some("RICH")), Reconcile::DescToFile);
+        assert_eq!(reconcile(Some(""), "RICH", None), Reconcile::DescToFile);
+    }
+
+    #[test]
+    fn reconcile_base_none_both_nonempty_differ_biases_to_file() {
+        // Recoverable bias — never Conflict on a missing baseline.
+        assert_eq!(reconcile(Some("file"), "desc", None), Reconcile::FileToDesc);
+    }
+
+    // -- anchor (poison-proof) --
+
+    #[test]
+    fn anchor_advances_only_when_equal() {
+        let prev = map(&[("a", "old-a"), ("b", "old-b")]);
+        // a: sides equal → advance to hash; b: sides differ (failed flush) → keep old.
+        let observed = obs(&[("a", Some("X"), "X"), ("b", Some("RICH"), "")]);
+        let next = anchor(&prev, &observed);
+        assert_eq!(next.get("a"), Some(&hash_content("X")));
+        assert_eq!(next.get("b"), Some(&"old-b".to_string()), "failed-flush bookmark keeps prior baseline (no poisoning)");
+    }
+
+    #[test]
+    fn anchor_ignores_newline_only_for_equality() {
+        let next = anchor(&BTreeMap::new(), &obs(&[("a", Some("p\n"), "p")]));
+        assert_eq!(next.get("a"), Some(&hash_content("p")));
+    }
+
+    #[test]
+    fn anchor_absent_file_does_not_advance() {
+        let prev = map(&[("a", "old")]);
+        let next = anchor(&prev, &[("a".to_string(), None, "desc".to_string())]);
+        assert_eq!(next.get("a"), Some(&"old".to_string()));
     }
 
     // -- is_drifted --
 
     #[test]
     fn drift_when_no_baseline() {
-        assert!(is_drifted("anything", None));
+        assert!(is_drifted(&map(&[("a", "h")]), None));
     }
 
     #[test]
-    fn no_drift_when_digests_match() {
-        let state = SyncState::new("abc123");
-        assert!(!is_drifted("abc123", Some(&state)));
+    fn no_drift_when_hashes_match_baselines() {
+        let state = SyncState::new(map(&[("a", "h1"), ("b", "h2")]));
+        assert!(!is_drifted(&map(&[("a", "h1"), ("b", "h2")]), Some(&state)));
     }
 
     #[test]
-    fn drift_when_digests_differ() {
-        let state = SyncState::new("abc123");
-        assert!(is_drifted("def456", Some(&state)));
+    fn drift_when_a_hash_differs() {
+        let state = SyncState::new(map(&[("a", "h1")]));
+        assert!(is_drifted(&map(&[("a", "CHANGED")]), Some(&state)));
+    }
+
+    #[test]
+    fn drift_when_a_bookmark_appears() {
+        let state = SyncState::new(map(&[("a", "h1")]));
+        assert!(is_drifted(&map(&[("a", "h1"), ("b", "h2")]), Some(&state)));
     }
 
     // -- persistence (mirrors pr_cache tests) --
@@ -246,8 +421,7 @@ mod tests {
     #[test]
     fn path_is_under_jj_repo() {
         let temp = fake_workspace();
-        let path = sync_state_path(temp.path());
-        assert!(path.ends_with(".jj/repo/jj-plan/sync-state.toml"));
+        assert!(sync_state_path(temp.path()).ends_with(".jj/repo/jj-plan/sync-state.toml"));
     }
 
     #[test]
@@ -257,14 +431,24 @@ mod tests {
     }
 
     #[test]
-    fn save_load_roundtrip() {
+    fn save_load_roundtrip_v2() {
         let temp = fake_workspace();
-        let state = SyncState::new("deadbeef");
+        let state = SyncState::new(map(&[("feat-auth", "deadbeef"), ("fix-login", "cafef00d")]));
         save_sync_state(temp.path(), &state).unwrap();
 
         let loaded = load_sync_state(temp.path()).unwrap();
-        assert_eq!(loaded.digest, "deadbeef");
         assert_eq!(loaded.version, SYNC_STATE_VERSION);
+        assert_eq!(loaded.baselines, state.baselines);
+    }
+
+    #[test]
+    fn load_v1_digest_format_returns_none() {
+        // A v1 file (aggregate digest, version = 1) must load as None → one self-healing flush.
+        let temp = fake_workspace();
+        let path = sync_state_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "version = 1\ndigest = \"abc123\"\n").unwrap();
+        assert!(load_sync_state(temp.path()).is_none());
     }
 
     #[test]
@@ -279,7 +463,7 @@ mod tests {
     #[test]
     fn saved_file_has_safe_to_delete_header() {
         let temp = fake_workspace();
-        save_sync_state(temp.path(), &SyncState::new("x")).unwrap();
+        save_sync_state(temp.path(), &SyncState::new(map(&[("a", "x")]))).unwrap();
         let content = fs::read_to_string(sync_state_path(temp.path())).unwrap();
         assert!(content.contains("Safe to delete"));
     }

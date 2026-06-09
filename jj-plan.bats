@@ -2325,3 +2325,72 @@ EOF
   # Env var set to regular should produce │ description lines
   [[ "$output" == *"│"*"Refactor auth"* ]]
 }
+
+# =============================================================================
+# Reconcile (three-way): neither flush nor sync clobbers; failed flush can't poison
+# =============================================================================
+
+# Run a single command with a fake `jj` (after the shim on PATH) that silently no-ops
+# `describe` and delegates everything else to real jj — simulating a failing flush
+# without instrumenting the binary. The shim resolves the fake as its "real jj".
+with_failing_describe() {
+  local fake="$BATS_TEST_TMPDIR/fakejj"
+  mkdir -p "$fake"
+  cat > "$fake/jj" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [ "\$a" = "describe" ] && exit 0; done
+exec "$REAL_JJ" "\$@"
+EOF
+  chmod +x "$fake/jj"
+  PATH="$SHIM_DIR:$fake:/opt/homebrew/bin:/usr/bin:/bin" "$@"
+}
+
+@test "reconcile: a failing flush does not clobber an authored plan file" {
+  jj status >/dev/null                       # materialize a-01-start.md (empty), seed baseline
+  printf 'feat: real plan\n\n# Background\nMUST NOT be lost\n' > "$(plan_file start)"
+  with_failing_describe jj status            # flush describe fails — must NOT zero the file
+  run cat "$(plan_file start)"
+  [[ -n "$output" ]]
+  [[ "$output" == *"MUST NOT be lost"* ]]
+}
+
+@test "reconcile: a failed summary flush does not poison the baseline" {
+  jj status >/dev/null
+  printf 'feat: real plan\n\nMUST NOT be lost\n' > "$(plan_file start)"
+  with_failing_describe jj plan summary >/dev/null   # flush fails; baseline must not advance
+  with_failing_describe jj status                    # flush fails again; file must survive
+  run cat "$(plan_file start)"
+  [[ "$output" == *"MUST NOT be lost"* ]]
+}
+
+@test "reconcile: a stale file does not clobber an out-of-band description change" {
+  jjdesc -m "version one"                     # file == desc == baseline
+  [[ "$(cat "$(plan_file start)")" == "version one" ]]
+  local cid; cid=$("$REAL_JJ" log -r start -T 'change_id.shortest(8)' --no-graph)
+  "$REAL_JJ" describe -r "$cid" -m "rebased description v2" >/dev/null 2>&1  # desc changes; file stale
+  jj status >/dev/null                        # flush must NOT push the stale file over the new desc
+  [[ "$("$REAL_JJ" log -r start -T description --no-graph)" == *"rebased description v2"* ]]
+  [[ "$(cat "$(plan_file start)")" == *"rebased description v2"* ]]   # file adopts the new desc
+}
+
+@test "reconcile: a true conflict preserves the file and writes .incoming" {
+  jjdesc -m "common base"
+  local cid; cid=$("$REAL_JJ" log -r start -T 'change_id.shortest(8)' --no-graph)
+  "$REAL_JJ" describe -r "$cid" -m "their version" >/dev/null 2>&1     # desc diverges
+  printf 'my version MUST NOT be lost\n' > "$(plan_file start)"        # file diverges
+  jj status >/dev/null 2>&1
+  [[ "$(cat "$(plan_file start)")" == *"my version MUST NOT be lost"* ]]   # file preserved
+  run cat "$(plan_file start)".incoming
+  [[ "$output" == *"their version"* ]]                                # incoming surfaced
+}
+
+@test "reconcile: squashing an authored plan keeps its content recoverable on disk" {
+  jjdesc -m "base plan"
+  jj plan new tip >/dev/null
+  printf 'feat: tip work\n\nMUST NOT be lost\n' > "$(plan_file tip)"
+  jj status >/dev/null                        # flush tip content to desc + baseline
+  jj squash -u >/dev/null 2>&1                # discards tip desc; tip plan file removed
+  # Content must survive somewhere under .jj-plan (snapshot/orphan), not vanish from disk.
+  run grep -rl "MUST NOT be lost" .jj-plan
+  [[ "$status" -eq 0 ]]
+}

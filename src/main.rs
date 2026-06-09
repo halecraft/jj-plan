@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use jj_plan::commands;
@@ -92,8 +93,9 @@ struct DriftGateContext {
     registry: PlanRegistry,
     error_state: bool,
     drifted: bool,
-    /// Digest of the current plan-file set (empty/unused in the error state).
-    digest: String,
+    /// Per-bookmark baselines from the last sync (empty if none/old version). Used to
+    /// `anchor` after a flush so a failed flush cannot poison the baseline.
+    prev_baselines: BTreeMap<String, String>,
 }
 
 /// GATHER: resolve repo + plan dir and compute the cheap drift signal.
@@ -110,14 +112,14 @@ fn gather_drift_gate_context(repository_override: Option<&str>) -> Option<DriftG
 
     // In the error state we never flush (matches flush_all), so skip the
     // file reads entirely — `drifted` is irrelevant.
-    let (digest, drifted) = if error_state {
-        (String::new(), false)
+    let (prev_baselines, drifted) = if error_state {
+        (BTreeMap::new(), false)
     } else {
-        let contents = sync_state::gather_plan_file_contents(&plan_dir.path, &registry);
-        let digest = sync_state::compute_digest(&contents);
+        let current = sync_state::current_file_hashes(&plan_dir.path, &registry);
         let stored = sync_state::load_sync_state(&repo_root);
-        let drifted = sync_state::is_drifted(&digest, stored.as_ref());
-        (digest, drifted)
+        let drifted = sync_state::is_drifted(&current, stored.as_ref());
+        let prev_baselines = stored.map(|s| s.baselines).unwrap_or_default();
+        (prev_baselines, drifted)
     };
 
     Some(DriftGateContext {
@@ -126,7 +128,7 @@ fn gather_drift_gate_context(repository_override: Option<&str>) -> Option<DriftG
         registry,
         error_state,
         drifted,
-        digest,
+        prev_baselines,
     })
 }
 
@@ -151,13 +153,15 @@ fn run_drift_gated_readonly(
 
     if let (ReadGate::FlushThenExec, Some(c)) = (gate, &ctx) {
         // Degrade to a plain exec if jj-lib can't open (e.g. version mismatch).
-        if let Some(workspace) = workspace::Workspace::open(&c.repo_root) {
+        if let Some(mut workspace) = workspace::Workspace::open(&c.repo_root) {
             flush::flush_all(&c.plan_dir.path, jj, &workspace, &c.registry);
-            // Files are unchanged by flush, so the digest we computed still holds.
-            let _ = sync_state::save_sync_state(
-                &c.repo_root,
-                &sync_state::SyncState::new(c.digest.clone()),
-            );
+            // Re-read post-flush descriptions and advance baselines only for bookmarks now
+            // confirmed equal — a failed flush leaves file != desc and is NOT recorded
+            // (no poisoning). This replaces the old "save the file digest unconditionally".
+            workspace.reload();
+            let observed = flush::observe(&c.plan_dir.path, &workspace, &c.registry);
+            let next = sync_state::anchor(&c.prev_baselines, &observed);
+            let _ = sync_state::save_sync_state(&c.repo_root, &sync_state::SyncState::new(next));
         }
     }
 

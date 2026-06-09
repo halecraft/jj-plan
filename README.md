@@ -81,6 +81,8 @@ jj stack auth gitea test      # Gitea  (via GITEA_TOKEN + GITEA_HOST)
 
 Every `jj` command you run — `status`, `new`, `edit`, `rebase` — automatically syncs the `.jj-plan/` directory with change descriptions. Plan files are always the source of truth. Even read-only inspection commands (`jj log`, `jj show`, `jj evolog`) reflect a freshly edited plan file: they run a near-zero-cost content-hash check and flush pending edits only when the plan files have actually changed — so `jj log` never shows a stale description, while staying a pure passthrough when nothing changed.
 
+**Your plan text is never silently overwritten.** Sync uses a three-way reconcile (like a merge): your file and its description are only updated when one side cleanly changed. If both sides changed in conflicting ways, jj-plan **keeps your file untouched**, writes the incoming description next to it as `<plan>.md.incoming`, and prints a warning. Every overwrite or removal first snapshots the prior content to `.jj-plan/.history/`, so nothing is lost from disk. (To clear a plan, untrack or abandon the change — emptying a file is treated as accidental and restored.)
+
 ### What you see
 
 `jj status` appends the plan stack:

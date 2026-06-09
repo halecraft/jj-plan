@@ -31,5 +31,5 @@ if $BUILD; then
   cargo build --release
 fi
 
-echo "Running 138 bats tests (--jobs $JOBS)..."
+echo "Running 176 bats tests (--jobs $JOBS)..."
 exec bats jj-plan.bats --jobs "$JOBS"

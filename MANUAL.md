@@ -56,6 +56,18 @@ Created by `mkdir .jj-plan` to activate jj-plan in a repository. The binary main
 
 Files are named `NN-BOOKMARKNAME.md` where `NN` is the 1-based position in the stack. Bookmarks containing `/` have slashes encoded as `--` in filenames (e.g., `stack/auth` → `01-stack--auth.md`).
 
+#### Recovering plan files
+
+Sync never silently overwrites your plan text. It reconciles each plan file with its change description three ways (your file, the description, and the last-synced baseline) and only adopts a change when one side cleanly changed. When it can't, it preserves your file and leaves recovery artifacts in `.jj-plan/` (all gitignored, none treated as plan files):
+
+| Artifact | When | Contains |
+|---|---|---|
+| `.history/<hash>-<bookmark>.md` | before any overwrite or removal | the prior file content |
+| `<plan>.md.incoming` | a write conflict (both sides changed) | the incoming description; your file is kept as-is |
+| `<plan>.md.orphan` | a file with unflushed edits leaves the stack | the content that would otherwise have been removed |
+
+A warning is printed whenever an `.incoming` or `.orphan` is written. To intentionally clear a plan, untrack or abandon the change — emptying a plan file is treated as accidental and restored from the description.
+
 #### `stack.md`
 
 The `stack.md` file is a rendered markdown document showing the full stack visualization. It is regenerated on every sync. For multi-stack repositories, it shows all stacks in a column layout with headers.
