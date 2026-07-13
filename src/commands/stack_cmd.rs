@@ -241,7 +241,7 @@ fn run_stack_untrack(
     for name in &plan_names {
         registry_mut.untrack(name);
     }
-    plan_registry::save_registry(&repo_root, &registry_mut);
+    plan_registry::save_registry(&repo_root, &mut registry_mut)?;
 
     // 6. Delete the stack base bookmark if one exists
     if let Some(ref bb) = base_bookmark
@@ -260,8 +260,7 @@ fn run_stack_untrack(
 
     // 8. Sync and show updated state
     workspace.reload();
-    let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::sync_and_show(plan_dir, workspace, &registry_mut, format);
 
     Ok(0)
 }
@@ -1088,7 +1087,11 @@ async fn run_merge_async(
         // ── 3. Per-merge cleanup ─────────────────────────────────
         pr_cache.remove(bookmark);
         registry_mut.untrack(bookmark);
-        crate::plan_registry::save_registry(repo_root, &registry_mut);
+        // Warn rather than abort: the PR is already merged on the forge, so bailing out
+        // here would strand the remaining merges without undoing anything.
+        if let Err(e) = crate::plan_registry::save_registry(repo_root, &mut registry_mut) {
+            eprintln!("Warning: failed to save plan registry: {e}");
+        }
         if let Err(e) = save_pr_cache(repo_root, &pr_cache) {
             eprintln!("Warning: failed to save PR cache: {e}");
         }

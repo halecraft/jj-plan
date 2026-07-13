@@ -41,11 +41,9 @@ pub fn sync(
     // EXECUTE — thin imperative shell
     execute_sync(dir, &plan);
 
-    // ADVANCE baselines from the executed outcomes, pruned to bookmarks still present.
-    let present: HashSet<&str> = plan.observations.iter().map(|(bm, _, _)| bm.as_str()).collect();
-    let mut next = sync_state::anchor(baselines, &plan.observations);
-    next.retain(|bm, _| present.contains(bm.as_str()));
-    next
+    // ADVANCE baselines from the executed outcomes (pruned to still-tracked bookmarks —
+    // see `advance_baselines` for why the predicate must be repo-global, not stack-local).
+    sync_state::advance_baselines(baselines, &plan.observations, |bm| registry.is_tracked(bm))
 }
 
 /// Set error state: write `error.md` and emit warning.

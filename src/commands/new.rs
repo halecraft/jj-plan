@@ -268,7 +268,9 @@ pub fn run_new(
         PlannedBookmark::new(bookmark_name.clone(), full_change_id)
     };
     registry_mut.track(planned);
-    plan_registry::save_registry(&repo_root, &registry_mut);
+    // Must succeed before we claim the plan exists: an unwritten registry means the
+    // bookmark is invisible to every later command. Context: jj:mqmkxzlv
+    plan_registry::save_registry(&repo_root, &mut registry_mut)?;
 
     // ------------------------------------------------------------------
     // 7. Set templated description
@@ -286,8 +288,7 @@ pub fn run_new(
         eprintln!("Created plan: {} (jj:{})", bookmark_name, new_change_id);
     }
     workspace.reload();
-    let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::full_sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, &registry_mut, format);
 
     Ok(0)
 }

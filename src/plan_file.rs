@@ -263,23 +263,36 @@ pub fn write_or_warn(path: &Path, content: &str) {
     }
 }
 
-/// Write content atomically (temp file in the same directory, then `rename`), warning on
-/// failure. The rename is atomic on the same filesystem, so a reader never sees a
-/// half-written plan file. The temp name (`.NAME.tmp`) is not a plan file (no `.md`
-/// suffix), so it is invisible to `collect_plan_files` even if a crash leaves it behind.
-pub fn write_atomic_or_warn(path: &Path, content: &str) {
+/// Write content atomically: temp file in the same directory, then `rename`.
+///
+/// The rename is atomic on the same filesystem, so a reader never sees a half-written
+/// file. The temp name (`.NAME.tmp`) is not a plan file (no `.md` suffix), so it is
+/// invisible to `collect_plan_files` even if a crash leaves it behind. A failed write
+/// cleans up its own temp file.
+///
+/// Note this prevents a *torn* file; it does not serialize concurrent read-modify-write
+/// cycles (two processes can still lose an update). Used for plan files and for the
+/// `.jj/repo/jj-plan/` metadata sidecars.
+pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
-        return write_or_warn(path, content);
+        return fs::write(path, content);
     };
     let tmp = dir.join(format!(".{}.tmp", name.to_string_lossy()));
     let result = fs::write(&tmp, content).and_then(|()| fs::rename(&tmp, path));
-    if let Err(e) = result {
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// [`write_atomic`], warning on failure instead of propagating.
+pub fn write_atomic_or_warn(path: &Path, content: &str) {
+    if let Err(e) = write_atomic(path, content) {
         eprintln!(
             "jj-plan: warning: failed to write {}: {}",
             path.display(),
             e
         );
-        let _ = fs::remove_file(&tmp);
     }
 }
 

@@ -1064,8 +1064,12 @@ fn build_minimal_settings() -> std::result::Result<UserSettings, JjPlanError> {
 fn build_minimal_config(repo_root: &Path) -> Option<StackedConfig> {
     let mut config = StackedConfig::with_defaults();
 
-    // Load repo-level config if it exists (may contain revset-aliases.trunk())
-    let repo_config_path = repo_root.join(".jj").join("repo").join("config.toml");
+    // Load repo-level config if it exists (may contain revset-aliases.trunk()).
+    // Must go through resolve_repo_path: in a `jj workspace add` workspace `.jj/repo` is a
+    // pointer *file*, so the hand-built `.jj/repo/config.toml` silently failed `is_file()`
+    // and the layer was dropped — giving the workspace jj's default trunk() while the
+    // default workspace used the configured one. Context: jj:mqmkxzlv
+    let repo_config_path = crate::plan_dir::resolve_repo_path(repo_root).join("config.toml");
     if repo_config_path.is_file()
         && let Ok(content) = std::fs::read_to_string(&repo_config_path)
             && let Ok(doc) = content.parse::<toml_edit::DocumentMut>() {

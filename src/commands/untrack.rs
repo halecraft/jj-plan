@@ -80,15 +80,14 @@ pub fn run_untrack(
     // ------------------------------------------------------------------
     let mut registry_mut = plan_registry::load_registry(&repo_root);
     registry_mut.untrack(&bookmark_name);
-    plan_registry::save_registry(&repo_root, &registry_mut);
+    plan_registry::save_registry(&repo_root, &mut registry_mut)?;
 
     // ------------------------------------------------------------------
     // 5. Reload, sync, and show
     // ------------------------------------------------------------------
     eprintln!("Untracked plan: {}", bookmark_name);
     workspace.reload();
-    let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::sync_and_show(plan_dir, workspace, &registry_mut, format);
 
     Ok(0)
 }

@@ -1066,6 +1066,21 @@ jj new                             # start fresh on trunk
 jj plan new next-feature           # new stack begins
 ```
 
+### Plan in a second working copy (jj workspace)
+
+`jj workspace add` gives you another working copy over the same repo. jj-plan works in it, but each workspace must be activated — `.jj-plan/` is gitignored, so a new workspace starts without one:
+
+```sh
+jj workspace add ../feature-b      # second working copy, same repo
+mkdir ../feature-b/.jj-plan        # activate jj-plan here
+cd ../feature-b
+jj plan new my-feature             # works; registry is shared with the main workspace
+```
+
+The plan **registry** and **PR cache** are shared across all workspaces of a repo (bookmarks and PRs are repo-global), so `jj plan new` in one workspace is visible from any of them. The plan **files** are per-workspace — each `.jj-plan/` only ever holds the plans in that workspace's own stack, and syncing one workspace never touches another's files.
+
+Avoid running jj-plan commands in two workspaces at literally the same moment: the shared registry is written read-modify-write, so a concurrent pair could drop an entry (recover with `jj plan track <bookmark>`).
+
 ### Cross-reference plans
 
 Plans can reference each other by change ID:

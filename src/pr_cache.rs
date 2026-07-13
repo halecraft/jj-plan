@@ -4,7 +4,7 @@
 //! deleted — it will be rebuilt on the next submit.
 
 use crate::error::{JjPlanError, Result};
-use crate::plan_registry::resolve_repo_path;
+use crate::plan_dir::meta_path;
 use crate::types::{CachedPr, PullRequest};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -16,9 +16,6 @@ pub const PR_CACHE_VERSION: u32 = 1;
 
 /// Filename for PR cache.
 const PR_CACHE_FILE: &str = "pr-cache.toml";
-
-/// Directory name for jj-plan metadata within `.jj/repo/`.
-const JJ_PLAN_DIR: &str = "jj-plan";
 
 /// PR cache state.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,9 +83,7 @@ impl PrCache {
 
 /// Get path to the PR cache file.
 pub fn pr_cache_path(workspace_root: &Path) -> PathBuf {
-    resolve_repo_path(workspace_root)
-        .join(JJ_PLAN_DIR)
-        .join(PR_CACHE_FILE)
+    meta_path(workspace_root, PR_CACHE_FILE)
 }
 
 /// Load PR cache from disk.
@@ -135,7 +130,7 @@ pub fn save_pr_cache(workspace_root: &Path, cache: &PrCache) -> Result<()> {
          # Safe to delete; will be rebuilt on next submit\n\n{content}"
     );
 
-    fs::write(&path, content_with_header)?;
+    crate::plan_file::write_atomic(&path, &content_with_header)?;
 
     Ok(())
 }

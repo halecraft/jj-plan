@@ -2444,3 +2444,53 @@ EOF
   [[ "$desc" != *'> [!plan] status:'* ]]        # desc was NOT rewritten to the inline form (no churn)
   grep -q '> \[!plan\] status: ✅' "$(plan_file start)"   # file's inline form left untouched
 }
+
+# =============================================================================
+# jj workspaces (jj:mqmkxzlv)
+# =============================================================================
+#
+# In a `jj workspace add` workspace, `.jj/repo` is a *file* whose contents are a
+# path to the shared repo dir, relative to the `.jj/` dir. jj-plan used to treat
+# it as an absolute path, fall back to the pointer file's own path, and then try
+# to mkdir inside it — so the registry never persisted and every plan was
+# invisible. That produced the giveaway pair: "Created plan: X" immediately
+# followed by "No plans between trunk and working copy".
+
+@test "workspace: jj plan new persists to the shared repo dir and renders" {
+  local WS="$BATS_TEST_TMPDIR/wsb"
+  "$REAL_JJ" workspace add "$WS" >/dev/null 2>&1
+  mkdir -p "$WS/.jj-plan"
+
+  cd "$WS"
+  run jj plan new feat-ws
+
+  # 1. The pointer resolved: no mkdir-inside-a-file.
+  [[ "$output" != *"failed to create"* ]]
+  [[ "$output" != *"Not a directory"* ]]
+
+  # 2. The registry landed in the SHARED repo dir, not the workspace's own .jj/.
+  #    This is the assertion that proves resolution, not merely a missing warning.
+  grep -q 'name = "feat-ws"' "$TEST_REPO/.jj/repo/jj-plan/plans.toml"
+  [ ! -e "$WS/.jj/repo/jj-plan" ]
+
+  # 3. The plan is visible — the symptom from the original report is gone.
+  [[ "$output" != *"No plans between trunk and working copy"* ]]
+  [[ "$output" == *"Created plan: feat-ws"* ]]
+
+  # 4. The plan file exists in the workspace's own (per-workspace) plan dir.
+  [ -f "$(plan_file feat-ws "$WS/.jj-plan")" ]
+}
+
+@test "workspace: plan files are per-workspace, registry is shared" {
+  local WS="$BATS_TEST_TMPDIR/wsc"
+  "$REAL_JJ" workspace add "$WS" >/dev/null 2>&1
+  mkdir -p "$WS/.jj-plan"
+
+  cd "$WS"
+  jj plan new feat-ws >/dev/null 2>&1
+
+  # The default workspace's plan dir is untouched by the workspace's sync.
+  [ ! -f "$(plan_file feat-ws "$TEST_REPO/.jj-plan")" ]
+  # But the default workspace can see the plan in the shared registry.
+  grep -q 'name = "feat-ws"' "$TEST_REPO/.jj/repo/jj-plan/plans.toml"
+}

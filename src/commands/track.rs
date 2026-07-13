@@ -156,7 +156,7 @@ pub fn run_track(
         bookmark_name.clone(),
         bookmark.change_id.clone(),
     ));
-    plan_registry::save_registry(&repo_root, &registry_mut);
+    plan_registry::save_registry(&repo_root, &mut registry_mut)?;
 
     // ------------------------------------------------------------------
     // 6. Reload, sync, and show
@@ -166,8 +166,7 @@ pub fn run_track(
         bookmark_name, bookmark.change_id
     );
     workspace.reload();
-    let post_registry = plan_registry::load_registry(&repo_root);
-    crate::wrap::full_sync_and_show(plan_dir, workspace, &post_registry, format);
+    crate::wrap::full_sync_and_show(plan_dir, workspace, &registry_mut, format);
 
     Ok(0)
 }

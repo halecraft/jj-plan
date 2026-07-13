@@ -304,6 +304,20 @@ You and an AI agent both edit these markdown files — no `jj describe` clobberi
 
 Any heading marked `[scratch]` is working memory. `jj plan done` strips all scratch sections, cleaning the archival record while preserving conclusions. The full working memory is always recoverable via `jj evolog`.
 
+### jj workspaces are supported
+
+`jj workspace add` gives you a second working copy over the same repo, and jj-plan works in it. Because bookmarks and PRs are repo-global, the plan registry and PR cache are **shared** across all workspaces of a repo — a plan created in one workspace is visible from any of them.
+
+The one thing you must do is **activate each workspace**. `.jj-plan/` is gitignored, so a fresh workspace doesn't have one:
+
+```sh
+jj workspace add ../feature-b
+mkdir ../feature-b/.jj-plan     # activate jj-plan in the new workspace
+cd ../feature-b && jj plan new my-feature
+```
+
+Plan *files* are per-workspace (they live in the working copy); the registry behind them is not.
+
 ---
 
 ## Key Properties

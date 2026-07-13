@@ -1,6 +1,79 @@
+//! Repo root, shared-repo, and plan directory resolution.
+//!
+//! # Why jj-lib's `WorkspaceLoader` is mirrored here, not called
+//!
+//! [`resolve_repo_path`] duplicates six lines of `jj_lib::workspace::WorkspaceLoader::new`
+//! rather than delegating to it. That is deliberate: this function runs on the *pre-jj-lib*
+//! path. The read-path drift gate exists precisely to answer "has any plan file drifted?"
+//! **without** paying `Workspace::open` (see TECHNICAL.md, "Read-path drift gate"), and it
+//! must locate `sync-state.toml` to do so. Opening the workspace in order to decide whether
+//! we need to open the workspace would forfeit the entire optimization on every `jj log`.
+//!
+//! The upstream semantics have been stable for years, and the mirror is pinned by
+//! [`tests::pointer_relative_resolves_against_jj_dir`].
+
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::stack_render::StackFormat;
+
+/// Directory name for jj-plan's metadata within the shared `.jj/repo/`.
+///
+/// Not to be confused with the `JJ_PLAN_DIR` **env var** read by [`resolve_plan_dir`],
+/// which points at the `.jj-plan/` *plan-file* directory — an unrelated concept that
+/// happens to live in this same module.
+const META_DIR: &str = "jj-plan";
+
+/// Where does the shared repo dir live, given the `.jj` dir and the raw contents of a
+/// `.jj/repo` pointer file?
+///
+/// Pure — this one expression *is* the workspace fix. In a non-default jj workspace
+/// (`jj workspace add`), `.jj/repo` is a **file** whose contents are a path to the shared
+/// repo dir **relative to the `.jj/` directory that contains it** — not to the process
+/// CWD, and not to the workspace root. `Path::join` also absorbs the absolute case for
+/// free (an absolute right-hand side replaces the left), so one expression covers both.
+///
+/// Context: jj:mqmkxzlv
+fn resolve_pointer(jj_dir: &Path, contents: &str) -> PathBuf {
+    jj_dir.join(contents.trim())
+}
+
+/// Resolve the shared repo directory (`.jj/repo`) for a workspace root.
+///
+/// In the default workspace `.jj/repo` is a plain directory and is returned as-is. In a
+/// workspace created by `jj workspace add` it is a pointer *file*, which is resolved via
+/// [`resolve_pointer`]. Mirrors `jj_lib::workspace::WorkspaceLoader::new`; see the module
+/// docs for why it is mirrored rather than called.
+///
+/// Never returns the pointer file's own path. A dangling or unreadable pointer yields a
+/// non-existent *directory* path, which `create_dir_all` can simply create; aliasing the
+/// pointer *file* is what made `create_dir_all` try to mkdir inside a regular file →
+/// `ENOTDIR`, which is exactly how the original workspace bug presented.
+pub fn resolve_repo_path(workspace_root: &Path) -> PathBuf {
+    let jj_dir = workspace_root.join(".jj");
+    let repo_path = jj_dir.join("repo");
+
+    if !repo_path.is_file() {
+        return repo_path;
+    }
+
+    let target = fs::read_to_string(&repo_path)
+        .map(|contents| resolve_pointer(&jj_dir, &contents))
+        // An unreadable pointer still must not resolve to the pointer file itself.
+        .unwrap_or_else(|_| resolve_pointer(&jj_dir, ""));
+
+    fs::canonicalize(&target).unwrap_or(target)
+}
+
+/// Path to a jj-plan metadata file in the shared repo dir: `.jj/repo/jj-plan/<file>`.
+///
+/// The single place this path is constructed. `plans.toml`, `pr-cache.toml`, and
+/// `sync-state.toml` all route through here, as does anything added later — the metadata
+/// path used to be hand-built in four places, and the one that drifted out of sync
+/// (`workspace.rs`) is what broke jj workspaces.
+pub fn meta_path(workspace_root: &Path, file: &str) -> PathBuf {
+    resolve_repo_path(workspace_root).join(META_DIR).join(file)
+}
 
 /// Discover the jj repo root by walking up from an arbitrary starting path
 /// looking for `.jj/`.
@@ -278,6 +351,123 @@ mod tests {
             .find(|p| p.join(".jj").is_dir())
             .map(|p| p.to_path_buf());
         assert_eq!(found, Some(root.to_path_buf()));
+    }
+
+    // --- Shared repo path resolution (jj workspace indirection) ---
+
+    /// The bug, in its purest form: jj writes the pointer path **relative to `.jj/`**, and
+    /// the old code treated it as absolute (testing `is_dir()` against the process CWD).
+    /// No fixture needed — this is the whole defect. Context: jj:mqmkxzlv
+    #[test]
+    fn pointer_relative_resolves_against_jj_dir() {
+        // Exactly what jj 0.42 writes into a workspace's .jj/repo.
+        let resolved = resolve_pointer(Path::new("/ws/floor-model/.jj"), "../../../synapse/.jj/repo");
+        assert_eq!(
+            resolved,
+            Path::new("/ws/floor-model/.jj/../../../synapse/.jj/repo")
+        );
+    }
+
+    #[test]
+    fn pointer_absolute_replaces_jj_dir() {
+        let resolved = resolve_pointer(Path::new("/ws/b/.jj"), "/repos/main/.jj/repo");
+        assert_eq!(resolved, Path::new("/repos/main/.jj/repo"));
+    }
+
+    #[test]
+    fn pointer_contents_are_trimmed() {
+        let resolved = resolve_pointer(Path::new("/ws/b/.jj"), "  ../a/.jj/repo\n");
+        assert_eq!(resolved, Path::new("/ws/b/.jj/../a/.jj/repo"));
+    }
+
+    #[test]
+    fn repo_path_regular_directory_is_returned_as_is() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(".jj").join("repo")).unwrap();
+
+        let resolved = resolve_repo_path(temp.path());
+        assert!(resolved.ends_with(".jj/repo"));
+        assert!(resolved.is_dir());
+    }
+
+    /// End-to-end shell over `resolve_pointer`, with the real relative layout jj produces.
+    #[test]
+    fn repo_path_follows_relative_pointer_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_repo = temp.path().join("main").join(".jj").join("repo");
+        fs::create_dir_all(&main_repo).unwrap();
+
+        let ws_jj = temp.path().join("ws").join(".jj");
+        fs::create_dir_all(&ws_jj).unwrap();
+        // Relative to the .jj dir — as jj writes it.
+        fs::write(ws_jj.join("repo"), "../../main/.jj/repo").unwrap();
+
+        let resolved = resolve_repo_path(&temp.path().join("ws"));
+        assert_eq!(resolved, fs::canonicalize(&main_repo).unwrap());
+    }
+
+    #[test]
+    fn repo_path_follows_absolute_pointer_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_repo = temp.path().join("main").join(".jj").join("repo");
+        fs::create_dir_all(&main_repo).unwrap();
+
+        let ws_jj = temp.path().join("ws").join(".jj");
+        fs::create_dir_all(&ws_jj).unwrap();
+        fs::write(ws_jj.join("repo"), main_repo.to_string_lossy().as_ref()).unwrap();
+
+        let resolved = resolve_repo_path(&temp.path().join("ws"));
+        assert_eq!(resolved, fs::canonicalize(&main_repo).unwrap());
+    }
+
+    /// A dangling pointer must never resolve to the pointer *file* itself. That aliasing is
+    /// what made `create_dir_all` try to mkdir *inside a regular file* → ENOTDIR, the
+    /// original workspace crash. Resolving to a merely non-existent directory is benign:
+    /// `create_dir_all` just creates it.
+    #[test]
+    fn dangling_pointer_never_resolves_to_the_pointer_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_jj = temp.path().join("ws").join(".jj");
+        fs::create_dir_all(&ws_jj).unwrap();
+        fs::write(ws_jj.join("repo"), "../../nowhere/.jj/repo").unwrap();
+
+        let resolved = resolve_repo_path(&temp.path().join("ws"));
+
+        assert_ne!(resolved, ws_jj.join("repo"));
+        assert!(!resolved.is_file());
+        // Whatever it is, a caller can create under it — no ENOTDIR.
+        fs::create_dir_all(resolved.join("jj-plan")).unwrap();
+    }
+
+    /// An unreadable pointer must not alias the pointer file either.
+    #[test]
+    fn empty_pointer_never_resolves_to_the_pointer_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_jj = temp.path().join("ws").join(".jj");
+        fs::create_dir_all(&ws_jj).unwrap();
+        fs::write(ws_jj.join("repo"), "").unwrap();
+
+        let resolved = resolve_repo_path(&temp.path().join("ws"));
+        assert!(!resolved.is_file());
+    }
+
+    #[test]
+    fn meta_path_composes_through_the_pointer() {
+        let temp = tempfile::tempdir().unwrap();
+        let main_repo = temp.path().join("main").join(".jj").join("repo");
+        fs::create_dir_all(&main_repo).unwrap();
+
+        let ws_jj = temp.path().join("ws").join(".jj");
+        fs::create_dir_all(&ws_jj).unwrap();
+        fs::write(ws_jj.join("repo"), "../../main/.jj/repo").unwrap();
+
+        let path = meta_path(&temp.path().join("ws"), "plans.toml");
+
+        // Lands in the *shared* repo dir, not the workspace's own .jj/.
+        assert_eq!(
+            path,
+            fs::canonicalize(&main_repo).unwrap().join("jj-plan").join("plans.toml")
+        );
     }
 
     #[test]

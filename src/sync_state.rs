@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{JjPlanError, Result};
+use crate::plan_dir::meta_path;
 use crate::plan_file::PlanFileEntry;
-use crate::plan_registry::resolve_repo_path;
 use crate::types::PlanRegistry;
 
 /// Current version of the sync-state file format.
@@ -39,9 +39,6 @@ pub const SYNC_STATE_VERSION: u32 = 2;
 
 /// Filename for the sync-state sidecar.
 const SYNC_STATE_FILE: &str = "sync-state.toml";
-
-/// Directory name for jj-plan metadata within `.jj/repo/`.
-const JJ_PLAN_DIR: &str = "jj-plan";
 
 // ---------------------------------------------------------------------------
 // Pure: normalization + content hashing
@@ -198,14 +195,52 @@ pub fn anchor(
     next
 }
 
+/// Advance baselines from executed outcomes, then drop entries for bookmarks that are no
+/// longer tracked at all.
+///
+/// Pure. The prune predicate is **registry membership**, deliberately *not* "bookmarks in
+/// this workspace's stack". The sidecar is shared across all workspaces of a repo, so
+/// pruning to the local stack would make every command in one workspace delete every other
+/// workspace's baselines, reopening their read gate on every command. The registry is
+/// repo-global, so this reaches the same verdict from any workspace while still keeping the
+/// map bounded as bookmarks are untracked or merged.
+///
+/// Context: jj:mqmkxzlv
+pub fn advance_baselines(
+    prev: &BTreeMap<String, String>,
+    observed: &[(String, Option<String>, String)],
+    is_tracked: impl Fn(&str) -> bool,
+) -> BTreeMap<String, String> {
+    let mut next = anchor(prev, observed);
+    next.retain(|bookmark, _| is_tracked(bookmark));
+    next
+}
+
 /// Decide whether plan files have drifted from the last confirmed baseline.
 ///
 /// Pure. A missing/unparseable/old-version baseline (`None`) counts as drift —
-/// conservatively forcing one flush. Otherwise compares the current per-bookmark file
-/// hashes against the stored baselines.
+/// conservatively forcing one flush.
+///
+/// Otherwise: drifted iff some plan file we *currently hold* disagrees with its stored
+/// baseline (or has none yet). This is a **subset** check, not whole-map equality, and the
+/// asymmetry is deliberate:
+///
+/// - A baseline with no corresponding file is **inert**. The sidecar lives in the shared
+///   `.jj/repo/` and `anchor` is additive, so it accumulates the union of every workspace's
+///   bookmarks — while each workspace only ever hashes its own `.jj-plan/`. Under whole-map
+///   equality the two could never match, so the gate stayed open *permanently* in every
+///   workspace and every `jj log` paid a full `Workspace::open` + flush. Stale baselines
+///   (from `jj plan untrack`, a merged stack, a hand-deleted file) were the same trap.
+/// - An *absent* file therefore does not signal drift — correctly, because flush is
+///   file→desc only, so an absent file has nothing to push. `reconcile` classifies it
+///   `DescToFile` and sync restores it from the description on the next mutating command.
+///
+/// Context: jj:mqmkxzlv
 pub fn is_drifted(current_file_hashes: &BTreeMap<String, String>, stored: Option<&SyncState>) -> bool {
     match stored {
-        Some(state) => &state.baselines != current_file_hashes,
+        Some(state) => current_file_hashes
+            .iter()
+            .any(|(bookmark, hash)| state.baselines.get(bookmark) != Some(hash)),
         None => true,
     }
 }
@@ -243,9 +278,7 @@ pub fn current_file_hashes(plan_dir: &Path, registry: &PlanRegistry) -> BTreeMap
 
 /// Path to the sync-state file (`.jj/repo/jj-plan/sync-state.toml`).
 pub fn sync_state_path(workspace_root: &Path) -> PathBuf {
-    resolve_repo_path(workspace_root)
-        .join(JJ_PLAN_DIR)
-        .join(SYNC_STATE_FILE)
+    meta_path(workspace_root, SYNC_STATE_FILE)
 }
 
 /// Load the recorded sync state, or `None` if missing, unparseable, or an old version.
@@ -279,10 +312,12 @@ pub fn save_sync_state(workspace_root: &Path, state: &SyncState) -> Result<()> {
 
     let content = format!(
         "# Plan-file reconcile baselines — per-bookmark hash of the content confirmed equal\n\
-         # on both sides at last sync. Safe to delete; a missing entry just forces one flush.\n\n{body}"
+         # on both sides at last sync. Safe to delete; a missing entry just forces one flush.\n\
+         # Shared across all workspaces of one repo; entries for bookmarks a given workspace\n\
+         # has no plan file for are inert (see `is_drifted`).\n\n{body}"
     );
 
-    fs::write(&path, content)?;
+    crate::plan_file::write_atomic(&path, &content)?;
     Ok(())
 }
 
@@ -433,6 +468,61 @@ mod tests {
     fn drift_when_a_bookmark_appears() {
         let state = SyncState::new(map(&[("a", "h1")]));
         assert!(is_drifted(&map(&[("a", "h1"), ("b", "h2")]), Some(&state)));
+    }
+
+    /// The sidecar is shared across all workspaces of a repo, so it accumulates baselines
+    /// for bookmarks this workspace has no plan file for. Under the old whole-map equality
+    /// those foreign entries made `is_drifted` return true *forever*, holding the read gate
+    /// open and forcing a full flush on every `jj log`. Context: jj:mqmkxzlv
+    #[test]
+    fn no_drift_from_another_workspaces_baselines() {
+        let state = SyncState::new(map(&[("a", "h1"), ("their-bookmark", "h9")]));
+        assert!(!is_drifted(&map(&[("a", "h1")]), Some(&state)));
+    }
+
+    /// Same shape, different cause: a baseline left behind by `jj plan untrack`, a merged
+    /// stack, or a hand-deleted plan file is inert rather than permanently drifting.
+    #[test]
+    fn no_drift_from_a_stale_baseline() {
+        let state = SyncState::new(map(&[("a", "h1"), ("untracked", "h2")]));
+        assert!(!is_drifted(&map(&[("a", "h1")]), Some(&state)));
+    }
+
+    /// Foreign baselines are ignored, but a real edit to *our* file is still caught.
+    #[test]
+    fn drift_still_detected_alongside_foreign_baselines() {
+        let state = SyncState::new(map(&[("a", "h1"), ("their-bookmark", "h9")]));
+        assert!(is_drifted(&map(&[("a", "EDITED")]), Some(&state)));
+    }
+
+    // -- advance_baselines: prune by registry, never by local stack --
+
+    /// The trap this guards: `sync` used to prune baselines to the bookmarks in *this
+    /// workspace's* stack. Since the sidecar is shared, a command in one workspace then
+    /// deleted the other's baselines, reopening its read gate on every command.
+    /// `their-bookmark` is tracked but absent from this workspace's observations — it must
+    /// survive. Context: jj:mqmkxzlv
+    #[test]
+    fn advance_keeps_tracked_bookmarks_absent_from_this_stack() {
+        let prev = map(&[("mine", "h1"), ("their-bookmark", "h9")]);
+        let observed = obs(&[("mine", Some("x"), "x")]);
+
+        let next = advance_baselines(&prev, &observed, |_| true);
+
+        assert_eq!(next.get("their-bookmark"), Some(&"h9".to_string()));
+        assert_eq!(next.get("mine"), Some(&hash_content("x")));
+    }
+
+    /// Growth is still bounded: an untracked/merged bookmark's baseline is dropped.
+    #[test]
+    fn advance_drops_untracked_bookmarks() {
+        let prev = map(&[("mine", "h1"), ("gone", "h2")]);
+        let observed = obs(&[("mine", Some("x"), "x")]);
+
+        let next = advance_baselines(&prev, &observed, |bm| bm != "gone");
+
+        assert!(!next.contains_key("gone"));
+        assert!(next.contains_key("mine"));
     }
 
     // -- persistence (mirrors pr_cache tests) --

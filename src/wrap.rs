@@ -159,7 +159,11 @@ pub fn auto_cleanup_merged_stacks(workspace: &mut Workspace, plan_dir: &PlanDir)
     for name in &bookmarks_to_untrack {
         registry.untrack(name);
     }
-    plan_registry::save_registry(&repo_root, &registry);
+    // Best-effort cleanup: warn but carry on — a failed save just means the merged stack
+    // gets re-detected and re-cleaned on the next command.
+    if let Err(e) = plan_registry::save_registry(&repo_root, &mut registry) {
+        eprintln!("jj-plan: warning: failed to save plan registry: {e}");
+    }
 
     for bb in &base_bookmarks_to_delete {
         let _ = workspace.delete_bookmark(bb);
@@ -330,7 +334,10 @@ pub fn cleanup_stale_and_migrate(
         for name in &stale {
             registry_mut.untrack(name);
         }
-        plan_registry::save_registry(&repo_root, &registry_mut);
+        // Best-effort: a failed save just means the stale entries are re-detected next time.
+        if let Err(e) = plan_registry::save_registry(&repo_root, &mut registry_mut) {
+            eprintln!("jj-plan: warning: failed to save plan registry: {e}");
+        }
         eprintln!(
             "jj-plan: auto-untracked {} abandoned bookmark(s): {}",
             stale.len(),

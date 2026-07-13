@@ -40,7 +40,7 @@ Read-only jj commands pass through via `exec`. `diff`/`interdiff` and the rest a
 | `src/sync.rs` | 587 | jj description → plan file sync (jj is authoritative post-flush); receives `stack_md_content` from caller |
 | `src/sync_state.rs` | — | Read-path drift signal: content digest of the plan-file set persisted at `.jj/repo/jj-plan/sync-state.toml`; pure `compute_digest`/`is_drifted` + `pr_cache`-shaped persistence |
 | `src/plan_file.rs` | 574 | Plan file parsing, bookmark name encoding, legacy migration |
-| `src/plan_dir.rs` | 219 | Repo root and plan directory resolution |
+| `src/plan_dir.rs` | 219 | Repo root, **shared-repo**, and plan directory resolution. Owns `resolve_repo_path()` (jj workspace pointer) and `meta_path()` — the single place `.jj/repo/jj-plan/<file>` is constructed |
 | `src/plan_registry.rs` | 229 | PlanRegistry persistence (`.jj/repo/jj-plan/plans.toml`) |
 | `src/pr_cache.rs` | 252 | PR cache persistence (`.jj/repo/jj-plan/pr-cache.toml`) |
 | `src/stack_context.rs` | 94 | Shared context for `jj stack` commands |
@@ -616,7 +616,14 @@ The gate never alters the command's stdout/stderr/exit: the flush is silent (`ru
 
 `jj plan summary` and bare `jj plan` use the same gate (in `run_summary`): they already hold an open workspace to read descriptions, so the gate only saves the redundant `flush_all` + `reload` round-trip when nothing drifted.
 
-**Known limitation (multi-workspace):** the sidecar lives under `resolve_repo_path` (shared across workspaces of one repo), while plan dirs are per-workspace, so two workspaces can clobber each other's digest — worst case an occasional needless flush (self-healing), never incorrectness.
+**Multi-workspace (`jj:mqmkxzlv`).** The sidecar is shared across all workspaces of a repo (it lives under `resolve_repo_path`), while plan dirs are per-workspace. `is_drifted` therefore compares **per-bookmark**, as a subset check — drifted iff some plan file *we currently hold* disagrees with its stored baseline (or has none yet). A baseline with no corresponding file is **inert**.
+
+This asymmetry is load-bearing. `is_drifted` used to compare the two maps for whole equality, and `anchor` is additive, so the shared sidecar accumulates the union of every workspace's bookmarks while each workspace only ever hashes its own `.jj-plan/`. The maps could then *never* be equal — so the gate stayed open **permanently** in every workspace and every `jj log`/`show`/`evolog` paid a full `Workspace::open` + flush, defeating the entire point of the gate. (An earlier revision of this document described that as "an occasional needless flush (self-healing), never incorrectness". The performance claim was wrong: it was every read, forever. The correctness claim held.) The same whole-map equality made a single stale baseline — from `jj plan untrack`, a merged stack, or a hand-deleted plan file — hold the gate open too.
+
+Consequences of the subset check, both deliberate:
+
+- An **absent** plan file no longer signals drift. Correct: flush is file→desc only, so an absent file has nothing to push. `reconcile` classifies it `DescToFile` and sync restores it from the description on the next mutating command.
+- Baselines are pruned by **registry membership**, never by "bookmarks in this workspace's stack" (`sync_state::advance_baselines`). The registry is repo-global, so the predicate reaches the same verdict from any workspace while still bounding the map as bookmarks are untracked or merged. Pruning to the local stack — which `sync()` originally did — makes every command in one workspace delete every other workspace's baselines, reopening their gate on every command.
 
 ---
 
@@ -689,9 +696,33 @@ The `stack` field is `Option<String>` — the standard-hex change ID of the stac
 
 `PlanRegistry::plans_in_stack(stack_id: Option<&str>)` returns all bookmarks matching a given stack value. When `stack_id` is `None`, returns all implicit trunk-stack plans.
 
-### Workspace indirection
+### Workspace indirection (`plan_dir::resolve_repo_path`)
 
-The registry handles jj workspace indirection — in child workspaces (created via `jj workspace add`), `.jj/repo` is a text file pointing to the parent's repo directory. `resolve_repo_path()` reads this pointer transparently.
+Workspaces created via `jj workspace add` each get their own root and `.jj/` directory but **share one repo directory** — object store, op log, and repo config. jj wires them together with a pointer file: in a non-default workspace, `.jj/repo` is not a directory but a plain file whose contents are a path to the shared repo dir, **relative to the `.jj/` directory that contains it**:
+
+```
+$ cat floor-model/.jj/repo
+../../../synapse/.jj/repo        # relative to floor-model/.jj/ — no trailing newline
+```
+
+`plan_dir::resolve_repo_path(workspace_root)` resolves this, mirroring jj-lib's `WorkspaceLoader::new` (`jj-lib/src/workspace.rs`): `jj_dir.join(contents)`, then canonicalize. `Path::join` absorbs the absolute case for free, so one expression covers both. All three sidecars (`plans.toml`, `pr-cache.toml`, `sync-state.toml`) reach it through `plan_dir::meta_path()`, which is the **only** place `.jj/repo/jj-plan/<file>` is built.
+
+**Gotcha — the trap that caused jj:mqmkxzlv.** The pointer is relative to `.jj/`, **not** to the process CWD and **not** to the workspace root. The original code read the pointer and tested `PathBuf::from(contents).is_dir()`, which silently resolves a relative path against the *CWD*. That is false almost everywhere, so it fell through to returning the **pointer file's own path** — and `create_dir_all` then tried to mkdir *inside a regular file*, yielding `ENOTDIR (os error 20)`. The registry write failed, the bookmark was never recorded, and `jj plan new` printed `Created plan: X` followed immediately by `No plans between trunk and working copy`.
+
+Two invariants now prevent a recurrence, both pinned by tests:
+
+- The decision is a **pure** function, `resolve_pointer(jj_dir, contents)` — the whole defect was one line of path algebra, and it is now testable with no filesystem fixture. (The old test passed because its *fixture* wrote an absolute path, which jj never does.)
+- `resolve_repo_path` **never returns the pointer file's own path**. A dangling pointer yields a non-existent *directory* path, which `create_dir_all` can simply create. Aliasing the pointer *file* is what made ENOTDIR reachable at all.
+
+**Why jj-lib's loader is mirrored rather than called:** `resolve_repo_path` runs on the pre-jj-lib path. The read-path drift gate exists to answer "has any plan file drifted?" *without* paying `Workspace::open`, and it must locate `sync-state.toml` to do so. Opening the workspace in order to decide whether to open the workspace would forfeit the optimization on every `jj log`.
+
+### Why the sidecars are shared, not per-workspace
+
+All three live in the shared repo dir, so every workspace of a repo sees one `plans.toml`, one `pr-cache.toml`, one `sync-state.toml`. This is correct rather than merely convenient: bookmarks, descriptions, and PRs are **repo-global**, so state keyed by them is too. Per-workspace registries would make `jj plan` in one workspace blind to plans created in another and break `jj stack --all`.
+
+The `.jj-plan/` **plan-file directory is per-workspace** — it lives in the working copy, is gitignored, and is therefore untracked. A fresh workspace starts without one, so **activation is per-workspace**: `mkdir .jj-plan` in each. Each workspace's sync only ever prunes its own plan dir.
+
+**Known limitation (concurrency):** two workspaces can now run jj-plan simultaneously against one sidecar. Writes are atomic (temp + `rename`, via `plan_file::write_atomic`), so a reader never sees a torn file — but they are still read-modify-write, so a genuinely concurrent pair could lose an entry. Recoverable via `jj plan track`.
 
 ### Expanded role in filename resolution
 
@@ -970,7 +1001,7 @@ updated_at = "2025-01-15T12:00:00Z"
 - **Cleaned** by `jj stack merge` (removes entries for merged bookmarks) and by `cleanup_stale_and_migrate` (prunes entries whose bookmarks no longer exist locally or in the plan registry).
 - **Safe to delete** — rebuilt on next submit.
 
-Uses `resolve_repo_path()` from `plan_registry.rs` for workspace indirection.
+Path resolved via `plan_dir::meta_path()`, which handles jj workspace indirection (see [Workspace indirection](#workspace-indirection-plan_dirresolve_repo_path)).
 
 ---
 
@@ -1165,27 +1196,29 @@ The proc-macro-heavy dependencies (octocrab, serde, tokio) increase build time s
 
 ### Unit tests (`cargo test`)
 
-523 tests covering (selected modules):
+546 tests covering (selected modules):
 
 | Module | Tests | Covers |
 |---|---|---|
 | `commands/` | 105 | Dispatch, describe interception & guard, navigation, new/track/untrack, stack visualization, WC adoption |
 | `plan_file.rs` | 30 | Filename parsing, bookmark encoding, registry-based resolution, legacy detection, atomic write |
 | `stack_builder.rs` | 26 | Stack construction, gap detection, registry filtering, `collect_submission_chain`, multi-stack grouping |
-| `sync_state.rs` | 22 | `reconcile` truth table, `anchor` (poison-proof), `is_drifted`, v2 baselines roundtrip / v1 load |
+| `sync_state.rs` | 30 | `reconcile` truth table, `anchor` (poison-proof), `is_drifted` (per-bookmark subset; foreign/stale baselines inert), `advance_baselines` (prune by registry, not local stack), v2 baselines roundtrip / v1 load |
 | `types.rs` | 23 | `LogEntry` methods, `PlanRegistry` CRUD, `resolve_encoded`, `would_collide`, TOML roundtrip, v1→v2 compat, `plans_in_stack` |
 | `markdown.rs` | 20 | Scratch stripping, code fence immunity, edge cases |
 | `template.rs` | 16 | Resolution chain, interpolation, bookmark placeholders, fallback |
 | `sync.rs` | 15 | `plan_sync` reconcile projection (write/skip/conflict), removes/renames, baseline observations |
-| `plan_dir.rs` | 8 | Directory resolution, plan max |
+| `plan_dir.rs` | 18 | Directory resolution, plan max, `resolve_pointer` (relative/absolute/trimmed), `resolve_repo_path` (jj workspace pointer, dangling-pointer guard), `meta_path` |
 | `flush.rs` | 8 | `plan_flush` reconcile projection, mirror no-push, empty-file no-push |
 | `pr_cache.rs` | 7 | TOML roundtrip, upsert/remove, path resolution |
-| `plan_registry.rs` | 6 | Load/save, workspace indirection, directory creation |
+| `plan_registry.rs` | 6 | Load/save, in-place version stamp, directory creation, write failures surface as `Err` |
 | `platform/detection.rs` | 18 | URL parsing, platform detection |
 
 ### Bats integration tests (`./test.sh`)
 
-176 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`. The "Reconcile (three-way)" block covers the failing-flush clobber, baseline-poisoning, mirror, true-conflict, and squash remove-path loss paths via a fake `jj` that no-ops `describe`.
+181 behavioral tests using [bats-core](https://github.com/bats-core/bats-core). A template jj repo with `.jj-plan/` is created once per run; each test gets an isolated `cp -r` copy. Tests run in parallel with GNU `parallel`. The "Reconcile (three-way)" block covers the failing-flush clobber, baseline-poisoning, mirror, true-conflict, and squash remove-path loss paths via a fake `jj` that no-ops `describe`. The "jj workspaces" block runs a real `jj workspace add` and asserts the registry lands in the *shared* repo dir while plan files stay per-workspace.
+
+Note the harness pins `PATH` to the shim dir plus `/opt/homebrew/bin` — deliberately excluding `~/.local/bin`, where an *installed* jj-plan may shadow the real `jj`. Without that, `JjBinary::resolve()` picks the installed shim up as "real jj" and every subprocess call silently re-enters an older jj-plan.
 
 ### PR integration tests
 
