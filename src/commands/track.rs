@@ -80,6 +80,8 @@ pub fn run_track(
                         "Tip: If the working copy has exactly one untracked bookmark, it will be"
                     );
                     eprintln!("     auto-detected. Currently no bookmarks point at @.");
+                    eprintln!();
+                    eprintln!("Run 'jj plan track --help' for details.");
                     return Ok(1);
                 }
                 _ => {

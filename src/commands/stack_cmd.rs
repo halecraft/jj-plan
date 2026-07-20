@@ -38,8 +38,6 @@ fn hint_suffix(err: &JjPlanError) -> String {
 struct StackDispatchArgs<'a> {
     /// The first positional argument (subcommand name), if any.
     subcommand: Option<&'a str>,
-    /// Whether `--help` or `-h` was present.
-    show_help: bool,
     /// Whether `--all` was present.
     show_all: bool,
     /// The value of `--format=X` or `--format X`, if present.
@@ -54,7 +52,6 @@ struct StackDispatchArgs<'a> {
 /// are ignored here — they are passed through to sub-command handlers.
 fn parse_stack_dispatch_args(args: &[String]) -> StackDispatchArgs<'_> {
     let mut subcommand: Option<&str> = None;
-    let mut show_help = false;
     let mut show_all = false;
     let mut format_override: Option<&str> = None;
 
@@ -63,7 +60,6 @@ fn parse_stack_dispatch_args(args: &[String]) -> StackDispatchArgs<'_> {
         let arg = args[i].as_str();
 
         match arg {
-            "--help" | "-h" => show_help = true,
             "--all" => show_all = true,
             "--format" => {
                 // --format VALUE (separate args)
@@ -93,7 +89,6 @@ fn parse_stack_dispatch_args(args: &[String]) -> StackDispatchArgs<'_> {
 
     StackDispatchArgs {
         subcommand,
-        show_help,
         show_all,
         format_override,
     }
@@ -127,11 +122,9 @@ pub fn dispatch_stack(
         None => format,
     };
 
-    // Help handling
-    if parsed.show_help {
-        print_stack_help();
-        return Ok(0);
-    }
+    // Help (`jj stack --help`, `jj stack <sub> --help`) is resolved earlier in
+    // `run()` via `help::classify_help`, before repo activation — so it never
+    // reaches here.
 
     // --all flag: show all stacks across the repo
     if parsed.show_all {
@@ -416,11 +409,6 @@ fn plan_file_to_pr_content_from_entries(
 // ---------------------------------------------------------------------------
 
 fn run_submit(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        print_submit_help();
-        return Ok(0);
-    }
-
     let dry_run = has_flag(args, "--dry-run");
     let draft = has_flag(args, "--draft");
     let publish = has_flag(args, "--publish");
@@ -773,11 +761,6 @@ async fn run_submit_async(
 // ---------------------------------------------------------------------------
 
 fn run_sync(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        print_sync_help();
-        return Ok(0);
-    }
-
     let dry_run = has_flag(args, "--dry-run");
     let remote_override = get_option(args, "--remote");
 
@@ -858,11 +841,6 @@ fn format_pr_error(
 }
 
 fn run_merge(workspace: &mut Workspace, args: &[String], registry: &PlanRegistry) -> Result<i32> {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        print_merge_help();
-        return Ok(0);
-    }
-
     let dry_run = has_flag(args, "--dry-run");
     let wait = has_flag(args, "--wait");
     let remote_override = get_option(args, "--remote");
@@ -1282,11 +1260,6 @@ async fn run_merge_async(
 // ---------------------------------------------------------------------------
 
 fn run_auth(args: &[String]) -> Result<i32> {
-    if has_flag(args, "--help") || has_flag(args, "-h") {
-        print_auth_help();
-        return Ok(0);
-    }
-
     // Parse: auth <platform> <action>
     // e.g., auth github test, auth gitlab setup
     let platform = args.get(1).map(|s| s.as_str());
@@ -1428,7 +1401,14 @@ fn run_auth(args: &[String]) -> Result<i32> {
             Ok(1)
         }
         _ => {
-            print_auth_help();
+            eprint!(
+                "{}",
+                crate::commands::help::render_help_screen(
+                    &crate::commands::help::stack_subcommand_help("auth")
+                        .expect("auth help screen exists"),
+                    crate::commands::help::configured_default_color_mode(),
+                )
+            );
             Ok(1)
         }
     }
@@ -1472,98 +1452,6 @@ fn show_all_stacks(plan_dir: &PlanDir, workspace: &Workspace, registry: &PlanReg
     });
 }
 
-fn print_stack_help() {
-    eprintln!("jj stack — stack-oriented PR operations");
-    eprintln!();
-    eprintln!("Usage: jj stack [SUBCOMMAND] [OPTIONS]");
-    eprintln!();
-    eprintln!("When run without a subcommand, displays the current stack with");
-    eprintln!("bookmark structure, sync status, and PR status.");
-    eprintln!();
-    eprintln!("Subcommands:");
-    eprintln!("  submit [bookmark]   Push and create/update PRs");
-    eprintln!("  sync                Fetch, push, and update stack");
-    eprintln!("  merge               Merge approved PRs from bottom of stack");
-    eprintln!("  untrack             Stop tracking the current stack");
-    eprintln!("  auth                Authentication management");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --all               Show all stacks across the repo");
-    eprintln!("  --format=FORMAT     Output format: 'compact' (default) or 'regular'");
-    eprintln!("  --help, -h          Show this help message");
-}
-
-fn print_submit_help() {
-    eprintln!("jj stack submit — push bookmarks and create/update PRs");
-    eprintln!();
-    eprintln!("Usage: jj stack submit [bookmark] [options]");
-    eprintln!();
-    eprintln!("If no bookmark is specified, submits up to the tip-most bookmarked");
-    eprintln!("segment near the working copy.");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --dry-run               Preview what would be done without making changes");
-    eprintln!("  --draft                 Create new PRs as drafts");
-    eprintln!("  --publish               Convert existing draft PRs to ready-for-review");
-    eprintln!("  --update-descriptions   Push current plan content to existing PR titles/bodies");
-    eprintln!("  --no-comments           Skip adding/updating stack navigation comments");
-    eprintln!("  --continue-on-error     Don't abort on first failure (default: abort)");
-    eprintln!("  --allow-gaps            Allow unbookmarked changes between bookmarks");
-    eprintln!("  --remote <remote>       Specify the remote to push to (default: origin)");
-    eprintln!("  --help, -h              Show this help message");
-    eprintln!();
-    eprintln!("Notes:");
-    eprintln!("  --draft and --publish are mutually exclusive.");
-    eprintln!("  Stack comments are added by default for multi-PR stacks.");
-    eprintln!("  Execution aborts on first failure by default (stacked PRs are dependent).");
-}
-
-fn print_sync_help() {
-    eprintln!("jj stack sync — fetch from remote and re-submit the stack");
-    eprintln!();
-    eprintln!("Usage: jj stack sync [options]");
-    eprintln!();
-    eprintln!("Fetches from the remote, then pushes bookmarks and updates PRs.");
-    eprintln!("Equivalent to fetch + submit with default flags.");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --dry-run               Preview what would be done without making changes");
-    eprintln!("  --remote <remote>       Specify the remote (default: origin)");
-    eprintln!("  --help, -h              Show this help message");
-}
-
-fn print_merge_help() {
-    eprintln!("jj stack merge — merge approved PRs from the bottom of the stack");
-    eprintln!();
-    eprintln!("Usage: jj stack merge [options]");
-    eprintln!();
-    eprintln!("Merges the first ready PR, then rebases and pushes the remaining");
-    eprintln!("stack onto updated trunk. Re-run after CI passes to merge the next.");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --dry-run           Preview the merge plan without merging");
-    eprintln!("  --wait              After merge+rebase, poll CI and continue merging");
-    eprintln!("  --remote <remote>   Specify the remote (default: origin)");
-    eprintln!("  --help, -h          Show this help message");
-}
-
-fn print_auth_help() {
-    eprintln!("jj stack auth — authentication management");
-    eprintln!();
-    eprintln!("Usage: jj stack auth <platform> <action>");
-    eprintln!();
-    eprintln!("Platforms: github, gitlab, gitea");
-    eprintln!("Actions:   test, setup");
-    eprintln!();
-    eprintln!("Examples:");
-    eprintln!("  jj stack auth github test    Test GitHub authentication");
-    eprintln!("  jj stack auth github setup   Show GitHub setup instructions");
-    eprintln!("  jj stack auth gitlab test    Test GitLab authentication");
-    eprintln!("  jj stack auth gitlab setup   Show GitLab setup instructions");
-    eprintln!("  jj stack auth gitea test     Test Gitea authentication");
-    eprintln!("  jj stack auth gitea setup    Show Gitea setup instructions");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,23 +1469,8 @@ mod tests {
         let a = args(&["stack"]);
         let parsed = parse_stack_dispatch_args(&a);
         assert!(parsed.subcommand.is_none());
-        assert!(!parsed.show_help);
         assert!(!parsed.show_all);
         assert!(parsed.format_override.is_none());
-    }
-
-    #[test]
-    fn parse_stack_help_long() {
-        let a = args(&["stack", "--help"]);
-        let parsed = parse_stack_dispatch_args(&a);
-        assert!(parsed.show_help);
-    }
-
-    #[test]
-    fn parse_stack_help_short() {
-        let a = args(&["stack", "-h"]);
-        let parsed = parse_stack_dispatch_args(&a);
-        assert!(parsed.show_help);
     }
 
     #[test]
@@ -1637,7 +1510,6 @@ mod tests {
         let a = args(&["stack", "submit", "--dry-run"]);
         let parsed = parse_stack_dispatch_args(&a);
         assert_eq!(parsed.subcommand, Some("submit"));
-        assert!(!parsed.show_help);
         assert!(!parsed.show_all);
     }
 
@@ -1670,7 +1542,6 @@ mod tests {
         let a = args(&["stack", "--dry-run", "submit"]);
         let parsed = parse_stack_dispatch_args(&a);
         assert_eq!(parsed.subcommand, Some("submit"));
-        assert!(!parsed.show_help);
         assert!(!parsed.show_all);
         assert!(parsed.format_override.is_none());
     }

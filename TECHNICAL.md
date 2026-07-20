@@ -70,7 +70,7 @@ Read-only jj commands pass through via `exec`. `diff`/`interdiff` and the rest a
 | `src/commands/describe.rs` | 379 | `jj describe -m` interception |
 | `src/commands/new.rs` | 195 | `jj plan new` bookmark creation |
 | `src/commands/nav.rs` | 273 | `jj plan next/prev/go` navigation |
-| `src/commands/help.rs` | 639 | `jj plan --help` rendering |
+| `src/commands/help.rs` | 944 | Help classifier + unified screen model + rendering (`jj plan`/`jj stack`, top-level and per-subcommand) |
 | `src/commands/config.rs` | 92 | `jj plan config` introspection |
 | `src/commands/track.rs` | 107 | `jj plan track` |
 | `src/commands/untrack.rs` | 88 | `jj plan untrack` |
@@ -275,7 +275,7 @@ derive:
   cmd_args  = &args[command_index..]
   repo_start = repository_override.unwrap_or(cwd)
   ↓
-plan --help?                  → commands::help::classify_invocation()
+plan/stack help (any sub)?    → commands::help::classify_help() → print & return
 no command / unknown / help?  → exec(jj, full_args)
 readonly command?             → exec(jj, full_args)
 workspace readonly subcommand?→ exec(jj, full_args)
@@ -304,7 +304,7 @@ The `resolve_plan_bookmark_at(workspace, registry, target)` helper (in `commands
 Before dispatch, `run()` now does this work in order:
 
 1. Resolve the real jj binary
-2. Check for top-level `plan --help` early
+2. Resolve any `jj plan`/`jj stack` help early (`classify_help`), before activation
 3. Classify the invocation (`classify_args`)
 4. Derive repo context from `cwd` or `repository_override`
 5. Resolve repo root and plan directory against that repo context
@@ -334,12 +334,24 @@ Unknown future workspace subcommands still conservatively route through wrap, wh
 ```
 cmd_args[1] match:
   None        → show_stack_visualization()
-  "--help"    → print_stack_help()
-  "submit"    → run_submit()         // tokio block_on
-  "sync"      → run_sync()           // tokio block_on
-  "merge"     → run_merge()          // tokio block_on
-  "auth"      → run_auth()           // tokio block_on
+  "submit"    → run_submit()          // tokio block_on
+  "sync"      → run_sync()            // tokio block_on
+  "merge"     → run_merge()           // tokio block_on
+  "auth"      → run_auth()            // tokio block_on
+  "untrack"   → run_stack_untrack()
 ```
+
+`--help`/`-h` never reaches `dispatch_stack` (or `dispatch_plan`): all help is resolved earlier in `run()` — see "Help".
+
+### Help (`src/commands/help.rs`)
+
+Help is **hand-rolled, not clap** (clap would fight the shim's passthrough contract). It is a functional core + imperative shell, resolved at the shell boundary before any repo work:
+
+- **`classify_help(args) -> Option<(HelpTarget, Option<ColorWhen>)>`** — pure. Built on `classify_args`, it recognizes `jj plan`/`jj stack` help in any position (`plan --help`, `plan new --help`, `stack submit -h`, with leading globals and `--color`). `HelpTarget` is `PlanTop | PlanSub(name) | StackTop | StackSub(name)`; an unknown subcommand falls back to the namespace's top screen. Returns `None` for everything else (bare `jj --help`, real jj commands) so those pass through.
+- **One screen model** — `HelpScreen { title, blurb, usage, sections }`, where each `HelpSection` carries either label+description `Entries` (commands/flags/args) or plain `Lines` (notes/examples). One model serves both landing pages and every leaf subcommand; one `render_help_screen` renders them all (stdout, ANSI-aware via `ColorWhen`).
+- **`run()` calls `classify_help` first**, before `classify_args` dispatch and before the activation gate. So all help — top-level and per-subcommand, `plan` and `stack` — works before activation and outside a repo, and is **side-effect-free by construction**: it returns before any `Workspace::open` or flush. (Previously only the top-level `plan --help` worked pre-activation; subcommand and stack help were gated behind activation.)
+
+There are no per-command `eprintln!` help printers anymore; the old stack ones printed uncolored to stderr and their subcommand variants were dead code.
 
 ---
 

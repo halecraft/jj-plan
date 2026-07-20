@@ -54,32 +54,34 @@ impl ColorWhen {
     }
 }
 
-/// Parsed info for a `jj plan --help`-style invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanHelpInvocation {
-    pub color_override: Option<ColorWhen>,
-}
+// ---------------------------------------------------------------------------
+// Help model — one section-list screen models every help surface: the `jj
+// plan` and `jj stack` landing pages and every leaf subcommand.
+// ---------------------------------------------------------------------------
 
-/// Invocation classification for the help path.
-///
-/// This deliberately recognizes only the top-level `plan --help` shape, not
-/// arbitrary subcommand help such as `plan stack --help`.
+/// A single help screen: a title, an optional one-line blurb, a usage block,
+/// and an ordered list of labeled sections.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvocationKind {
-    PlanHelp(PlanHelpInvocation),
-    Other,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlanHelp {
+pub struct HelpScreen {
     pub title: &'static str,
-    pub mental_model: &'static str,
+    pub blurb: Option<&'static str>,
     pub usage: Vec<&'static str>,
-    pub workflow: Vec<(&'static str, &'static str)>,
-    pub commands: Vec<HelpEntry>,
-    pub options: Vec<HelpEntry>,
-    pub notes: Vec<&'static str>,
-    pub docs: Vec<HelpEntry>,
+    pub sections: Vec<HelpSection>,
+}
+
+/// A labeled section (`Commands:`, `Options:`, `Notes:`, …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpSection {
+    pub heading: &'static str,
+    pub body: SectionBody,
+}
+
+/// A section body is either label+description rows (commands, flags, args) or
+/// plain wrapped lines (notes, examples).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionBody {
+    Entries(Vec<HelpEntry>),
+    Lines(Vec<&'static str>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,29 +90,122 @@ pub struct HelpEntry {
     pub description: &'static str,
 }
 
-/// Current default entry point used by existing callers.
+impl HelpEntry {
+    const fn new(label: &'static str, description: &'static str) -> Self {
+        HelpEntry { label, description }
+    }
+}
+
+/// Which help screen an invocation asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpTarget {
+    PlanTop,
+    PlanSub(String),
+    StackTop,
+    StackSub(String),
+}
+
+/// Canonical `jj plan` subcommand names that have a dedicated help screen.
+pub const PLAN_SUBCOMMANDS: &[&str] = &[
+    "new", "track", "untrack", "done", "summary", "next", "prev", "go", "config",
+];
+
+/// Canonical `jj stack` subcommand names that have a dedicated help screen.
+pub const STACK_SUBCOMMANDS: &[&str] = &["submit", "sync", "merge", "untrack", "auth"];
+
+// ---------------------------------------------------------------------------
+// Classification (pure) — resolved at the shell boundary before any repo work,
+// so all help is available pre-activation and is side-effect-free.
+// ---------------------------------------------------------------------------
+
+/// Classify whether an invocation asks for jj-plan help, and for which screen.
 ///
-/// Resolves the default color mode from jj's `ui.color` setting, then lets any
-/// explicit `--color` flag in the current process args override it.
-pub fn print_help() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let config_default = configured_default_color_mode();
-    print!("{}", help_text_for_args(&args, config_default));
+/// Returns `None` for anything that is not a `jj plan`/`jj stack` `--help`
+/// invocation — including bare `jj --help` and every real jj command — so the
+/// caller passes those through to the real `jj` binary unchanged.
+///
+/// Built on top of [`classify_args`], so leading globals (`-R`, `--no-pager`),
+/// `--color`, and built-in aliases are already handled. An unknown subcommand
+/// falls back to the namespace's top-level screen.
+pub fn classify_help(args: &[String]) -> Option<(HelpTarget, Option<ColorWhen>)> {
+    let invocation = classify_args(args);
+    let command = invocation.command.as_deref()?;
+
+    let is_plan = match command {
+        "plan" => true,
+        "stack" => false,
+        _ => return None,
+    };
+
+    // Start from any leading `--color` captured before the command; a trailing
+    // `--color` after the command overrides it.
+    let mut color_override = invocation
+        .leading_color
+        .as_deref()
+        .and_then(ColorWhen::parse);
+    let mut saw_help = false;
+    let mut subcommand: Option<&str> = None;
+
+    let mut idx = invocation.command_index + 1;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        match arg {
+            "--help" | "-h" => {
+                saw_help = true;
+                idx += 1;
+            }
+            "--color" => {
+                if let Some(value) = args.get(idx + 1) {
+                    if let Some(parsed) = ColorWhen::parse(value) {
+                        color_override = Some(parsed);
+                    }
+                    idx += 2;
+                } else {
+                    idx += 1;
+                }
+            }
+            _ if arg.starts_with("--color=") => {
+                if let Some(parsed) = arg.strip_prefix("--color=").and_then(ColorWhen::parse) {
+                    color_override = Some(parsed);
+                }
+                idx += 1;
+            }
+            _ if arg.starts_with('-') => {
+                // Any other flag is irrelevant to help classification.
+                idx += 1;
+            }
+            _ => {
+                if subcommand.is_none() {
+                    subcommand = Some(arg);
+                }
+                idx += 1;
+            }
+        }
+    }
+
+    if !saw_help {
+        return None;
+    }
+
+    let target = match (is_plan, subcommand) {
+        (true, Some(s)) if PLAN_SUBCOMMANDS.contains(&s) => HelpTarget::PlanSub(s.to_string()),
+        (true, _) => HelpTarget::PlanTop,
+        (false, Some(s)) if STACK_SUBCOMMANDS.contains(&s) => HelpTarget::StackSub(s.to_string()),
+        (false, _) => HelpTarget::StackTop,
+    };
+
+    Some((target, color_override))
 }
 
-
-
-/// Build help text for an argument vector with a configurable default color mode.
-pub fn help_text_for_args(args: &[String], config_default: ColorWhen) -> String {
-    let color = resolve_help_color_mode(args, config_default);
-    render_plan_help(&build_plan_help(), color)
-}
+// ---------------------------------------------------------------------------
+// Shell entry points
+// ---------------------------------------------------------------------------
 
 /// Resolve the configured default color mode from `jj config get ui.color`.
 ///
 /// Falls back to `auto` if the real jj binary cannot be resolved, the config
 /// lookup fails, or the returned value is unknown.
-fn configured_default_color_mode() -> ColorWhen {
+pub fn configured_default_color_mode() -> ColorWhen {
     let Ok(jj) = JjBinary::resolve() else {
         return ColorWhen::Auto;
     };
@@ -126,274 +221,493 @@ fn configured_default_color_mode() -> ColorWhen {
     ColorWhen::parse(stdout.trim()).unwrap_or(ColorWhen::Auto)
 }
 
-/// Classify whether an invocation is the top-level `jj plan --help` help path.
+/// Print the help screen for a classified target to stdout.
 ///
-/// Recognized forms include:
-/// - `plan --help`
-/// - `plan -h`
-/// - `--color always plan --help`
-/// - `plan --help --color always`
-/// - `--color=never plan -h`
-pub fn classify_invocation(args: &[String]) -> InvocationKind {
-    let invocation = classify_args(args);
+/// The imperative shell: resolves color (explicit `--color` wins over the
+/// configured default) and renders the pure screen model.
+pub fn print_help_screen(target: HelpTarget, color_override: Option<ColorWhen>) {
+    let color = color_override.unwrap_or_else(configured_default_color_mode);
+    print!("{}", render_help_screen(&screen_for_target(&target), color));
+}
 
-    if invocation.command.as_deref() != Some("plan") {
-        return InvocationKind::Other;
-    }
-
-    let mut color_override = match invocation.leading_color.as_deref() {
-        Some(value) => {
-            let Some(parsed) = ColorWhen::parse(value) else {
-                return InvocationKind::Other;
-            };
-            Some(parsed)
-        }
-        None => None,
-    };
-
-    let mut saw_help = false;
-    let mut idx = invocation.command_index + 1;
-
-    while idx < args.len() {
-        let arg = args[idx].as_str();
-
-        match arg {
-            "--help" | "-h" => {
-                saw_help = true;
-                idx += 1;
-            }
-            "--color" => {
-                let Some(value) = args.get(idx + 1) else {
-                    return InvocationKind::Other;
-                };
-                let Some(parsed) = ColorWhen::parse(value) else {
-                    return InvocationKind::Other;
-                };
-                color_override = Some(parsed);
-                idx += 2;
-            }
-            _ if arg.starts_with("--color=") => {
-                let Some((parsed, consumed)) = parse_color_flag(args, idx) else {
-                    return InvocationKind::Other;
-                };
-                color_override = Some(parsed);
-                idx += consumed;
-            }
-            _ => {
-                // Any non-help, non-color token after `plan` means this is not
-                // the top-level `plan --help` surface.
-                return InvocationKind::Other;
-            }
-        }
-    }
-
-    if saw_help {
-        InvocationKind::PlanHelp(PlanHelpInvocation { color_override })
-    } else {
-        InvocationKind::Other
+fn screen_for_target(target: &HelpTarget) -> HelpScreen {
+    match target {
+        HelpTarget::PlanTop => build_plan_help(),
+        HelpTarget::PlanSub(sub) => plan_subcommand_help(sub).unwrap_or_else(build_plan_help),
+        HelpTarget::StackTop => build_stack_help(),
+        HelpTarget::StackSub(sub) => stack_subcommand_help(sub).unwrap_or_else(build_stack_help),
     }
 }
 
-/// Resolve the effective help color mode.
-///
-/// Explicit `--color` flags win. Otherwise the caller-provided configured or
-/// default mode is used.
-pub fn resolve_help_color_mode(args: &[String], config_default: ColorWhen) -> ColorWhen {
-    match classify_invocation(args) {
-        InvocationKind::PlanHelp(invocation) => invocation.color_override.unwrap_or(config_default),
-        InvocationKind::Other => config_default,
-    }
-}
+// ---------------------------------------------------------------------------
+// Screen models (pure)
+// ---------------------------------------------------------------------------
 
-/// Build the structured help model.
+/// The top-level `jj plan --help` landing page.
 ///
-/// This is the pure "PLAN" step; formatting decisions happen in
-/// `render_plan_help()`.
-pub fn build_plan_help() -> PlanHelp {
-    PlanHelp {
+/// Workflow-first and deliberately compact: one line per command, no inline
+/// flag rows (those live in each subcommand's own `--help`).
+pub fn build_plan_help() -> HelpScreen {
+    HelpScreen {
         title: "jj plan — plan-oriented programming commands",
-        mental_model:
+        blurb: Some(
             "One bookmark = one plan = one PR. Plans are jj change descriptions synced to `.jj-plan/` markdown files.",
-        usage: vec![
-            "jj plan [SUBCOMMAND]",
-            "jj plan --help [--color <WHEN>]",
-        ],
-        workflow: vec![
-            ("jj plan new <bookmark>", "Create a plan (change + bookmark + template)"),
-            ("$EDITOR .jj-plan/NN-bookmark.md", "Edit the plan file (path shown in stack output)"),
-            ("jj plan new <next-bookmark>", "Add another plan to the stack"),
-            ("jj plan done", "Mark the current plan done"),
-            ("jj plan", "Show plan summary (same as `jj plan summary`)"),
-        ],
-        commands: vec![
-            HelpEntry {
-                label: "new <bookmark> [-r REV]",
-                description: "Create a plan (change + bookmark + plan file + registry entry)",
+        ),
+        usage: vec!["jj plan [SUBCOMMAND]", "jj plan <subcommand> --help"],
+        sections: vec![
+            HelpSection {
+                heading: "Workflow:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new(
+                        "jj plan new <bookmark>",
+                        "Create a plan (change + bookmark + template)",
+                    ),
+                    HelpEntry::new(
+                        "$EDITOR .jj-plan/NN-bookmark.md",
+                        "Edit the plan file (path shown in stack output)",
+                    ),
+                    HelpEntry::new("jj plan done", "Mark the current plan done"),
+                    HelpEntry::new("jj plan", "Show the plan summary or orientation"),
+                ]),
             },
-            HelpEntry {
-                label: "track [bookmark]",
-                description: "Adopt an existing bookmark as a plan (auto-detects from @)",
+            HelpSection {
+                heading: "Commands:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new(
+                        "new <bookmark>",
+                        "Create a plan; flags -A/-B/--stack (`jj plan new --help`)",
+                    ),
+                    HelpEntry::new(
+                        "track [bookmark]",
+                        "Adopt an existing bookmark as a plan (auto-detects from @)",
+                    ),
+                    HelpEntry::new("untrack <bookmark>", "Remove a bookmark from plan tracking"),
+                    HelpEntry::new(
+                        "done [CHANGE_ID]",
+                        "Mark a plan (or --stack) done (`jj plan done --help`)",
+                    ),
+                    HelpEntry::new(
+                        "summary [target]",
+                        "Structured, LLM-friendly summary (`jj plan summary --help`)",
+                    ),
+                    HelpEntry::new("next / prev", "Move @ to the next / previous plan"),
+                    HelpEntry::new(
+                        "go <N | bookmark | ID>",
+                        "Jump to a plan by index, bookmark, or change ID",
+                    ),
+                    HelpEntry::new("config", "Show resolved configuration and stack info"),
+                    HelpEntry::new(
+                        "stack [SUBCOMMAND]",
+                        "Stacked-PR ops: `jj stack submit/sync/merge` — see `jj stack --help`",
+                    ),
+                ]),
             },
-            HelpEntry {
-                label: "untrack <bookmark>",
-                description: "Remove a bookmark from plan tracking",
+            HelpSection {
+                heading: "Options:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("--help, -h", "Show this help message"),
+                    HelpEntry::new(
+                        "--color <WHEN>",
+                        "When to colorize output [always, never, debug, auto]",
+                    ),
+                ]),
             },
-            HelpEntry {
-                label: "done [flags] [CHANGE_ID]",
-                description: "Mark a plan as done (defaults to @)",
+            HelpSection {
+                heading: "Notes:",
+                body: SectionBody::Lines(vec![
+                    "`jj status` shows the current plan stack with file paths.",
+                    "Edit `.jj-plan/NN-bookmark.md` directly — `jj describe -m`/`--stdin` on a tracked plan is blocked.",
+                    "Add --override-plan-protocol to replace a plan's full description anyway.",
+                ]),
             },
-            HelpEntry {
-                label: "  --stack",
-                description: "Mark all plans in the stack as done",
-            },
-            HelpEntry {
-                label: "  --keep-scratch",
-                description: "Keep [scratch] sections instead of stripping them",
-            },
-            HelpEntry {
-                label: "  --dry-run",
-                description: "Show what would change without modifying anything",
-            },
-            HelpEntry {
-                label: "  --show-stripped=<mode>",
-                description: "Report stripped scratch sections: full | toc | headings | none (default: toc)",
-            },
-            HelpEntry {
-                label: "next",
-                description: "Advance @ to the next plan in the stack",
-            },
-            HelpEntry {
-                label: "prev",
-                description: "Move @ to the previous plan in the stack",
-            },
-            HelpEntry {
-                label: "go <N | bookmark | ID>",
-                description: "Jump to a plan by index (1-based), bookmark name, or change ID",
-            },
-            HelpEntry {
-                label: "summary [target] [flags]",
-                description: "Show structured plan summary (LLM-friendly)",
-            },
-            HelpEntry {
-                label: "  --json",
-                description: "Output as JSON instead of text",
-            },
-            HelpEntry {
-                label: "  --no-diff-stat",
-                description: "Suppress diff stat section",
-            },
-            HelpEntry {
-                label: "  --stack=full|minimal|quiet",
-                description: "Control stack verbosity (default: full)",
-            },
-            HelpEntry {
-                label: "config",
-                description: "Show resolved configuration and stack info",
-            },
-        ],
-        options: vec![
-            HelpEntry {
-                label: "--help, -h",
-                description: "Show this help message",
-            },
-            HelpEntry {
-                label: "--color <WHEN>",
-                description: "When to colorize output [always, never, debug, auto]",
-            },
-        ],
-        notes: vec![
-            "`jj plan` shows the plan summary if @ is a plan, or orientation with next steps.",
-            "`jj plan summary` always shows raw summary data (even if @ is not a plan).",
-            "`jj status` shows the current plan stack with file paths.",
-            "Plan files are `.jj-plan/NN-bookmark.md` — paths shown as `→` in stack output.",
-            "`jj describe -m` on a tracked plan is blocked; edit the plan file directly.",
-            "`jj stack submit/sync/merge` — stacked PR operations.",
-        ],
-        docs: vec![
-            HelpEntry {
-                label: "README.md",
-                description: "Overview, philosophy, and quick start",
-            },
-            HelpEntry {
-                label: "MANUAL.md",
-                description: "Exhaustive command reference and recipes",
+            HelpSection {
+                heading: "Docs:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("README.md", "Overview, philosophy, and quick start"),
+                    HelpEntry::new("MANUAL.md", "Exhaustive command reference and recipes"),
+                ]),
             },
         ],
     }
 }
 
-/// Render structured help as plain text or ANSI-styled text.
+/// The top-level `jj stack --help` landing page.
+pub fn build_stack_help() -> HelpScreen {
+    HelpScreen {
+        title: "jj stack — stack-oriented PR operations",
+        blurb: Some(
+            "Stacked-PR operations over a plan stack: push, sync, and merge dependent PRs.",
+        ),
+        usage: vec!["jj stack [SUBCOMMAND] [OPTIONS]", "jj stack <subcommand> --help"],
+        sections: vec![
+            HelpSection {
+                heading: "Subcommands:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("submit [bookmark]", "Push bookmarks and create/update PRs"),
+                    HelpEntry::new("sync", "Fetch from the remote, then re-submit the stack"),
+                    HelpEntry::new("merge", "Merge approved PRs from the bottom of the stack"),
+                    HelpEntry::new("untrack", "Stop tracking the current stack"),
+                    HelpEntry::new("auth", "Authentication management (github/gitlab/gitea)"),
+                ]),
+            },
+            HelpSection {
+                heading: "Options:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("--all", "Show all stacks across the repo"),
+                    HelpEntry::new(
+                        "--format=<compact|regular>",
+                        "Output format (default: compact)",
+                    ),
+                    HelpEntry::new("--help, -h", "Show this help message"),
+                ]),
+            },
+            HelpSection {
+                heading: "Notes:",
+                body: SectionBody::Lines(vec![
+                    "Bare `jj stack` shows the current stack: bookmark structure, sync status, and PR status.",
+                ]),
+            },
+        ],
+    }
+}
+
+/// Per-subcommand help for `jj plan <sub>`.
+pub fn plan_subcommand_help(sub: &str) -> Option<HelpScreen> {
+    let screen = match sub {
+        "new" => HelpScreen {
+            title: "jj plan new — create a plan",
+            blurb: Some("Creates a jj change + bookmark + plan file + registry entry."),
+            usage: vec!["jj plan new <bookmark> [--stack <name>] [-r <rev>] [-A <rev>] [-B <rev>]"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![HelpEntry::new(
+                        "<bookmark>",
+                        "Name for the bookmark and plan file (e.g. feat-auth)",
+                    )]),
+                },
+                HelpSection {
+                    heading: "Options:",
+                    body: SectionBody::Entries(vec![
+                        HelpEntry::new(
+                            "--stack <name>",
+                            "Create a new named stack (a stack/<name> base bookmark)",
+                        ),
+                        HelpEntry::new("-r <rev>", "Create the plan change at <rev> (passed to jj new)"),
+                        HelpEntry::new(
+                            "-A, --insert-after <rev>",
+                            "Insert the plan after <rev> (passed to jj new)",
+                        ),
+                        HelpEntry::new(
+                            "-B, --insert-before <rev>",
+                            "Insert the plan before <rev> (passed to jj new)",
+                        ),
+                    ]),
+                },
+                HelpSection {
+                    heading: "Notes:",
+                    body: SectionBody::Lines(vec![
+                        "With no positioning flag, the plan is added after @ (adopting @ if it is an",
+                        "empty, unbookmarked, undescribed change).",
+                    ]),
+                },
+            ],
+        },
+        "track" => HelpScreen {
+            title: "jj plan track — adopt an existing bookmark as a plan",
+            blurb: None,
+            usage: vec!["jj plan track [bookmark]"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![HelpEntry::new(
+                        "[bookmark]",
+                        "Bookmark to adopt; if omitted, auto-detects a single untracked bookmark at @",
+                    )]),
+                },
+                HelpSection {
+                    heading: "Notes:",
+                    body: SectionBody::Lines(vec![
+                        "The bookmark must already exist (create it with `jj bookmark create`).",
+                    ]),
+                },
+            ],
+        },
+        "untrack" => HelpScreen {
+            title: "jj plan untrack — stop tracking a bookmark as a plan",
+            blurb: None,
+            usage: vec!["jj plan untrack <bookmark>"],
+            sections: vec![HelpSection {
+                heading: "Arguments:",
+                body: SectionBody::Entries(vec![HelpEntry::new(
+                    "<bookmark>",
+                    "Bookmark to untrack; the bookmark and change remain, only the plan record and file are removed",
+                )]),
+            }],
+        },
+        "done" => HelpScreen {
+            title: "jj plan done — mark a plan done",
+            blurb: Some("Strips [scratch] sections and sets plan-status: ✅."),
+            usage: vec!["jj plan done [CHANGE_ID] [flags]"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![HelpEntry::new(
+                        "[CHANGE_ID]",
+                        "Plan to mark done (defaults to @)",
+                    )]),
+                },
+                HelpSection {
+                    heading: "Options:",
+                    body: SectionBody::Entries(vec![
+                        HelpEntry::new("--stack", "Mark all plans in the stack as done"),
+                        HelpEntry::new(
+                            "--keep-scratch",
+                            "Keep [scratch] sections instead of stripping them",
+                        ),
+                        HelpEntry::new(
+                            "--dry-run",
+                            "Show what would change without modifying anything",
+                        ),
+                        HelpEntry::new(
+                            "--show-stripped=<mode>",
+                            "Report stripped scratch sections: full | toc | headings | none (default: toc)",
+                        ),
+                    ]),
+                },
+            ],
+        },
+        "summary" => HelpScreen {
+            title: "jj plan summary — structured plan summary (LLM-friendly)",
+            blurb: None,
+            usage: vec!["jj plan summary [target] [flags]"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![HelpEntry::new(
+                        "[target]",
+                        "Revset to summarize (defaults to @)",
+                    )]),
+                },
+                HelpSection {
+                    heading: "Options:",
+                    body: SectionBody::Entries(vec![
+                        HelpEntry::new("--json", "Output as JSON instead of text"),
+                        HelpEntry::new("--no-diff-stat", "Suppress the diff stat section"),
+                        HelpEntry::new(
+                            "--stack=<mode>",
+                            "Stack verbosity: full | minimal | quiet (default: full)",
+                        ),
+                    ]),
+                },
+            ],
+        },
+        "next" => HelpScreen {
+            title: "jj plan next — advance @ to the next plan",
+            blurb: None,
+            usage: vec!["jj plan next"],
+            sections: vec![HelpSection {
+                heading: "Notes:",
+                body: SectionBody::Lines(vec!["Moves the working copy to the next plan up the stack."]),
+            }],
+        },
+        "prev" => HelpScreen {
+            title: "jj plan prev — move @ to the previous plan",
+            blurb: None,
+            usage: vec!["jj plan prev"],
+            sections: vec![HelpSection {
+                heading: "Notes:",
+                body: SectionBody::Lines(vec!["Moves the working copy to the previous plan down the stack."]),
+            }],
+        },
+        "go" => HelpScreen {
+            title: "jj plan go — jump to a plan",
+            blurb: None,
+            usage: vec!["jj plan go <N | bookmark | ID>"],
+            sections: vec![HelpSection {
+                heading: "Arguments:",
+                body: SectionBody::Entries(vec![HelpEntry::new(
+                    "<N | bookmark | ID>",
+                    "Target: 1-based stack index, bookmark name, or change ID",
+                )]),
+            }],
+        },
+        "config" => HelpScreen {
+            title: "jj plan config — show resolved configuration",
+            blurb: None,
+            usage: vec!["jj plan config"],
+            sections: vec![HelpSection {
+                heading: "Notes:",
+                body: SectionBody::Lines(vec![
+                    "Prints the resolved plan directory, stack format, and current stack info.",
+                ]),
+            }],
+        },
+        _ => return None,
+    };
+    Some(screen)
+}
+
+/// Per-subcommand help for `jj stack <sub>`.
+pub fn stack_subcommand_help(sub: &str) -> Option<HelpScreen> {
+    let screen = match sub {
+        "submit" => HelpScreen {
+            title: "jj stack submit — push bookmarks and create/update PRs",
+            blurb: Some(
+                "With no bookmark, submits up to the tip-most bookmarked segment near @.",
+            ),
+            usage: vec!["jj stack submit [bookmark] [options]"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![HelpEntry::new(
+                        "[bookmark]",
+                        "Submit up to this bookmark",
+                    )]),
+                },
+                HelpSection {
+                    heading: "Options:",
+                    body: SectionBody::Entries(vec![
+                        HelpEntry::new("--dry-run", "Preview without making changes"),
+                        HelpEntry::new("--draft", "Create new PRs as drafts"),
+                        HelpEntry::new("--publish", "Convert existing draft PRs to ready-for-review"),
+                        HelpEntry::new(
+                            "--update-descriptions",
+                            "Push current plan content to existing PR titles/bodies",
+                        ),
+                        HelpEntry::new("--no-comments", "Skip stack navigation comments"),
+                        HelpEntry::new(
+                            "--continue-on-error",
+                            "Don't abort on first failure (default: abort)",
+                        ),
+                        HelpEntry::new("--allow-gaps", "Allow unbookmarked changes between bookmarks"),
+                        HelpEntry::new("--remote <remote>", "Remote to push to (default: origin)"),
+                    ]),
+                },
+                HelpSection {
+                    heading: "Notes:",
+                    body: SectionBody::Lines(vec![
+                        "--draft and --publish are mutually exclusive.",
+                        "Execution aborts on first failure by default (stacked PRs are dependent).",
+                    ]),
+                },
+            ],
+        },
+        "sync" => HelpScreen {
+            title: "jj stack sync — fetch from remote and re-submit the stack",
+            blurb: Some("Fetches, then pushes bookmarks and updates PRs (fetch + submit)."),
+            usage: vec!["jj stack sync [options]"],
+            sections: vec![HelpSection {
+                heading: "Options:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("--dry-run", "Preview without making changes"),
+                    HelpEntry::new("--remote <remote>", "Remote to use (default: origin)"),
+                ]),
+            }],
+        },
+        "merge" => HelpScreen {
+            title: "jj stack merge — merge approved PRs from the bottom of the stack",
+            blurb: Some(
+                "Merges the first ready PR, then rebases and pushes the rest onto updated trunk.",
+            ),
+            usage: vec!["jj stack merge [options]"],
+            sections: vec![HelpSection {
+                heading: "Options:",
+                body: SectionBody::Entries(vec![
+                    HelpEntry::new("--dry-run", "Preview the merge plan without merging"),
+                    HelpEntry::new("--wait", "After merge+rebase, poll CI and continue merging"),
+                    HelpEntry::new("--remote <remote>", "Remote to use (default: origin)"),
+                ]),
+            }],
+        },
+        "untrack" => HelpScreen {
+            title: "jj stack untrack — stop tracking the current stack",
+            blurb: None,
+            usage: vec!["jj stack untrack [--dry-run]"],
+            sections: vec![HelpSection {
+                heading: "Options:",
+                body: SectionBody::Entries(vec![HelpEntry::new(
+                    "--dry-run",
+                    "Show what would be untracked without modifying anything",
+                )]),
+            }],
+        },
+        "auth" => HelpScreen {
+            title: "jj stack auth — authentication management",
+            blurb: None,
+            usage: vec!["jj stack auth <platform> <action>"],
+            sections: vec![
+                HelpSection {
+                    heading: "Arguments:",
+                    body: SectionBody::Entries(vec![
+                        HelpEntry::new("<platform>", "github | gitlab | gitea"),
+                        HelpEntry::new("<action>", "test | setup"),
+                    ]),
+                },
+                HelpSection {
+                    heading: "Examples:",
+                    body: SectionBody::Lines(vec![
+                        "jj stack auth github test    Test GitHub authentication",
+                        "jj stack auth github setup   Show GitHub setup instructions",
+                        "jj stack auth gitlab test    Test GitLab authentication",
+                        "jj stack auth gitea setup    Show Gitea setup instructions",
+                    ]),
+                },
+            ],
+        },
+        _ => return None,
+    };
+    Some(screen)
+}
+
+// ---------------------------------------------------------------------------
+// Rendering (pure)
+// ---------------------------------------------------------------------------
+
+/// Render a help screen as plain text or ANSI-styled text.
 ///
-/// This is the pure "EXECUTE formatting" step. It returns a string instead of
-/// writing to stdout so it is easy to unit test.
-pub fn render_plan_help(help: &PlanHelp, color: ColorWhen) -> String {
+/// Returns a string instead of writing to stdout so it is easy to unit test.
+pub fn render_help_screen(screen: &HelpScreen, color: ColorWhen) -> String {
     let ansi = color.should_color();
     let mut out = String::new();
 
-    out.push_str(help.title);
-    out.push_str("\n\n");
-    out.push_str(help.mental_model);
-    out.push_str("\n\n");
-
-    push_heading(&mut out, "Usage:", ansi);
-    for line in &help.usage {
-        push_code_line(&mut out, line, ansi);
-    }
+    out.push_str(screen.title);
     out.push('\n');
 
-    push_heading(&mut out, "Workflow:", ansi);
-    for (label, description) in &help.workflow {
-        push_entry(&mut out, label, description, ansi);
-    }
-    out.push('\n');
-
-    push_heading(&mut out, "Commands:", ansi);
-    for entry in &help.commands {
-        push_entry(&mut out, entry.label, entry.description, ansi);
-    }
-    out.push('\n');
-
-    push_heading(&mut out, "Options:", ansi);
-    for entry in &help.options {
-        push_entry(&mut out, entry.label, entry.description, ansi);
-    }
-    out.push('\n');
-
-    push_heading(&mut out, "Notes:", ansi);
-    for note in &help.notes {
-        out.push_str("  ");
-        out.push_str(note);
+    if let Some(blurb) = screen.blurb {
+        out.push('\n');
+        out.push_str(blurb);
         out.push('\n');
     }
-    out.push('\n');
 
-    push_heading(&mut out, "Docs:", ansi);
-    for entry in &help.docs {
-        push_entry(&mut out, entry.label, entry.description, ansi);
+    if !screen.usage.is_empty() {
+        out.push('\n');
+        push_heading(&mut out, "Usage:", ansi);
+        for line in &screen.usage {
+            push_code_line(&mut out, line, ansi);
+        }
+    }
+
+    for section in &screen.sections {
+        out.push('\n');
+        push_heading(&mut out, section.heading, ansi);
+        match &section.body {
+            SectionBody::Entries(entries) => {
+                for entry in entries {
+                    push_entry(&mut out, entry.label, entry.description, ansi);
+                }
+            }
+            SectionBody::Lines(lines) => {
+                for line in lines {
+                    out.push_str("  ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
     }
 
     out
-}
-
-// ---------------------------------------------------------------------------
-// Pure parsing helpers
-// ---------------------------------------------------------------------------
-
-
-
-fn parse_color_flag(args: &[String], idx: usize) -> Option<(ColorWhen, usize)> {
-    let arg = args.get(idx)?.as_str();
-
-    if arg == "--color" {
-        let value = args.get(idx + 1)?;
-        let parsed = ColorWhen::parse(value)?;
-        Some((parsed, 2))
-    } else if let Some(value) = arg.strip_prefix("--color=") {
-        let parsed = ColorWhen::parse(value)?;
-        Some((parsed, 1))
-    } else {
-        None
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,173 +769,176 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Invocation classification
+    // classify_help
     // -----------------------------------------------------------------------
 
     #[test]
-    fn classify_plain_plan_help() {
+    fn classify_plan_top() {
         assert_eq!(
-            classify_invocation(&args(&["plan", "--help"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: None
-            })
+            classify_help(&args(&["plan", "--help"])),
+            Some((HelpTarget::PlanTop, None))
+        );
+        assert_eq!(
+            classify_help(&args(&["plan", "-h"])),
+            Some((HelpTarget::PlanTop, None))
         );
     }
 
     #[test]
-    fn classify_plan_short_help() {
+    fn classify_plan_subcommand() {
         assert_eq!(
-            classify_invocation(&args(&["plan", "-h"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: None
-            })
+            classify_help(&args(&["plan", "new", "--help"])),
+            Some((HelpTarget::PlanSub("new".to_string()), None))
+        );
+        assert_eq!(
+            classify_help(&args(&["plan", "done", "-h"])),
+            Some((HelpTarget::PlanSub("done".to_string()), None))
         );
     }
 
     #[test]
-    fn classify_leading_global_color_then_plan_help() {
+    fn classify_unknown_plan_subcommand_falls_back_to_top() {
         assert_eq!(
-            classify_invocation(&args(&["--color", "always", "plan", "--help"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: Some(ColorWhen::Always)
-            })
+            classify_help(&args(&["plan", "bogus", "--help"])),
+            Some((HelpTarget::PlanTop, None))
         );
     }
 
     #[test]
-    fn classify_trailing_color_after_plan_help() {
+    fn classify_stack_top_and_subcommand() {
         assert_eq!(
-            classify_invocation(&args(&["plan", "--help", "--color", "always"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: Some(ColorWhen::Always)
-            })
+            classify_help(&args(&["stack", "--help"])),
+            Some((HelpTarget::StackTop, None))
+        );
+        assert_eq!(
+            classify_help(&args(&["stack", "submit", "--help"])),
+            Some((HelpTarget::StackSub("submit".to_string()), None))
+        );
+        assert_eq!(
+            classify_help(&args(&["stack", "bogus", "--help"])),
+            Some((HelpTarget::StackTop, None))
         );
     }
 
     #[test]
-    fn classify_color_equals_then_short_help() {
+    fn classify_honors_leading_and_trailing_color() {
         assert_eq!(
-            classify_invocation(&args(&["--color=never", "plan", "-h"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: Some(ColorWhen::Never)
-            })
+            classify_help(&args(&["--color", "always", "plan", "--help"])),
+            Some((HelpTarget::PlanTop, Some(ColorWhen::Always)))
+        );
+        assert_eq!(
+            classify_help(&args(&["plan", "--help", "--color=never"])),
+            Some((HelpTarget::PlanTop, Some(ColorWhen::Never)))
+        );
+        assert_eq!(
+            classify_help(&args(&["-R", ".", "stack", "submit", "-h"])),
+            Some((HelpTarget::StackSub("submit".to_string()), None))
         );
     }
 
     #[test]
-    fn classify_non_help_invocation_as_other() {
-        assert_eq!(
-            classify_invocation(&args(&["plan", "stack"])),
-            InvocationKind::Other
-        );
-    }
-
-    #[test]
-    fn classify_subcommand_help_as_other() {
-        assert_eq!(
-            classify_invocation(&args(&["plan", "stack", "--help"])),
-            InvocationKind::Other
-        );
-    }
-
-    #[test]
-    fn classify_unknown_leading_option_as_other() {
-        assert_eq!(
-            classify_invocation(&args(&["--mystery", "plan", "--help"])),
-            InvocationKind::Other
-        );
-    }
-
-    #[test]
-    fn classify_repository_then_plan_help() {
-        assert_eq!(
-            classify_invocation(&args(&["-R", ".", "plan", "--help"])),
-            InvocationKind::PlanHelp(PlanHelpInvocation {
-                color_override: None
-            })
-        );
+    fn classify_non_help_returns_none() {
+        assert_eq!(classify_help(&args(&["--help"])), None); // bare jj --help → real jj
+        assert_eq!(classify_help(&args(&["log"])), None);
+        assert_eq!(classify_help(&args(&["plan"])), None); // no --help → dispatch, not help
+        assert_eq!(classify_help(&args(&["plan", "new", "feat-x"])), None);
     }
 
     // -----------------------------------------------------------------------
-    // Color resolution
+    // Screen models
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_help_color_mode_prefers_explicit_always() {
-        let result = resolve_help_color_mode(
-            &args(&["--color", "always", "plan", "--help"]),
-            ColorWhen::Never,
-        );
-        assert_eq!(result, ColorWhen::Always);
+    fn plan_new_help_documents_positioning_flags() {
+        let text = render_help_screen(&plan_subcommand_help("new").unwrap(), ColorWhen::Never);
+        for needle in ["-A", "--insert-after", "-B", "--insert-before", "--stack"] {
+            assert!(text.contains(needle), "new help missing {needle}: {text}");
+        }
     }
 
     #[test]
-    fn resolve_help_color_mode_prefers_explicit_never() {
-        let result = resolve_help_color_mode(
-            &args(&["plan", "--help", "--color=never"]),
-            ColorWhen::Always,
-        );
-        assert_eq!(result, ColorWhen::Never);
+    fn plan_done_and_summary_help_document_flags() {
+        let done = render_help_screen(&plan_subcommand_help("done").unwrap(), ColorWhen::Never);
+        assert!(done.contains("--show-stripped"));
+        assert!(done.contains("--keep-scratch"));
+
+        let summary = render_help_screen(&plan_subcommand_help("summary").unwrap(), ColorWhen::Never);
+        assert!(summary.contains("--json"));
+        assert!(summary.contains("--stack"));
     }
 
     #[test]
-    fn resolve_help_color_mode_prefers_explicit_auto() {
-        let result = resolve_help_color_mode(
-            &args(&["plan", "--help", "--color=auto"]),
-            ColorWhen::Always,
-        );
-        assert_eq!(result, ColorWhen::Auto);
+    fn stack_submit_and_auth_help_exist_and_document_flags() {
+        let submit = render_help_screen(&stack_subcommand_help("submit").unwrap(), ColorWhen::Never);
+        for needle in ["--draft", "--publish", "--continue-on-error", "--allow-gaps", "--remote"] {
+            assert!(submit.contains(needle), "submit help missing {needle}");
+        }
+        assert!(stack_subcommand_help("auth").is_some());
     }
 
     #[test]
-    fn resolve_help_color_mode_falls_back_to_default() {
-        let result = resolve_help_color_mode(&args(&["plan", "--help"]), ColorWhen::Debug);
-        assert_eq!(result, ColorWhen::Debug);
+    fn unknown_subcommands_have_no_screen() {
+        assert!(plan_subcommand_help("bogus").is_none());
+        assert!(stack_subcommand_help("bogus").is_none());
+    }
+
+    #[test]
+    fn every_named_subcommand_has_a_screen() {
+        for sub in PLAN_SUBCOMMANDS {
+            assert!(plan_subcommand_help(sub).is_some(), "no plan screen for {sub}");
+        }
+        for sub in STACK_SUBCOMMANDS {
+            assert!(stack_subcommand_help(sub).is_some(), "no stack screen for {sub}");
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Rendering
+    // Top-level plan help: slimmed but preserves the anchor strings
     // -----------------------------------------------------------------------
 
     #[test]
-    fn render_plain_help_has_no_ansi() {
-        let text = render_plan_help(&build_plan_help(), ColorWhen::Never);
-        assert!(!text.contains("\x1b["));
+    fn plan_help_preserves_anchor_strings() {
+        let text = render_help_screen(&build_plan_help(), ColorWhen::Never);
+        for needle in [
+            "One bookmark = one plan = one PR.",
+            "jj plan new <bookmark>",
+            "track [bookmark]",
+            "untrack <bookmark>",
+            "$EDITOR .jj-plan/NN-bookmark.md",
+            "`jj status` shows the current plan stack",
+            "`jj stack submit/sync/merge`",
+            "README.md",
+            "MANUAL.md",
+            "Commands:",
+        ] {
+            assert!(text.contains(needle), "plan help missing {needle}");
+        }
     }
 
     #[test]
-    fn render_color_help_has_ansi() {
-        let text = render_plan_help(&build_plan_help(), ColorWhen::Always);
-        assert!(text.contains("\x1b["));
+    fn plan_help_is_slim_no_inline_flag_rows() {
+        // The done/summary flag rows were moved into per-subcommand help.
+        let text = render_help_screen(&build_plan_help(), ColorWhen::Never);
+        assert!(!text.contains("--keep-scratch"), "flag rows should not be in top-level help");
+        assert!(!text.contains("--no-diff-stat"), "flag rows should not be in top-level help");
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendering / color
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn render_plain_has_no_ansi() {
+        assert!(!render_help_screen(&build_plan_help(), ColorWhen::Never).contains("\x1b["));
+        assert!(!render_help_screen(&build_stack_help(), ColorWhen::Never).contains("\x1b["));
     }
 
     #[test]
-    fn render_help_contains_mental_model_workflow_and_docs() {
-        let text = render_plan_help(&build_plan_help(), ColorWhen::Never);
-
-        assert!(text.contains("One bookmark = one plan = one PR."));
-        assert!(text.contains("jj plan new <bookmark>"));
-        assert!(text.contains("track [bookmark]"));
-        assert!(text.contains("untrack <bookmark>"));
-        assert!(text.contains("$EDITOR .jj-plan/NN-bookmark.md"));
-        assert!(text.contains("`jj status` shows the current plan stack"));
-        assert!(text.contains("`jj stack submit/sync/merge`"));
-        assert!(text.contains("README.md"));
-        assert!(text.contains("MANUAL.md"));
-    }
-
-    #[test]
-    fn help_text_for_args_uses_explicit_color_override() {
-        let text = help_text_for_args(
-            &args(&["plan", "--help", "--color", "always"]),
-            ColorWhen::Never,
+    fn render_color_has_ansi() {
+        assert!(render_help_screen(&build_plan_help(), ColorWhen::Always).contains("\x1b["));
+        assert!(
+            render_help_screen(&stack_subcommand_help("submit").unwrap(), ColorWhen::Always)
+                .contains("\x1b[")
         );
-        assert!(text.contains("\x1b["));
-    }
-
-    #[test]
-    fn help_text_for_args_uses_default_when_no_override() {
-        let text = help_text_for_args(&args(&["plan", "--help"]), ColorWhen::Never);
-        assert!(!text.contains("\x1b["));
     }
 }

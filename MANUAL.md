@@ -171,8 +171,9 @@ jj plan new auth-tests                   # inherits parent plan's stack
 | Flag | Description |
 |---|---|
 | `--stack <name>` | Create a new named stack with a base bookmark |
-| `--before <rev>` | Insert the plan before a specific revision |
-| `--after <rev>` | Insert the plan after a specific revision |
+| `-r <rev>` | Create the plan change at `<rev>` (passed to `jj new`) |
+| `-A`, `--insert-after <rev>` | Insert the plan after `<rev>` (passed to `jj new`) |
+| `-B`, `--insert-before <rev>` | Insert the plan before `<rev>` (passed to `jj new`) |
 | `--help`, `-h` | Show help |
 
 ### `jj plan track [bookmark]`
@@ -461,6 +462,7 @@ jj stack submit --remote upstream        # specify the remote
 | `--publish` | Convert existing draft PRs to ready-for-review |
 | `--update-descriptions` | Push current plan content to existing PR titles/bodies |
 | `--no-comments` | Skip adding/updating stack navigation comments |
+| `--continue-on-error` | Don't abort on the first failure (default: abort) |
 | `--allow-gaps` | Allow unbookmarked changes between bookmarks |
 | `--remote <name>` | Specify the remote to push to (default: `origin`) |
 
@@ -647,9 +649,10 @@ jj-plan intercepts certain jj commands to keep plan files synchronized. All inte
 
 Intercepted to keep plan files and descriptions in sync.
 
-- **`jj describe -m "message"`**: The message is written to the plan file first, then the plan file content is flushed to the jj description. This ensures the plan file is always the source of truth.
-- **`jj describe` (no `-m`)**: Opens the editor on the jj description. After editing, the plan file is updated to match.
-- **`jj describe -r <rev> -m "message"`**: If the target revision has a tracked plan, its plan file is updated.
+- **`jj describe -m "message"` on a tracked plan**: **blocked**. Replacing a rich, multi-line plan document with a one-liner is almost always a mistake, so this is refused with an educational error. Edit the plan file (`.jj-plan/NN-bookmark.md`) directly instead. The same guard applies to **`jj describe --stdin`**.
+- **`jj describe --override-plan-protocol -m "message"`**: the escape hatch. Writes the message to the plan file, then flushes it to the description. The flag is intentionally verbose to prevent accidental use.
+- **`jj describe` (no `-m`/`--stdin`)**: opens the editor on the jj description (unguarded — you see the full plan and can make informed edits). After editing, the plan file is updated to match.
+- **`jj describe -m "message"` on a change that is *not* a tracked plan**: passes through to jj unchanged.
 
 ### `jj abandon`
 

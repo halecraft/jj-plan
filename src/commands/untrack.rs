@@ -43,6 +43,8 @@ pub fn run_untrack(
             eprintln!();
             eprintln!("Removes a bookmark from plan tracking. The bookmark itself");
             eprintln!("is not deleted — only the plan registration is removed.");
+            eprintln!();
+            eprintln!("Run 'jj plan untrack --help' for details.");
             return Ok(1);
         }
     };

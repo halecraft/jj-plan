@@ -226,12 +226,12 @@ fn main() {
 }
 
 fn run(jj: &JjBinary, args: &[String]) -> jj_plan::error::Result<i32> {
-    // Top-level `plan --help` should work even before repo activation checks
-    // and should recognize jj-style global options such as `--color`.
-    if let commands::help::InvocationKind::PlanHelp(_) =
-        commands::help::classify_invocation(args)
-    {
-        commands::help::print_help();
+    // All help — top-level and per-subcommand, for both `plan` and `stack` —
+    // is resolved here, before repo discovery and activation. That makes help
+    // available pre-activation (like jj's own) and side-effect-free by
+    // construction: it returns before any workspace is opened or flushed.
+    if let Some((target, color)) = commands::help::classify_help(args) {
+        commands::help::print_help_screen(target, color);
         return Ok(0);
     }
 

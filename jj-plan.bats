@@ -1009,7 +1009,10 @@ Need JWT and API key support
   jjdesc -m "Precious content"
   run jj plan new --help
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"jj plan"* ]]
+  [[ "$output" == *"jj plan new"* ]]
+  # Comprehensive: documents the previously-hidden positioning/stack flags.
+  [[ "$output" == *"--insert-after"* ]]
+  [[ "$output" == *"--stack"* ]]
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
 }
 
@@ -1033,7 +1036,17 @@ Need JWT and API key support
   jjdesc -m "Precious content"
   run jj plan done --help
   [[ "$status" -eq 0 ]]
-  [[ "$output" == *"jj plan"* ]]
+  [[ "$output" == *"jj plan done"* ]]
+  [[ "$output" == *"--show-stripped"* ]]
+  [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+@test "jj plan summary --help prints help without side effects" {
+  jjdesc -m "Precious content"
+  run jj plan summary --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan summary"* ]]
+  [[ "$output" == *"--json"* ]]
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
 }
 
@@ -1059,6 +1072,54 @@ Need JWT and API key support
   [[ "$status" -eq 0 ]]
   [[ "$output" == *"jj plan"* ]]
   [[ "$("$REAL_JJ" log -r @ -T description --no-graph)" == "Precious content" ]]
+}
+
+# =============================================================================
+# jj stack <subcommand> --help
+# =============================================================================
+
+@test "jj stack --help lists all subcommands" {
+  run jj stack --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj stack"* ]]
+  for sub in submit sync merge untrack auth; do
+    [[ "$output" == *"$sub"* ]]
+  done
+}
+
+@test "jj stack submit --help is comprehensive" {
+  run jj stack submit --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj stack submit"* ]]
+  [[ "$output" == *"--draft"* ]]
+  [[ "$output" == *"--continue-on-error"* ]]
+}
+
+@test "jj stack auth --help documents actions" {
+  run jj stack auth --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj stack auth"* ]]
+  [[ "$output" == *"setup"* ]]
+}
+
+# =============================================================================
+# Help works before activation (no .jj-plan/ directory)
+# =============================================================================
+
+@test "jj plan new --help works before activation" {
+  rm -rf .jj-plan
+  run jj plan new --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj plan new"* ]]
+  [[ "$output" != *"not activated"* ]]
+}
+
+@test "jj stack submit --help works before activation" {
+  rm -rf .jj-plan
+  run jj stack submit --help
+  [[ "$status" -eq 0 ]]
+  [[ "$output" == *"jj stack submit"* ]]
+  [[ "$output" != *"not activated"* ]]
 }
 
 # =============================================================================

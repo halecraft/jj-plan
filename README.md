@@ -398,7 +398,7 @@ bats jj-plan.bats              # sequential
 
 ## Documentation
 
-Use `jj plan --help` for the compact terminal summary. Use the docs below when you want the full reference or implementation details.
+Use `jj plan --help` for the compact terminal summary, and `jj plan <subcommand> --help` (or `jj stack <subcommand> --help`) for comprehensive per-command help. Use the docs below when you want the full reference or implementation details.
 
 | Document | Audience | Content |
 |---|---|---|

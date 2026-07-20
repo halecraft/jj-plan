@@ -17,14 +17,6 @@ use crate::types::PlanRegistry;
 use crate::wrap::SyncChangeView;
 use crate::workspace::Workspace;
 
-/// Returns true if any element in `args` is `"--help"` or `"-h"`.
-///
-/// Used to intercept help requests in subcommand args before they reach
-/// handlers that would interpret them as passthrough flags to jj.
-fn sub_args_request_help(args: &[String]) -> bool {
-    args.iter().any(|a| a == "--help" || a == "-h")
-}
-
 /// Resolve the tracked plan bookmark name at a given revision target.
 ///
 /// Returns `Some(bookmark_name)` if the target resolves to a change ID
@@ -66,21 +58,10 @@ pub fn dispatch_plan(
     // args[0] is "plan", args[1] is the subcommand (if present)
     let subcommand = args.get(1).map(|s| s.as_str());
 
-    // Intercept `--help` / `-h` as the subcommand itself (e.g. `jj plan --help`)
-    if matches!(subcommand, Some("--help" | "-h")) {
-        help::print_help();
-        return Ok(0);
-    }
-
-    // Central help guard: if any sub_args after the subcommand contain
-    // --help / -h, show the top-level plan help and exit with no side effects.
-    // This uniformly covers stack, new, done, go, next, prev, and config
-    // without requiring each handler to check for --help itself.
+    // Help (`jj plan --help`, `jj plan <sub> --help`) is resolved earlier in
+    // `run()` via `help::classify_help`, before repo activation — so it never
+    // reaches here. `sub_args` is the command-rooted slice each handler parses.
     let sub_args = if args.len() > 2 { &args[2..] } else { &[] as &[String] };
-    if sub_args_request_help(sub_args) {
-        help::print_help();
-        return Ok(0);
-    }
 
     match subcommand {
         Some("config") => {
@@ -220,30 +201,4 @@ mod tests {
         assert!(!msg.contains("plans in stack"), "should not be plural: {msg}");
     }
 
-    // -- sub_args_request_help tests ----------------------------------------
-
-    #[test]
-    fn sub_args_request_help_with_long_flag() {
-        assert!(sub_args_request_help(&args(&["--help"])));
-    }
-
-    #[test]
-    fn sub_args_request_help_with_short_flag() {
-        assert!(sub_args_request_help(&args(&["-h"])));
-    }
-
-    #[test]
-    fn sub_args_request_help_mixed_with_other_flags() {
-        assert!(sub_args_request_help(&args(&["--first", "--help"])));
-    }
-
-    #[test]
-    fn sub_args_request_help_no_help_flag() {
-        assert!(!sub_args_request_help(&args(&["--first"])));
-    }
-
-    #[test]
-    fn sub_args_request_help_empty() {
-        assert!(!sub_args_request_help(&args(&[])));
-    }
 }

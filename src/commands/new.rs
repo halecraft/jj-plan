@@ -80,6 +80,8 @@ pub fn run_new(
             eprintln!();
             eprintln!("Creates a new plan: jj change + bookmark + plan file + registry entry.");
             eprintln!("The bookmark name becomes the plan name (e.g. feat-auth, fix-login).");
+            eprintln!();
+            eprintln!("Run 'jj plan new --help' for details.");
             return Ok(1);
         }
     };
